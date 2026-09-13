@@ -615,9 +615,9 @@ fn decide_caps(
 }
 
 /// The geometry every session is initialized to hold, so `reconfigure_resolution` can grow into
-/// it in place. It is the largest picture the 5.x levels of all three codecs admit, which is what
-/// keeps the pinned level low enough for a hardware decoder to accept, and it spans both UHD and
-/// DCI 4K; a taller resize rebuilds the session instead.
+/// it in place. It spans both UHD and DCI 4K and is the largest picture the 5.x levels of all
+/// three codecs admit, which is what lets AV1 -- pinned to this level -- stay inside a level a
+/// decoder accepts; a taller resize rebuilds the session instead.
 const HEADROOM_WIDTH: u32 = 4096;
 const HEADROOM_HEIGHT: u32 = 2160;
 
@@ -1149,24 +1149,25 @@ impl Drop for NvencEncoder {
     }
 }
 
-/// The level an NVENC session advertises, read from the shared ladder at the resize headroom
-/// rather than at the capture (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc for
-/// H.264, general_level_idc for HEVC, seq_level_idx for AV1).
+/// The level an NVENC session advertises for a `width` x `height` stream at `fps`
+/// (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc for H.264, general_level_idc
+/// for HEVC, seq_level_idx for AV1).
 ///
-/// `reconfigure_resolution` resizes a live session in place, so the level has to cover every
-/// geometry that session can still reach: NVENC refuses an AV1 session whose level cannot hold
-/// `maxEncodeWidth` x `maxEncodeHeight`, and a level bump mid-GOP forces some hardware decoders
-/// to re-initialize. Reading the ladder at the headroom keeps one answer across the whole resize
-/// range and keeps it true of every frame the session may emit; the frame rate is floored the
-/// same way, since a level moving with a live rate change is the same event.
+/// H.264 and HEVC carry the current geometry's level, the lowest a decoder is asked to accept,
+/// so a hardware decoder that gates on it -- older Apple and Intel fixed-function parts refuse
+/// a stream whose SPS names a level above their ceiling even for a picture they could hold --
+/// takes the stream. `reconfigure_resolution` re-declares the level with a forced IDR on every
+/// resize; the frame rate is floored at `HEADROOM_FPS`, so a live rate change between the
+/// common rates, which carries no IDR, never moves it. AV1 instead holds the resize headroom's
+/// level: NVENC validates an AV1 session's level against `maxEncodeWidth` x `maxEncodeHeight`
+/// at init and refuses one that cannot hold it, and an AV1 hardware decoder is recent enough to
+/// take that level whatever the picture.
 fn nvenc_level(codec: Codec, width: u32, height: u32, fps: u32) -> u32 {
-    let w = width.max(HEADROOM_WIDTH);
-    let h = height.max(HEADROOM_HEIGHT);
     let fps = fps.max(HEADROOM_FPS);
     match codec {
-        Codec::H265 => h265_level(w, h, fps),
-        Codec::Av1 => av1_level(w, h, fps),
-        _ => h264_level(w, h, fps),
+        Codec::Av1 => av1_level(width.max(HEADROOM_WIDTH), height.max(HEADROOM_HEIGHT), fps),
+        Codec::H265 => h265_level(width, height, fps),
+        _ => h264_level(width, height, fps),
     }
 }
 
@@ -3492,6 +3493,21 @@ mod gpu_tests {
                         })
                         .count();
                     assert_eq!(vcl, SLICES_PER_FRAME as usize, "{codec:?} {w}x{h} frame {i} slices");
+                    if codec == Codec::H264 && i == 0 {
+                        // After the one-byte NAL header the SPS RBSP carries profile_idc, the
+                        // constraint-flag byte, then level_idc, which must be the current
+                        // geometry's level rather than the 4K-headroom one so a decoder gating
+                        // on it accepts the picture.
+                        let sps = annexb_nals(au)
+                            .find(|nal| nal[0] & 0x1f == 7)
+                            .map(rbsp)
+                            .expect("an SPS on the key frame");
+                        assert_eq!(
+                            sps[3] as u32,
+                            nvenc_level(Codec::H264, w as u32, h as u32, 60),
+                            "level_idc at {w}x{h}"
+                        );
+                    }
                     if codec == Codec::H265 && i == 0 {
                         let sps = annexb_nals(au)
                             .find(|nal| (nal[0] >> 1) & 0x3f == 33)
@@ -4851,34 +4867,46 @@ mod decision_tests {
         assert_eq!(nvenc_headroom(1920, 4096, Some(2048)), 2048);
     }
 
-    /// Every session is initialized to hold the resize headroom, so the level it advertises has
-    /// to admit that picture whatever the capture is -- NVENC refuses an AV1 session where it
-    /// does not -- and it must not move as the capture is resized underneath it.
+    /// H.264 and HEVC advertise the current geometry's level, so a decoder that gates on the
+    /// level takes a 1080p stream a 4K-headroom session would once have marked 5.2; a resize
+    /// re-declares it and a live rate change between the common rates does not. AV1 holds the
+    /// headroom level, which NVENC requires it to cover at init and every AV1 decoder accepts.
     #[test]
-    fn level_covers_the_resize_headroom() {
-        let pixels = (HEADROOM_WIDTH * HEADROOM_HEIGHT) as u64;
-        let macroblocks = (HEADROOM_WIDTH as u64 / 16) * (HEADROOM_HEIGHT as u64 / 16);
-        for fps in [30, 60, 120] {
-            for (w, h) in [(1280, 720), (1600, 900), (1920, 1080), (3840, 2160)] {
-                assert_eq!(
-                    nvenc_level(Codec::Av1, w, h, fps),
-                    nvenc_level(Codec::Av1, HEADROOM_WIDTH, HEADROOM_HEIGHT, fps),
-                    "AV1 level moved with the capture at {w}x{h}@{fps}"
-                );
-                assert!(
-                    av1_max_picture(nvenc_level(Codec::Av1, w, h, fps)) >= pixels,
-                    "AV1 level at {w}x{h}@{fps} cannot hold the headroom"
-                );
-                assert!(
-                    h265_max_picture(nvenc_level(Codec::H265, w, h, fps)) >= pixels,
-                    "HEVC level at {w}x{h}@{fps} cannot hold the headroom"
-                );
-                assert!(
-                    h264_max_macroblocks(nvenc_level(Codec::H264, w, h, fps)) >= macroblocks,
-                    "H.264 level at {w}x{h}@{fps} cannot hold the headroom"
-                );
-            }
+    fn nvenc_level_follows_geometry_except_av1() {
+        // The 1080p60 level, the one older Apple and Intel decoders gate on, is well below the
+        // 4K-headroom level the session used to pin: H.264 4.2 and HEVC 4.1 rather than 5.2/5.1.
+        assert_eq!(nvenc_level(Codec::H264, 1920, 1080, 60), 42);
+        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60), 123);
+        // The current level rises with the picture, back to the headroom level at 4K.
+        assert_eq!(nvenc_level(Codec::H264, 3840, 2160, 60), 52);
+        assert_eq!(nvenc_level(Codec::H265, 3840, 2160, 60), 153);
+        // The current level admits the current picture on every codec.
+        for (w, h) in [(1280u32, 720u32), (1920, 1080), (3840, 2160)] {
+            let macroblocks = (w as u64 / 16) * (h as u64 / 16);
+            assert!(
+                h264_max_macroblocks(nvenc_level(Codec::H264, w, h, 60)) >= macroblocks,
+                "H.264 level at {w}x{h} cannot hold the picture"
+            );
+            assert!(
+                h265_max_picture(nvenc_level(Codec::H265, w, h, 60)) >= (w as u64) * (h as u64),
+                "HEVC level at {w}x{h} cannot hold the picture"
+            );
         }
+        // AV1 holds the headroom level whatever the capture, since NVENC checks it against
+        // maxEncodeWidth x maxEncodeHeight at init.
+        let pixels = (HEADROOM_WIDTH * HEADROOM_HEIGHT) as u64;
+        for (w, h) in [(1280, 720), (1920, 1080), (3840, 2160)] {
+            assert_eq!(
+                nvenc_level(Codec::Av1, w, h, 60),
+                nvenc_level(Codec::Av1, HEADROOM_WIDTH, HEADROOM_HEIGHT, 60),
+                "AV1 level moved with the capture at {w}x{h}"
+            );
+            assert!(
+                av1_max_picture(nvenc_level(Codec::Av1, w, h, 60)) >= pixels,
+                "AV1 level at {w}x{h} cannot hold the headroom"
+            );
+        }
+        // A live rate change between the common rates keeps the level, so it carries no IDR.
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             assert_eq!(
                 nvenc_level(codec, 1920, 1080, 30),
@@ -4886,11 +4914,6 @@ mod decision_tests {
                 "{codec:?} level moved between 30 and 60 fps"
             );
         }
-        // The headroom spans UHD and DCI 4K, which is what keeps these levels low enough for a
-        // hardware decoder to accept them.
-        assert_eq!(nvenc_level(Codec::H264, 1920, 1080, 60), 52);
-        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60), 153);
-        assert_eq!(nvenc_level(Codec::Av1, 1920, 1080, 60), 13);
     }
 
     /// AV1 Annex A MaxPicSize for a seq_level_idx the ladder can return.

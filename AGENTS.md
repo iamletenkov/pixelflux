@@ -59,7 +59,12 @@ as the default: that it is exposed is not proof it works, and a reviewer has to 
 The codec of a capture is `CaptureSettings.codec` (`jpeg`, `h264`, `h265`, `vp8`, `vp9`, `av1`), the
 `encoders::Codec` enum in Rust: it carries the wire id (the high nibble of a `0x04` frame's type byte, the
 low nibble being the frame kind), the per-codec quantizer domain the shared `video_crf` index maps onto, the
-level ladders and the bitstream reads that label frames. JPEG and H.264 may stripe (`encoders/software.rs`);
+level ladders and the bitstream reads that label frames. A session advertises its stream's level from the
+shared ladder at the current geometry (`codec.rs`), the lowest a decoder is asked to accept, so a hardware
+decoder that gates on the level — older Apple and Intel parts refuse a level above their ceiling even for a
+picture they could hold — takes the stream; NVENC re-declares it with a forced IDR on each in-place resize, and
+holds AV1 alone at the resize headroom's level, which NVENC validates its session against at init. JPEG and
+H.264 may stripe (`encoders/software.rs`);
 every other codec streams whole frames. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (NVENC on the NVIDIA driver, VA-API otherwise, then the codec's software
 encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback. `encoders/nvenc.rs`
