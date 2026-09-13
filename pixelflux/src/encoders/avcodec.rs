@@ -170,13 +170,13 @@ fn vpp_chain(stage: &str, width: i32, height: i32, format: &str, matrix: &str) -
     )
 }
 
-/// The 4:4:4 surface format to encode into on this VA device, or `None` when the driver
-/// carries none. This answers only the driver half: `av_hwframe_ctx_init` and
-/// `avcodec_open2` still have to accept the format, and each reports its own refusal.
-unsafe fn fullcolor_sw_format(device: *mut ff::AVBufferRef) -> Option<ff::AVPixelFormat> {
+/// The 4:4:4 surface formats to try on this VA device, in `FULLCOLOR_SW_FORMATS` order.
+/// This answers only the driver half: the surface pool, the VA-VPP output pad and
+/// `avcodec_open2` each still have to accept the format, so the caller tries them in turn.
+unsafe fn fullcolor_sw_formats(device: *mut ff::AVBufferRef) -> Vec<ff::AVPixelFormat> {
     let constraints = ff::av_hwdevice_get_hwframe_constraints(device, ptr::null());
     if constraints.is_null() {
-        return None;
+        return Vec::new();
     }
     let mut carried = Vec::new();
     let mut fmt = (*constraints).valid_sw_formats;
@@ -188,12 +188,13 @@ unsafe fn fullcolor_sw_format(device: *mut ff::AVBufferRef) -> Option<ff::AVPixe
     }
     let mut owned = constraints;
     ff::av_hwframe_constraints_free(&mut owned);
-    preferred_fullcolor_format(&carried)
+    preferred_fullcolor_formats(&carried)
 }
 
-/// The pick out of the formats a device reports, in `FULLCOLOR_SW_FORMATS` order.
-fn preferred_fullcolor_format(carried: &[ff::AVPixelFormat]) -> Option<ff::AVPixelFormat> {
-    FULLCOLOR_SW_FORMATS.into_iter().find(|wanted| carried.contains(wanted))
+/// The formats a device reports that this build can encode 4:4:4 into, in
+/// `FULLCOLOR_SW_FORMATS` order.
+fn preferred_fullcolor_formats(carried: &[ff::AVPixelFormat]) -> Vec<ff::AVPixelFormat> {
+    FULLCOLOR_SW_FORMATS.into_iter().filter(|wanted| carried.contains(wanted)).collect()
 }
 
 /// Format an FFmpeg error code through `av_strerror`.
@@ -466,7 +467,39 @@ impl AvcodecEncoder {
     }
 
     /// Open the VA-API device, surface pool and filter graph, then the codec.
+    /// Stand the VA-API session up, trying each 4:4:4 surface format the driver carries until
+    /// one survives the whole bring-up.
+    ///
+    /// A driver can report a surface format its VA-VPP cannot write and its encoder cannot
+    /// read: Intel carries planar `yuv444p` surfaces while the HEVC 4:4:4 entry point takes
+    /// packed `vuyx` alone, and the mismatch only surfaces when the scaler configures its
+    /// output pad. Each attempt therefore runs to a built graph before it counts, and a
+    /// refusal moves to the next format rather than failing the session.
     unsafe fn open_vaapi(&mut self, settings: &RustCaptureSettings, fullcolor: bool) -> Result<(), String> {
+        let mut last = None;
+        for attempt in 0..FULLCOLOR_SW_FORMATS.len() {
+            match self.open_vaapi_once(settings, fullcolor, attempt) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    self.close_codec();
+                    self.hw.take();
+                    last = Some(e);
+                    if !fullcolor {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| "no VA-API surface format to try".to_string()))
+    }
+
+    /// One bring-up attempt: `attempt` selects which of the driver's 4:4:4 formats to take.
+    unsafe fn open_vaapi_once(
+        &mut self,
+        settings: &RustCaptureSettings,
+        fullcolor: bool,
+        attempt: usize,
+    ) -> Result<(), String> {
         let render_node = if settings.encode_node_index >= 0 {
             format!("/dev/dri/renderD{}", 128 + settings.encode_node_index)
         } else {
@@ -506,8 +539,13 @@ impl AvcodecEncoder {
         }
 
         self.sw_format = if fullcolor {
-            fullcolor_sw_format(session.hw_device_ctx)
-                .ok_or("4:4:4 requested but this VA-API driver carries no 4:4:4 surface format")?
+            let carried = fullcolor_sw_formats(session.hw_device_ctx);
+            if carried.is_empty() {
+                return Err("4:4:4 requested but this VA-API driver carries no 4:4:4 surface format".into());
+            }
+            *carried
+                .get(attempt)
+                .ok_or_else(|| format!("no 4:4:4 surface format on this VA-API driver encodes {:?}", self.codec))?
         } else {
             ff::AVPixelFormat::AV_PIX_FMT_NV12
         };
@@ -1256,9 +1294,13 @@ mod tests {
     #[test]
     fn fullcolor_surface_preference_and_names() {
         use ff::AVPixelFormat::*;
-        assert_eq!(preferred_fullcolor_format(&[AV_PIX_FMT_NV12]), None);
-        assert_eq!(preferred_fullcolor_format(&[AV_PIX_FMT_NV12, AV_PIX_FMT_VUYX]), Some(AV_PIX_FMT_VUYX));
-        assert_eq!(preferred_fullcolor_format(&[AV_PIX_FMT_VUYX, AV_PIX_FMT_YUV444P]), Some(AV_PIX_FMT_YUV444P));
+        assert!(preferred_fullcolor_formats(&[AV_PIX_FMT_NV12]).is_empty());
+        assert_eq!(preferred_fullcolor_formats(&[AV_PIX_FMT_NV12, AV_PIX_FMT_VUYX]), vec![AV_PIX_FMT_VUYX]);
+        assert_eq!(
+            preferred_fullcolor_formats(&[AV_PIX_FMT_VUYX, AV_PIX_FMT_YUV444P]),
+            vec![AV_PIX_FMT_YUV444P, AV_PIX_FMT_VUYX],
+            "a driver carrying both is tried planar first, then packed"
+        );
         for fmt in FULLCOLOR_SW_FORMATS {
             let name = pix_fmt_name(fmt);
             let round_trip = unsafe { ff::av_get_pix_fmt(CString::new(name.clone()).unwrap().as_ptr()) };
