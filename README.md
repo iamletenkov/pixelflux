@@ -125,7 +125,9 @@ captured through shm instead, and both are damage-gated so a static screen costs
 A host that offers neither protocol — GNOME, or KDE before its `ext-image-copy-capture`
 support — is captured through **xdg-desktop-portal** instead: one `RemoteDesktop` session on the
 session bus (`DBUS_SESSION_BUS_ADDRESS`) hands out a PipeWire stream per monitor, and takes the
-keyboard and pointer where the host has no virtual-input protocol for them. Each capability
+keyboard and pointer where the host has no virtual-input protocol for them. A host that grants the
+screen but refuses those devices answers the whole request as a refusal, so the session is asked
+again for capture alone: declining remote interaction leaves the video working without injection. Each capability
 picks its rung from the registry, so a KWin that serves `ext-image-copy-capture` but no
 `zwlr-virtual-pointer` gets its frames natively and its pointer from the portal. The compositor
 owns the portal's buffers: a dmabuf frame is imported by the encoder where it lies (the stream

@@ -39,7 +39,7 @@ use smithay::utils::{Physical, Rectangle};
 
 use crate::pipewire::*;
 use crate::wayland::cursor::CursorJob;
-use crate::wayland::host::{FrameSink, HostCpuFrame, HostFrame};
+use crate::wayland::host::{now_ns, trace, FrameSink, HostCpuFrame, HostFrame};
 
 const FOURCC_XR24: u32 = 0x3432_5258;
 const FOURCC_AR24: u32 = 0x3432_5241;
@@ -443,6 +443,15 @@ unsafe fn read_damage(buf: &SpaBuffer, width: i32, height: i32) -> Vec<Rectangle
     damage
 }
 
+/// The compositor's stamp from the buffer's header meta, when it carries one.
+fn header_pts(buf: &SpaBuffer) -> Option<i64> {
+    (0..buf.n_metas as usize)
+        .map(|i| unsafe { &*buf.metas.add(i) })
+        .find(|m| m.type_ == SPA_META_HEADER && m.size >= SPA_META_HEADER_SIZE && !m.data.is_null())
+        .map(|m| unsafe { (*(m.data as *const SpaMetaHeader)).pts })
+        .filter(|pts| *pts > 0)
+}
+
 /// Build the slot's import on its first frame: the dmabuf planes as a `Dmabuf` of duplicated
 /// fds, or the memfd mapped whole.
 unsafe fn import_slot(slot: &mut BufferSlot, buf: &SpaBuffer, n: &Negotiated) -> bool {
@@ -554,27 +563,23 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             width: n.width,
             height: n.height,
             damage: unsafe { read_damage(buf, n.width, n.height) },
+            stamp_ns: header_pts(buf).unwrap_or_else(now_ns),
         }
     };
-    if shared.frames.fetch_add(1, Ordering::Relaxed) == 0 {
-        let pts_age = (0..buf.n_metas as usize)
-            .map(|i| unsafe { &*buf.metas.add(i) })
-            .find(|m| m.type_ == SPA_META_HEADER && m.size >= SPA_META_HEADER_SIZE && !m.data.is_null())
-            .map(|m| unsafe { (*(m.data as *const SpaMetaHeader)).pts })
-            .filter(|pts| *pts > 0)
-            .map(|pts| {
-                let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-                (now.tv_sec * 1_000_000_000 + now.tv_nsec - pts) as f64 / 1e6
-            });
+    let count = shared.frames.fetch_add(1, Ordering::Relaxed);
+    let age_ms = (now_ns() - frame.stamp_ns) as f64 / 1e6;
+    if count == 0 {
         eprintln!(
             "[HostCapture] output {}: first portal frame {}x{}, {} damage rect(s){}",
             shared.sink.index,
             n.width,
             n.height,
             frame.damage.len(),
-            pts_age.map(|ms| format!(", {ms:.1} ms after the compositor stamped it")).unwrap_or_default()
+            header_pts(buf).map(|_| format!(", {age_ms:.1} ms after the compositor stamped it")).unwrap_or_default()
         );
+    }
+    if trace() {
+        eprintln!("[HostTrace] output {} frame {count} process +{age_ms:.2}ms", shared.sink.index);
     }
     if !shared.sink.send(frame) {
         if let Some(slot) = shared.buffers.lock().unwrap().get_mut(idx) {

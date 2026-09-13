@@ -2784,6 +2784,7 @@ fn render_node_tick(
     }
     // Dmabuf handed to the GPU encoder in host mode (from the new or retained frame).
     let mut host_enc_dmabuf: Option<Dmabuf> = None;
+    let mut new_stamp: Option<i64> = None;
     // Host software frames arrive BGRA, so anything reading this display's frame buffer
     // back has to know it is not the GLES readback's RGBA.
     let mut host_cpu_frame = false;
@@ -2819,6 +2820,7 @@ fn render_node_tick(
             (f, _) => f,
         };
         let have_new = new_frame.is_some();
+        new_stamp = new_frame.as_ref().map(|f| f.stamp_ns);
         // Streaming mode wants a constant-rate stream (the client's decoder pipeline
         // is built for it), so re-encode the retained frame every tick like the
         // compositor path does. Outside streaming mode, stay damage-driven, waking
@@ -3453,6 +3455,10 @@ fn render_node_tick(
                         cap.hw_rebuilt = false;
                         if !data.is_empty() {
                             frame_out = true;
+                            if wayland::host::trace() && let Some(stamp) = new_stamp {
+                                let age = (wayland::host::now_ns() - stamp) as f64 / 1e6;
+                                eprintln!("[HostTrace] output {} frame {} encoded +{age:.2}ms {}B", node.id, cap.frame_counter, data.len());
+                            }
                             cap.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
                             cap.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref tx) = cap.deliver_tx {

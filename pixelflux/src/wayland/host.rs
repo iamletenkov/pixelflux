@@ -112,6 +112,22 @@ pub struct HostFrame {
     pub width: i32,
     pub height: i32,
     pub damage: Vec<Rectangle<i32, Physical>>,
+    /// The compositor's CLOCK_MONOTONIC stamp for the frame, or its arrival when the host gives none.
+    pub stamp_ns: i64,
+}
+
+/// CLOCK_MONOTONIC in nanoseconds, the clock PipeWire stamps frames with.
+pub(crate) fn now_ns() -> i64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec * 1_000_000_000 + t.tv_nsec
+}
+
+/// `PIXELFLUX_HOST_TRACE` set: log every host frame's age on arrival and once encoded.
+pub(crate) fn trace() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PIXELFLUX_HOST_TRACE").is_some());
+    *ON
 }
 
 /// Borrow-by-Arc view of a software frame still sitting in its shm mapping.
@@ -1831,10 +1847,22 @@ fn portal_thread(ctl: Arc<PortalCtl>) {
         let old = ctl.inner.lock().unwrap().live.take();
         drop(old);
         let cursor_mode = if ctl.capture && !paint { portal::CURSOR_METADATA } else { portal::CURSOR_EMBEDDED };
-        let opened = PortalSession::open(ctl.capture, ctl.devices, cursor_mode, token.as_deref()).and_then(|session| {
-            let core = if ctl.capture { Some(PwCore::connect(session.open_pipewire_remote()?)?) } else { None };
-            Ok((session, core))
-        });
+        let open = |devices: u32| {
+            PortalSession::open(ctl.capture, devices, cursor_mode, token.as_deref()).and_then(|session| {
+                let core = if ctl.capture { Some(PwCore::connect(session.open_pipewire_remote()?)?) } else { None };
+                Ok((session, core))
+            })
+        };
+        // A host that grants the screen but refuses the input devices answers the whole request as
+        // a refusal, so asking again for capture alone is what turns that into a session with
+        // video and no injection, rather than no session at all.
+        let opened = match open(ctl.devices) {
+            Err(e) if ctl.capture && ctl.devices != 0 => {
+                eprintln!("[HostCapture] portal refused keyboard and pointer ({e}); capturing without them.");
+                open(0)
+            }
+            other => other,
+        };
         let mut inner = ctl.inner.lock().unwrap();
         match opened {
             Ok((session, core)) => {
@@ -2592,6 +2620,7 @@ fn capture_loop(
                 width: fw,
                 height: fh,
                 damage,
+                stamp_ns: now_ns(),
             },
             SlotBuffer::Cpu { map, stride, format, .. } => HostFrame {
                 generation,
@@ -2606,6 +2635,7 @@ fn capture_loop(
                 width: fw,
                 height: fh,
                 damage,
+                stamp_ns: now_ns(),
             },
         };
         if !frames.send(out) {
@@ -2902,6 +2932,7 @@ fn capture_loop_ext(
                 width: cw,
                 height: ch,
                 damage,
+                stamp_ns: now_ns(),
             },
             SlotBuffer::Cpu { map, stride, format, .. } => HostFrame {
                 generation,
@@ -2916,6 +2947,7 @@ fn capture_loop_ext(
                 width: cw,
                 height: ch,
                 damage,
+                stamp_ns: now_ns(),
             },
         };
         if !frames.send(out) {
