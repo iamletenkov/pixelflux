@@ -118,15 +118,15 @@ table below.
 | av-scenechange | 0.14.1 | MIT | permissive | both |  |
 | av1-grain | 0.2.5 | BSD-2-Clause | permissive | both |  |
 | avif-serialize | 0.8.9 | BSD-3-Clause | permissive | both |  |
-| base64 | 0.22.1 | MIT OR Apache-2.0 | permissive | both |  |
+| base64 | 0.23.1 | MIT OR Apache-2.0 | permissive | both |  |
 | bit_field | 0.10.3 | Apache-2.0/MIT | permissive | both |  |
-| bitflags | 2.13.1 | MIT OR Apache-2.0 | permissive | both |  |
+| bitflags | 2.13.2 | MIT OR Apache-2.0 | permissive | both |  |
 | bitstream-io | 4.10.0 | MIT/Apache-2.0 | permissive | both |  |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | permissive | both |  |
 | blocking | 1.7.0 | Apache-2.0 OR MIT | permissive | both |  |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | permissive | both |  |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | permissive | both |  |
-| bytemuck_derive | 1.11.0 | Zlib OR Apache-2.0 OR MIT | permissive | both |  |
+| bytemuck_derive | 1.12.1 | Zlib OR Apache-2.0 OR MIT | permissive | both |  |
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | permissive | both |  |
 | calloop | 0.14.4 | MIT | permissive | both |  |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 | permissive | both |  |
@@ -135,11 +135,11 @@ table below.
 | color_quant | 1.1.0 | MIT | permissive | both |  |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT | permissive | both |  |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 | permissive | both |  |
-| crc32fast | 1.5.0 | MIT OR Apache-2.0 | permissive | both |  |
-| crossbeam-channel | 0.5.16 | MIT OR Apache-2.0 | permissive | both |  |
-| crossbeam-deque | 0.8.7 | MIT OR Apache-2.0 | permissive | both |  |
-| crossbeam-epoch | 0.9.20 | MIT OR Apache-2.0 | permissive | both |  |
-| crossbeam-utils | 0.8.22 | MIT OR Apache-2.0 | permissive | both |  |
+| crc32fast | 1.5.2 | MIT OR Apache-2.0 | permissive | both |  |
+| crossbeam-channel | 0.5.17 | MIT OR Apache-2.0 | permissive | both |  |
+| crossbeam-deque | 0.8.8 | MIT OR Apache-2.0 | permissive | both |  |
+| crossbeam-epoch | 0.9.21 | MIT OR Apache-2.0 | permissive | both |  |
+| crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 | permissive | both |  |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 | permissive | both |  |
 | cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | digest | 0.10.7 | MIT OR Apache-2.0 | permissive | both |  |
@@ -149,7 +149,7 @@ table below.
 | drm-ffi | 0.9.1 | MIT | permissive | both | Linux DRM ioctls (no library): MIT (permissive) |
 | drm-fourcc | 2.2.0 | MIT | permissive | both |  |
 | drm-sys | 0.8.1 | MIT | permissive | both | libdrm headers (bindings only): MIT (permissive) |
-| either | 1.17.0 | MIT OR Apache-2.0 | permissive | both |  |
+| either | 1.18.0 | MIT OR Apache-2.0 | permissive | both |  |
 | endi | 1.1.1 | MIT | permissive | both |  |
 | enumflags2 | 0.7.12 | MIT OR Apache-2.0 | permissive | both |  |
 | enumflags2_derive | 0.7.12 | MIT OR Apache-2.0 | permissive | both |  |
@@ -164,7 +164,7 @@ table below.
 | fax | 0.2.7 | MIT | permissive | both |  |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | permissive | both |  |
 | ffmpeg-sys-next | 9.0.0 | WTFPL | permissive | both | FFmpeg libavcodec, libavfilter, libavutil (plus the libswresample, libswscale, libavformat they pull in), and through libavcodec the codec libraries it wraps: kvazaar, libvpx, SVT-AV1, dav1d (BSD) on every wheel, x265 (GPL-2.0-or-later) on the GPL wheel: LGPL-2.1-or-later (weak copyleft) |
-| flate2 | 1.1.9 | MIT OR Apache-2.0 | permissive | both |  |
+| flate2 | 1.1.10 | MIT OR Apache-2.0 | permissive | both |  |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 | permissive | both |  |
 | futures-io | 0.3.34 | MIT OR Apache-2.0 | permissive | both |  |
 | futures-lite | 2.6.1 | Apache-2.0 OR MIT | permissive | both |  |
@@ -181,10 +181,10 @@ table below.
 | heck | 0.5.0 | MIT OR Apache-2.0 | permissive | both |  |
 | hex | 0.4.3 | MIT OR Apache-2.0 | permissive | both |  |
 | httpdate | 1.0.3 | MIT OR Apache-2.0 | permissive | both |  |
-| image | 0.25.9 | MIT OR Apache-2.0 | permissive | both |  |
+| image | 0.25.10 | MIT OR Apache-2.0 | permissive | both |  |
 | image-webp | 0.2.4 | MIT OR Apache-2.0 | permissive | both |  |
-| imgref | 1.12.2 | CC0-1.0 OR Apache-2.0 | permissive | both |  |
-| indexmap | 2.14.0 | Apache-2.0 OR MIT | permissive | both |  |
+| imgref | 1.12.3 | CC0-1.0 OR Apache-2.0 | permissive | both |  |
+| indexmap | 2.14.2 | Apache-2.0 OR MIT | permissive | both |  |
 | input | 0.10.0 | MIT | permissive | both |  |
 | input-sys | 1.19.0 | MIT | permissive | both | libinput: MIT (permissive) |
 | io-lifetimes | 1.0.11 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
@@ -199,14 +199,14 @@ table below.
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
 | linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
 | linux-raw-sys | 0.9.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
-| log | 0.4.33 | MIT OR Apache-2.0 | permissive | both |  |
+| log | 0.4.34 | MIT OR Apache-2.0 | permissive | both |  |
 | loop9 | 0.1.5 | MIT | permissive | both |  |
 | maybe-rayon | 0.1.1 | MIT | permissive | both |  |
 | memchr | 2.8.3 | Unlicense OR MIT | permissive | both |  |
 | memmap2 | 0.9.11 | MIT OR Apache-2.0 | permissive | both |  |
 | memoffset | 0.9.1 | MIT | permissive | both |  |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | permissive | both |  |
-| moxcms | 0.7.11 | BSD-3-Clause OR Apache-2.0 | permissive | both |  |
+| moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | permissive | both |  |
 | new_debug_unreachable | 1.0.6 | MIT | permissive | both |  |
 | no_std_io2 | 0.9.4 | Apache-2.0 OR MIT | permissive | both |  |
 | nom | 8.0.0 | MIT | permissive | both |  |
@@ -214,13 +214,13 @@ table below.
 | num-bigint | 0.4.8 | MIT OR Apache-2.0 | permissive | both |  |
 | num-complex | 0.4.6 | MIT OR Apache-2.0 | permissive | both |  |
 | num-derive | 0.4.2 | MIT OR Apache-2.0 | permissive | both |  |
-| num-integer | 0.1.46 | MIT OR Apache-2.0 | permissive | both |  |
+| num-integer | 0.1.47 | MIT OR Apache-2.0 | permissive | both |  |
 | num-rational | 0.4.2 | MIT OR Apache-2.0 | permissive | both |  |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | permissive | both |  |
 | nvcodec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture (libnvidia-fbc.so.1) and CUDA driver (libcuda.so.1): proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings are declarations generated from the CUDA toolkit headers (permissive) |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | permissive | both |  |
-| openh264 | 0.9.7 | BSD-2-Clause | permissive | non-GPL only |  |
-| openh264-sys2 | 0.9.7 | BSD-2-Clause | permissive | non-GPL only | Cisco OpenH264 2.6 (vendored source): BSD-2-Clause (permissive) |
+| openh264 | 0.9.8 | BSD-2-Clause | permissive | non-GPL only |  |
+| openh264-sys2 | 0.9.8 | BSD-2-Clause | permissive | non-GPL only | Cisco OpenH264 2.6 (vendored source): BSD-2-Clause (permissive) |
 | ordered-stream | 0.2.0 | MIT OR Apache-2.0 | permissive | both |  |
 | parking | 2.2.1 | Apache-2.0 OR MIT | permissive | both |  |
 | paste | 1.0.15 | MIT OR Apache-2.0 | permissive | both |  |
@@ -252,7 +252,7 @@ table below.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | permissive | both |  |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 | permissive | both |  |
 | rav1e | 0.8.1 | BSD-2-Clause | permissive | both |  |
-| ravif | 0.12.0 | BSD-3-Clause | permissive | both |  |
+| ravif | 0.13.0 | BSD-3-Clause | permissive | both |  |
 | raw-cpuid | 11.6.0 | MIT | permissive | both |  |
 | rayon | 1.12.0 | MIT OR Apache-2.0 | permissive | both |  |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 | permissive | both |  |
@@ -260,7 +260,7 @@ table below.
 | rgb | 0.8.53 | MIT | permissive | both |  |
 | rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
-| safe_arch | 1.1.0 | Zlib OR Apache-2.0 OR MIT | permissive | non-GPL only |  |
+| safe_arch | 1.2.0 | Zlib OR Apache-2.0 OR MIT | permissive | non-GPL only |  |
 | scoped-tls | 1.0.1 | MIT/Apache-2.0 | permissive | both |  |
 | serde | 1.0.229 | MIT OR Apache-2.0 | permissive | both |  |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | permissive | both |  |
@@ -272,17 +272,17 @@ table below.
 | simd-adler32 | 0.3.10 | MIT | permissive | both |  |
 | simd_helpers | 0.1.0 | MIT | permissive | both |  |
 | slab | 0.4.12 | MIT | permissive | both |  |
-| smallvec | 1.15.2 | MIT OR Apache-2.0 | permissive | both |  |
+| smallvec | 1.16.1 | MIT OR Apache-2.0 | permissive | both |  |
 | smithay | 0.7.0 | MIT | permissive | both |  |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | permissive | both |  |
 | syn | 2.0.119 | MIT OR Apache-2.0 | permissive | both |  |
-| syn | 3.0.3 | MIT OR Apache-2.0 | permissive | both |  |
+| syn | 3.0.5 | MIT OR Apache-2.0 | permissive | both |  |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 | permissive | both |  |
 | thiserror | 1.0.69 | MIT OR Apache-2.0 | permissive | both |  |
-| thiserror | 2.0.19 | MIT OR Apache-2.0 | permissive | both |  |
+| thiserror | 2.0.20 | MIT OR Apache-2.0 | permissive | both |  |
 | thiserror-impl | 1.0.69 | MIT OR Apache-2.0 | permissive | both |  |
-| thiserror-impl | 2.0.19 | MIT OR Apache-2.0 | permissive | both |  |
-| tiff | 0.10.3 | MIT | permissive | both |  |
+| thiserror-impl | 2.0.20 | MIT OR Apache-2.0 | permissive | both |  |
+| tiff | 0.11.3 | MIT | permissive | both |  |
 | tiny_http | 0.12.0 | MIT OR Apache-2.0 | permissive | both |  |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | permissive | both |  |
 | toml_edit | 0.25.15+spec-1.1.0 | MIT OR Apache-2.0 | permissive | both |  |
@@ -297,11 +297,11 @@ table below.
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | permissive | both |  |
 | uuid | 1.26.1 | Apache-2.0 OR MIT | permissive | both |  |
 | v_frame | 0.3.9 | BSD-2-Clause | permissive | both |  |
-| wasm-bindgen | 0.2.126 | MIT OR Apache-2.0 | permissive | both |  |
-| wasm-bindgen-macro | 0.2.126 | MIT OR Apache-2.0 | permissive | both |  |
-| wasm-bindgen-macro-support | 0.2.126 | MIT OR Apache-2.0 | permissive | both |  |
-| wasm-bindgen-shared | 0.2.126 | MIT OR Apache-2.0 | permissive | both |  |
-| wayland-backend | 0.3.16 | MIT | permissive | both |  |
+| wasm-bindgen | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
+| wasm-bindgen-macro | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
+| wasm-bindgen-macro-support | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
+| wasm-bindgen-shared | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
+| wayland-backend | 0.3.17 | MIT | permissive | both |  |
 | wayland-client | 0.31.15 | MIT | permissive | both |  |
 | wayland-protocols | 0.32.13 | MIT | permissive | both |  |
 | wayland-protocols-misc | 0.3.12 | MIT | permissive | both |  |
@@ -311,28 +311,28 @@ table below.
 | wayland-server | 0.31.14 | MIT | permissive | both |  |
 | wayland-sys | 0.31.11 | MIT | permissive | both | libwayland-server: MIT (permissive) |
 | weezl | 0.1.12 | MIT OR Apache-2.0 | permissive | both |  |
-| wide | 1.6.1 | Zlib OR Apache-2.0 OR MIT | permissive | non-GPL only |  |
+| wide | 1.7.0 | Zlib OR Apache-2.0 OR MIT | permissive | non-GPL only |  |
 | winnow | 1.0.4 | MIT | permissive | both |  |
-| x11rb | 0.13.2 | MIT OR Apache-2.0 | permissive | both |  |
-| x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 | permissive | both |  |
+| x11rb | 0.14.0 | MIT OR Apache-2.0 | permissive | both |  |
+| x11rb-protocol | 0.14.0 | MIT OR Apache-2.0 | permissive | both |  |
 | x264-sys | 0.2.3 | MIT | permissive | GPL only | libx264: GPL-2.0-or-later (copyleft) |
 | xcursor | 0.3.11 | MIT | permissive | both |  |
 | xkbcommon | 0.9.0 | MIT | permissive | both | libxkbcommon: MIT (permissive) |
 | xkeysym | 0.2.1 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | xxhash-rust | 0.8.18 | BSL-1.0 | permissive | both |  |
 | y4m | 0.8.0 | MIT | permissive | both |  |
-| yuv | 0.8.16 | BSD-3-Clause OR Apache-2.0 | permissive | both |  |
+| yuv | 0.8.18 | BSD-3-Clause OR Apache-2.0 | permissive | both |  |
 | zbus | 5.19.0 | MIT | permissive | both |  |
 | zbus_macros | 5.19.0 | MIT | permissive | both |  |
 | zbus_names | 4.3.4 | MIT | permissive | both |  |
 | zcheapstr | 1.1.0 | MIT | permissive | both |  |
-| zerocopy | 0.8.55 | BSD-2-Clause OR Apache-2.0 OR MIT | permissive | both |  |
-| zerocopy-derive | 0.8.55 | BSD-2-Clause OR Apache-2.0 OR MIT | permissive | both |  |
+| zerocopy | 0.8.57 | BSD-2-Clause OR Apache-2.0 OR MIT | permissive | both |  |
+| zerocopy-derive | 0.8.57 | BSD-2-Clause OR Apache-2.0 OR MIT | permissive | both |  |
 | zmij | 1.0.23 | MIT | permissive | both |  |
-| zune-core | 0.4.12 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
-| zune-core | 0.5.1 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
+| zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
+| zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | zune-inflate | 0.2.54 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
-| zune-jpeg | 0.4.21 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
+| zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | zvariant | 5.15.0 | MIT | permissive | both |  |
 | zvariant_derive | 5.15.0 | MIT | permissive | both |  |
