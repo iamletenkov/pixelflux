@@ -482,6 +482,17 @@ enum DmaBufInput {
 /// The NVENC packed input format whose byte order is a dmabuf's: the XR24 / AR24 family is
 /// B,G,R,A in memory (NVENC's word-ordered `ARGB`), the XB24 / AB24 family R,G,B,A (`ABGR`).
 /// `None` for any other fourcc — nothing NVENC reads as packed 8-bit RGB.
+/// The fourcc a dmabuf is described with for CUDA's EGL import: the alpha-carrying twin of an
+/// X-format, since the NVIDIA driver refuses XRGB/XBGR images there while the bytes lie identically
+/// and NVENC ignores the alpha channel of ARGB/ABGR input.
+fn egl_import_fourcc(code: Fourcc) -> Fourcc {
+    match code {
+        Fourcc::Xrgb8888 => Fourcc::Argb8888,
+        Fourcc::Xbgr8888 => Fourcc::Abgr8888,
+        other => other,
+    }
+}
+
 fn fourcc_nvenc_format(code: Fourcc) -> Option<NV_ENC_BUFFER_FORMAT> {
     match code {
         Fourcc::Argb8888 | Fourcc::Xrgb8888 => Some(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB),
@@ -2499,7 +2510,7 @@ impl NvencEncoder {
                     EGL_HEIGHT,
                     self.height as i32,
                     EGL_LINUX_DRM_FOURCC_EXT,
-                    fmt.code as i32,
+                    egl_import_fourcc(fmt.code) as i32,
                     EGL_DMA_BUF_PLANE0_FD_EXT,
                     fd,
                     EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -5027,6 +5038,16 @@ mod decision_tests {
         }
         for code in [Fourcc::Rgb565, Fourcc::Nv12, Fourcc::Argb2101010, Fourcc::Bgra8888, Fourcc::Rgba8888] {
             assert_eq!(fourcc_nvenc_format(code), None, "{code:?}");
+        }
+    }
+
+    /// The EGL import names X-formats by their alpha twin and leaves everything else alone.
+    #[test]
+    fn egl_import_names_alpha_twins() {
+        assert_eq!(egl_import_fourcc(Fourcc::Xrgb8888), Fourcc::Argb8888);
+        assert_eq!(egl_import_fourcc(Fourcc::Xbgr8888), Fourcc::Abgr8888);
+        for code in [Fourcc::Argb8888, Fourcc::Abgr8888, Fourcc::Nv12] {
+            assert_eq!(egl_import_fourcc(code), code);
         }
     }
 }
