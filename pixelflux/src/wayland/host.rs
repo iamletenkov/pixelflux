@@ -25,13 +25,25 @@
 //! layout's bounding box. All capture-side waits poll a wake pipe next to the
 //! Wayland socket, so a resize or teardown lands immediately even while the
 //! thread is parked in a `copy_with_damage` wait on a static screen.
+//!
+//! A host without those protocols (GNOME, KDE before ext-image-copy-capture) is captured
+//! through xdg-desktop-portal instead: one RemoteDesktop session hands out a PipeWire stream per
+//! monitor and takes the input the seat lacks a virtual device for (`portal`, `pwcapture`).
+//! Each rung is chosen per capability from the registry — frames, keyboard and pointer each
+//! take the Wayland protocol where the host offers it and the portal where it does not — so a
+//! KWin that serves ext-image-copy-capture but no virtual pointer still gets its pointer from
+//! the portal. Portal keys go by keysym, resolved from selkies' own keymap, so the host applies
+//! its layout to the symbol rather than to a keycode from another layout. The compositor owns
+//! the portal buffers: a dmabuf frame is imported where it lies and a memfd frame is read in
+//! place, and the portal stream is asked for at most the capture's rate so no frame is
+//! produced only to be dropped.
 
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use gbm::{BufferObjectFlags, Device as GbmDevice, Format as GbmFormat};
@@ -74,6 +86,9 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
+use crate::wayland::cursor::CursorJob;
+use crate::wayland::portal::{self, PortalSession, PortalStream};
+use crate::wayland::pwcapture::{PwCore, PwStream, StreamConfig};
 use crate::wayland::wlclient::{
     bounded_roundtrip, drain_pipe, impl_sync_callback, memfd_with, socket_path, wait_readable2,
     wake_pipe, wake_write, SyncState,
@@ -86,8 +101,8 @@ const SLOTS: usize = 2;
 
 /// A frame the compositor finished blitting, ready for the encoder.
 pub struct HostFrame {
-    generation: u64,
-    slot: usize,
+    pub(crate) generation: u64,
+    pub(crate) slot: usize,
     /// GPU path: the filled dmabuf (Arc-backed; the buffer itself stays owned by
     /// the capture thread and is reused once the slot is released).
     pub dmabuf: Option<Dmabuf>,
@@ -101,9 +116,11 @@ pub struct HostFrame {
 
 /// Borrow-by-Arc view of a software frame still sitting in its shm mapping.
 pub struct HostCpuFrame {
-    map: Arc<memmap2::MmapMut>,
-    stride: usize,
-    format: u32,
+    pub(crate) map: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    /// First byte of the frame within the mapping.
+    pub(crate) offset: usize,
+    pub(crate) stride: usize,
+    pub(crate) format: u32,
 }
 
 /// Source bytes-per-pixel and whether R and B swap to reach BGRA, for one announced wl_shm
@@ -168,13 +185,15 @@ impl HostCpuFrame {
     pub fn write_bgra(&self, w: i32, h: i32, dst: &mut [u8]) {
         let row = (w * 4) as usize;
         let (src_bpp, swap_rb) = shm_src_layout(self.format);
+        let bytes: &[u8] = (*self.map).as_ref();
+        let bytes = &bytes[self.offset.min(bytes.len())..];
         for y in 0..h as usize {
             let src_start = y * self.stride;
-            let src_end = (src_start + src_bpp * w as usize).min(self.map.len());
+            let src_end = (src_start + src_bpp * w as usize).min(bytes.len());
             if src_start >= src_end || (y + 1) * row > dst.len() {
                 break;
             }
-            let src_row = &self.map[src_start..src_end];
+            let src_row = &bytes[src_start..src_end];
             let dst_row = &mut dst[y * row..(y + 1) * row];
             convert_shm_row(src_row, dst_row, src_bpp, swap_rb);
         }
@@ -195,6 +214,8 @@ struct LayoutSlot {
     /// The host paints its cursor into the frames (the consumer's native cursor
     /// rendering); off, the consumer draws the cursor itself from the sprite callback.
     paint_cursor: bool,
+    /// The capture's rate in millihertz, the most a portal stream is asked to deliver.
+    fps_milli: u32,
 }
 
 /// What a capture thread is currently aiming at: the encoder's dimensions, the buffer
@@ -206,10 +227,11 @@ struct Want {
     size: (i32, i32),
     zero_copy: bool,
     paint_cursor: bool,
+    fps_milli: u32,
 }
 
 enum ToHost {
-    Start { width: i32, height: i32, zero_copy: bool, paint_cursor: bool },
+    Start { width: i32, height: i32, zero_copy: bool, paint_cursor: bool, fps_milli: u32 },
     /// Slot return; `generation` guards against slots recycled by a renegotiation
     /// while the consumer still held the frame.
     Release { generation: u64, slot: usize },
@@ -224,16 +246,17 @@ enum CtrlMsg {
 /// The capture thread's end of one output's frame queue: the frames, an exact count of those
 /// queued and not yet taken (so a wake that the timer has already served is recognised as
 /// such), and the calloop wake that follows every frame.
-struct FrameSink {
-    tx: Sender<HostFrame>,
-    queued: Arc<AtomicI64>,
-    wake: smithay::reexports::calloop::channel::Sender<usize>,
-    index: usize,
+#[derive(Clone)]
+pub(crate) struct FrameSink {
+    pub(crate) tx: Sender<HostFrame>,
+    pub(crate) queued: Arc<AtomicI64>,
+    pub(crate) wake: smithay::reexports::calloop::channel::Sender<usize>,
+    pub(crate) index: usize,
 }
 
 impl FrameSink {
     /// Queue `frame` and wake the consumer; false once the consumer is gone.
-    fn send(&self, frame: HostFrame) -> bool {
+    pub(crate) fn send(&self, frame: HostFrame) -> bool {
         if self.tx.send(frame).is_err() {
             return false;
         }
@@ -298,6 +321,9 @@ struct CtrlState {
     /// when the host keeps its own size (refused or unmanageable layout), the
     /// capture follows this instead of gating on the size it asked for.
     sizes: Arc<Mutex<Vec<(i32, i32)>>>,
+    /// Layout position and integer scale per output, registry-indexed.
+    positions: Vec<(i32, i32)>,
+    scales: Vec<i32>,
     /// Registry indices in display order (natural name sort — registry
     /// announcement order is not guaranteed to match output creation order).
     order: Vec<usize>,
@@ -413,6 +439,18 @@ impl Dispatch<wl_output::WlOutput, usize> for CtrlState {
                     sizes.resize(*idx + 1, (0, 0));
                 }
                 sizes[*idx] = (width, height);
+            }
+            wl_output::Event::Geometry { x, y, .. } => {
+                if state.positions.len() <= *idx {
+                    state.positions.resize(*idx + 1, (0, 0));
+                }
+                state.positions[*idx] = (x, y);
+            }
+            wl_output::Event::Scale { factor } => {
+                if state.scales.len() <= *idx {
+                    state.scales.resize(*idx + 1, 1);
+                }
+                state.scales[*idx] = factor.max(1);
             }
             _ => {}
         }
@@ -860,6 +898,14 @@ impl HostKeyboardState {
         Some(Self::serialize(state))
     }
 
+    /// The keysym `xkb_keycode` carries at the base level of the effective layout, if any.
+    fn base_keysym(&self, xkb_keycode: u32) -> Option<u32> {
+        let state = self.state.as_ref()?;
+        let layout = state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+        let sym = state.get_keymap().key_get_syms_by_level(xkb::Keycode::new(xkb_keycode), layout, 0).first()?.raw();
+        (sym != 0).then_some(sym)
+    }
+
     fn serialize(state: &xkb::State) -> SerializedMods {
         SerializedMods {
             depressed: state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
@@ -876,6 +922,10 @@ pub struct HostSession {
     vk: Option<ZwpVirtualKeyboardV1>,
     keyboard: Mutex<HostKeyboardState>,
     vptr: Option<ZwlrVirtualPointerV1>,
+    /// The portal session when frames or an input device come through xdg-desktop-portal.
+    portal: Option<Arc<PortalCtl>>,
+    /// Output geometry by rank, pairing portal streams with outputs.
+    geoms: Vec<OutputGeom>,
     ctrl_tx: Sender<CtrlMsg>,
     ctrl_wake: OwnedFd,
     outputs: Vec<OutputHandle>,
@@ -897,6 +947,8 @@ impl HostSession {
         display: &str,
         gbm_path: Option<std::path::PathBuf>,
         frame_wake: smithay::reexports::calloop::channel::Sender<usize>,
+        dma_formats: Vec<(u32, Vec<u64>)>,
+        cursor_tx: std::sync::mpsc::Sender<CursorJob>,
     ) -> Result<Self, String> {
         let path = socket_path(display).ok_or("XDG_RUNTIME_DIR is unset")?;
         let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
@@ -908,14 +960,28 @@ impl HostSession {
         bounded_roundtrip(&conn, &mut queue, &mut state)?;
 
         let seat = state.seat.clone().ok_or("host compositor advertises no wl_seat")?;
-        if !state.has_screencopy && !(state.has_ext_capture && state.has_ext_source) {
-            return Err(
-                "host compositor offers neither ext-image-copy-capture nor zwlr_screencopy_manager_v1 (v3)"
-                    .into(),
-            );
-        }
         if state.outputs.is_empty() {
             return Err("host compositor has no wl_output".into());
+        }
+        let native_capture = state.has_screencopy || (state.has_ext_capture && state.has_ext_source);
+        let portal_devices = if state.vk_mgr.is_none() { portal::DEVICE_KEYBOARD } else { 0 }
+            | if state.vptr_mgr.is_none() { portal::DEVICE_POINTER } else { 0 };
+        let portal = if !native_capture || portal_devices != 0 {
+            if PortalSession::available() {
+                Some(PortalCtl::spawn(!native_capture, portal_devices))
+            } else if native_capture {
+                None
+            } else {
+                return Err(
+                    "host compositor offers neither ext-image-copy-capture nor zwlr_screencopy_manager_v1 (v3), and no xdg-desktop-portal answers on the session bus"
+                        .into(),
+                );
+            }
+        } else {
+            None
+        };
+        if !native_capture {
+            println!("[HostCapture] host offers no capture protocol; frames come through the xdg-desktop-portal ScreenCast.");
         }
 
         let base_keymap = crate::wayland::vkclient::us_base_text();
@@ -933,14 +999,20 @@ impl HostSession {
                 Some(vk)
             }
             None => {
-                eprintln!("[HostCapture] no zwp_virtual_keyboard_manager_v1: keyboard injection disabled.");
+                eprintln!(
+                    "[HostCapture] no zwp_virtual_keyboard_manager_v1: keyboard {}.",
+                    if portal.is_some() { "goes through the portal by keysym" } else { "injection disabled" }
+                );
                 None
             }
         };
         let vptr = match &state.vptr_mgr {
             Some(mgr) => Some(mgr.create_virtual_pointer(Some(&seat), &qh, ())),
             None => {
-                eprintln!("[HostCapture] no zwlr_virtual_pointer_manager_v1: pointer injection disabled.");
+                eprintln!(
+                    "[HostCapture] no zwlr_virtual_pointer_manager_v1: pointer {}.",
+                    if portal.is_some() { "goes through the portal" } else { "injection disabled" }
+                );
                 None
             }
         };
@@ -952,6 +1024,20 @@ impl HostSession {
         order.sort_by_key(|&i| output_order_key(state.outputs[i].1.as_ref(), i));
         let names: Vec<Option<String>> =
             order.iter().map(|&i| state.outputs[i].1.clone()).collect();
+        let geoms: Vec<OutputGeom> = {
+            let sizes = state.sizes.lock().unwrap();
+            order
+                .iter()
+                .map(|&i| {
+                    let scale = state.scales.get(i).copied().unwrap_or(1).max(1);
+                    let size = sizes.get(i).copied().unwrap_or((0, 0));
+                    OutputGeom {
+                        pos: state.positions.get(i).copied().unwrap_or((0, 0)),
+                        logical: (size.0 / scale, size.1 / scale),
+                    }
+                })
+                .collect()
+        };
         state.order = order;
         println!(
             "[HostCapture] host outputs: {}.",
@@ -979,12 +1065,16 @@ impl HostSession {
             let expect = name.clone();
             let gbm_path = gbm_path.clone();
             let alive = alive.clone();
+            let portal_ctl = portal.clone().filter(|_| !native_capture);
+            let (dma_formats, cursor_tx, geoms) = (dma_formats.clone(), cursor_tx.clone(), geoms.clone());
             std::thread::Builder::new()
                 .name(format!("pf-host-cap{i}"))
                 .spawn(move || {
-                    if let Err(e) =
-                        capture_loop(&display, i, expect, gbm_path, from_main, wake_rd, sink)
-                    {
+                    let outcome = match portal_ctl {
+                        Some(ctl) => portal_capture_loop(i, ctl, from_main, sink, cursor_tx, dma_formats, geoms),
+                        None => capture_loop(&display, i, expect, gbm_path, from_main, wake_rd, sink),
+                    };
+                    if let Err(e) = outcome {
                         eprintln!("[HostCapture] output {i} capture ended: {e}");
                     }
                     if i == 0 {
@@ -1024,7 +1114,8 @@ impl HostSession {
 
         let layout = Mutex::new(std::collections::BTreeMap::new());
         let mut keyboard = HostKeyboardState::default();
-        if vk.is_some() && base_keymap.and_then(|text| keyboard.set_keymap(text)).is_none() {
+        let has_keyboard = vk.is_some() || portal_devices & portal::DEVICE_KEYBOARD != 0 && portal.is_some();
+        if has_keyboard && base_keymap.and_then(|text| keyboard.set_keymap(text)).is_none() {
             eprintln!(
                 "[HostCapture] base keymap unavailable: keys are dropped until selkies uploads its keymap."
             );
@@ -1034,6 +1125,8 @@ impl HostSession {
             vk,
             keyboard: Mutex::new(keyboard),
             vptr,
+            portal,
+            geoms,
             ctrl_tx,
             ctrl_wake,
             outputs,
@@ -1128,13 +1221,18 @@ impl HostSession {
         height: i32,
         zero_copy: bool,
         paint_cursor: bool,
+        fps: f64,
     ) -> u64 {
+        if let Some(ctl) = &self.portal {
+            ctl.set_paint(paint_cursor);
+        }
         let assignments = {
             let mut layout = self.layout.lock().unwrap();
             let slot = layout.entry(display_id).or_default();
             slot.want = (width, height);
             slot.zero_copy = zero_copy;
             slot.paint_cursor = paint_cursor;
+            slot.fps_milli = fps_milli(fps);
             slot.active = true;
             let active: Vec<(u32, LayoutSlot)> = layout
                 .iter()
@@ -1170,12 +1268,7 @@ impl HostSession {
             if size_mismatch {
                 self.drop_buffered_frames(rank);
             }
-            self.outputs[rank].send(ToHost::Start {
-                width: slot.want.0,
-                height: slot.want.1,
-                zero_copy: slot.zero_copy,
-                paint_cursor: slot.paint_cursor,
-            });
+            self.outputs[rank].send(slot.start());
             by_output.push(*slot);
         }
         self.send_apply(by_output)
@@ -1194,32 +1287,54 @@ impl HostSession {
                 return;
             }
             slot.zero_copy = zero_copy;
-            let (want, active, paint_cursor) = (slot.want, slot.active, slot.paint_cursor);
+            let (start, active) = (slot.start(), slot.active);
             let rank = layout
                 .iter()
                 .filter(|(_, s)| s.active)
                 .position(|(id, _)| *id == display_id);
             match rank {
-                Some(r) if active && r < self.outputs.len() => (r, want, paint_cursor),
+                Some(r) if active && r < self.outputs.len() => (r, start),
                 _ => return,
             }
         };
-        let (idx, want, paint_cursor) = target;
+        let (idx, start) = target;
         // Same geometry, new buffer type: a retained dmabuf cannot be consumed
         // by the shm path (nor vice versa), so everything buffered goes back.
         self.drop_buffered_frames(idx);
-        self.outputs[idx].send(ToHost::Start {
-            width: want.0,
-            height: want.1,
-            zero_copy,
-            paint_cursor,
-        });
+        self.outputs[idx].send(start);
+    }
+
+    /// Point `display_id`'s capture at a new rate: what a portal stream asks the compositor
+    /// to hold; the Wayland capture protocols are demand-driven and ignore it.
+    pub fn set_fps(&self, display_id: u32, fps: f64) {
+        let target = {
+            let mut layout = self.layout.lock().unwrap();
+            let slot = layout.entry(display_id).or_default();
+            let milli = fps_milli(fps);
+            if slot.fps_milli == milli {
+                return;
+            }
+            slot.fps_milli = milli;
+            let (start, active) = (slot.start(), slot.active);
+            let rank = layout
+                .iter()
+                .filter(|(_, s)| s.active)
+                .position(|(id, _)| *id == display_id);
+            match rank {
+                Some(r) if active && r < self.outputs.len() => (r, start),
+                _ => return,
+            }
+        };
+        self.outputs[target.0].send(target.1);
     }
 
     /// Switch every active capture between host-painted and consumer-drawn cursors
     /// (the consumer's native cursor rendering toggle), keeping geometry and buffer type.
     /// Frames already buffered stay valid either way. Idempotent.
     pub fn set_cursor_painting(&self, paint_cursor: bool) {
+        if let Some(ctl) = &self.portal {
+            ctl.set_paint(paint_cursor);
+        }
         let targets: Vec<(usize, LayoutSlot)> = {
             let mut layout = self.layout.lock().unwrap();
             let mut out = Vec::new();
@@ -1235,12 +1350,7 @@ impl HostSession {
             out
         };
         for (idx, slot) in targets {
-            self.outputs[idx].send(ToHost::Start {
-                width: slot.want.0,
-                height: slot.want.1,
-                zero_copy: slot.zero_copy,
-                paint_cursor,
-            });
+            self.outputs[idx].send(slot.start());
         }
     }
 
@@ -1278,7 +1388,7 @@ impl HostSession {
     /// output's capture ended): the owner drops the session and reports its captures as
     /// stopped, so they are rebuilt against a new connection instead of feeding a dead one.
     pub fn alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        self.alive.load(Ordering::Relaxed) && !self.portal.as_ref().is_some_and(|c| c.dead())
     }
 
     /// Hand one frame back to the pool (same path the drain/idle releases take).
@@ -1330,8 +1440,14 @@ impl HostSession {
         }
     }
 
-    /// Upload selkies' managed keymap to the virtual keyboard verbatim.
+    /// Take selkies' managed keymap: uploaded verbatim to the virtual keyboard, and the
+    /// table portal keys resolve their keysyms from.
     pub fn set_keymap(&self, text: &str) {
+        let mut keyboard = self.keyboard.lock().unwrap();
+        let Some(mods) = keyboard.set_keymap(text) else {
+            eprintln!("[HostCapture] keymap state update failed");
+            return;
+        };
         let Some(vk) = &self.vk else { return };
         let mut data = text.as_bytes().to_vec();
         data.push(0);
@@ -1342,19 +1458,16 @@ impl HostSession {
                 return;
             }
         };
-        let mut keyboard = self.keyboard.lock().unwrap();
-        let Some(mods) = keyboard.set_keymap(text) else {
-            eprintln!("[HostCapture] keymap state update failed");
-            return;
-        };
         vk.keymap(KEYMAP_FORMAT_XKB_V1, fd.as_fd(), data.len() as u32);
         vk.modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
         let _ = self.conn.flush();
     }
 
-    /// Key event in xkb numbering (evdev + 8), matching the seat injectors.
+    /// Key event in xkb numbering (evdev + 8), matching the seat injectors. The virtual
+    /// keyboard takes the keycode under selkies' keymap; the portal takes the keysym that
+    /// keycode carries at its base level, which the host resolves in its own layout, and the
+    /// evdev code only for a key without one.
     pub fn key(&self, xkb_keycode: u32, pressed: bool) {
-        let Some(vk) = &self.vk else { return };
         if xkb_keycode < 8 {
             return;
         }
@@ -1362,9 +1475,25 @@ impl HostSession {
         let Some(mods) = keyboard.update_key(xkb_keycode, pressed) else {
             return;
         };
-        vk.key(0, xkb_keycode - 8, if pressed { 1 } else { 0 });
-        vk.modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
-        let _ = self.conn.flush();
+        if let Some(vk) = &self.vk {
+            vk.key(0, xkb_keycode - 8, if pressed { 1 } else { 0 });
+            vk.modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
+            let _ = self.conn.flush();
+            return;
+        }
+        let sym = keyboard.base_keysym(xkb_keycode);
+        drop(keyboard);
+        self.with_portal(|p| match sym {
+            Some(sym) => p.keysym(sym as i32, pressed),
+            None => p.keycode(xkb_keycode as i32 - 8, pressed),
+        });
+    }
+
+    /// Run `f` with the portal session while one is live.
+    fn with_portal(&self, f: impl FnOnce(&PortalSession)) {
+        if let Some(live) = self.portal.as_ref().and_then(|c| c.live()) {
+            f(&live.session);
+        }
     }
 
     /// Union-layout bounding box of every active, output-backed display (the
@@ -1383,8 +1512,30 @@ impl HostSession {
         (w, h)
     }
 
+    /// The portal stream under a union-layout point and the point in that stream's logical
+    /// space: the active display whose slot holds the point (else the nearest slot), paired
+    /// with its stream by rank.
+    fn portal_target(&self, x: f64, y: f64) -> Option<(u32, f64, f64)> {
+        let live = self.portal.as_ref()?.live()?;
+        let slots: Vec<LayoutSlot> = {
+            let layout = self.layout.lock().unwrap();
+            layout.values().filter(|s| s.active).copied().take(self.outputs.len()).collect()
+        };
+        let rank = nearest_slot(&slots, x, y)?;
+        let assignment = assign_streams(&live.session.streams, &self.geoms);
+        let stream = &live.session.streams[(*assignment.get(rank)?)?];
+        let slot = &slots[rank];
+        let (sx, sy) = stream_point(slot, stream.size.unwrap_or(slot.want), x, y);
+        Some((stream.node_id, sx, sy))
+    }
+
     pub fn pointer_motion_abs(&self, x: f64, y: f64) {
-        let Some(vp) = &self.vptr else { return };
+        let Some(vp) = &self.vptr else {
+            if let Some((node, sx, sy)) = self.portal_target(x, y) {
+                self.with_portal(|p| p.pointer_motion_abs(node, sx, sy));
+            }
+            return;
+        };
         let (w, h) = self.extent();
         if w <= 0 || h <= 0 {
             return;
@@ -1402,17 +1553,23 @@ impl HostSession {
     /// against a position tracked here could not do the second: the locked host pointer
     /// stays put, so every warp would read as the whole distance from the lock point.
     pub fn pointer_motion_rel(&self, dx: f64, dy: f64) {
-        let Some(vp) = &self.vptr else { return };
         if dx == 0.0 && dy == 0.0 {
             return;
         }
+        let Some(vp) = &self.vptr else {
+            self.with_portal(|p| p.pointer_motion(dx, dy));
+            return;
+        };
         vp.motion(0, dx, dy);
         vp.frame();
         let _ = self.conn.flush();
     }
 
     pub fn pointer_button(&self, btn: u32, pressed: bool) {
-        let Some(vp) = &self.vptr else { return };
+        let Some(vp) = &self.vptr else {
+            self.with_portal(|p| p.pointer_button(btn as i32, pressed));
+            return;
+        };
         vp.button(
             0,
             btn,
@@ -1427,10 +1584,24 @@ impl HostSession {
     /// see the same steps as in nested mode; a value below one notch stays continuous. The
     /// source follows each axis request, which is the axis it applies to on wlroots.
     pub fn pointer_axis(&self, dx: f64, dy: f64) {
-        let Some(vp) = &self.vptr else { return };
         if dx == 0.0 && dy == 0.0 {
             return;
         }
+        let steps = |value: f64| (value * crate::SCROLL_V120_PER_UNIT / 120.0).round() as i32;
+        let Some(vp) = &self.vptr else {
+            self.with_portal(|p| {
+                for (axis, value) in [(0u32, dy), (1u32, dx)] {
+                    if value == 0.0 {
+                        continue;
+                    }
+                    match steps(value) {
+                        0 => p.pointer_axis(if axis == 1 { value } else { 0.0 }, if axis == 0 { value } else { 0.0 }, true),
+                        n => p.pointer_axis_discrete(axis, n),
+                    }
+                }
+            });
+            return;
+        };
         for (axis, value) in [
             (wl_pointer::Axis::VerticalScroll, dy),
             (wl_pointer::Axis::HorizontalScroll, dx),
@@ -1438,7 +1609,7 @@ impl HostSession {
             if value == 0.0 {
                 continue;
             }
-            let steps = (value * crate::SCROLL_V120_PER_UNIT / 120.0).round() as i32;
+            let steps = steps(value);
             if steps != 0 {
                 vp.axis_discrete(0, axis, value, steps);
             } else {
@@ -1448,6 +1619,341 @@ impl HostSession {
         }
         vp.frame();
         let _ = self.conn.flush();
+    }
+}
+
+impl Drop for HostSession {
+    fn drop(&mut self) {
+        if let Some(ctl) = &self.portal {
+            ctl.close();
+        }
+    }
+}
+
+/// A capture rate as the millihertz a portal stream is asked to hold.
+fn fps_milli(fps: f64) -> u32 {
+    (fps.max(1.0) * 1000.0).round() as u32
+}
+
+impl LayoutSlot {
+    /// The Start message aiming a capture thread at this slot.
+    fn start(&self) -> ToHost {
+        ToHost::Start {
+            width: self.want.0,
+            height: self.want.1,
+            zero_copy: self.zero_copy,
+            paint_cursor: self.paint_cursor,
+            fps_milli: self.fps_milli,
+        }
+    }
+}
+
+/// The active slot holding `(x, y)`, else the one nearest to it, by rank.
+fn nearest_slot(slots: &[LayoutSlot], x: f64, y: f64) -> Option<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .map(|(rank, s)| {
+            let cx = x.clamp(s.pos.0 as f64, (s.pos.0 + s.want.0).max(s.pos.0) as f64);
+            let cy = y.clamp(s.pos.1 as f64, (s.pos.1 + s.want.1).max(s.pos.1) as f64);
+            (rank, (cx - x).powi(2) + (cy - y).powi(2))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(rank, _)| rank)
+}
+
+/// A union-layout point in the logical space of the stream behind `slot`: the slot captures
+/// its output at physical size `want`, the portal addresses it at logical size `logical`.
+fn stream_point(slot: &LayoutSlot, logical: (i32, i32), x: f64, y: f64) -> (f64, f64) {
+    let scale = |v: f64, from: i32, to: i32| {
+        let mapped = if from > 0 { v * to as f64 / from as f64 } else { v };
+        mapped.clamp(0.0, (to.max(1) - 1) as f64)
+    };
+    (scale(x - slot.pos.0 as f64, slot.want.0, logical.0), scale(y - slot.pos.1 as f64, slot.want.1, logical.1))
+}
+
+/// Wait, bounded, until the GPU work the compositor queued on a host dmabuf has finished:
+/// the CUDA import reads the buffer without honouring its implicit fences, so a frame
+/// encoded the instant it was announced could otherwise carry a half-blitted image. Drivers
+/// that attach no fence return at once.
+pub fn wait_gpu_done(dmabuf: &Dmabuf) {
+    for fd in dmabuf.handles() {
+        let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut pfd, 1, 50) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Portal rung: the session-wide portal, and the stream consumer per output.
+// ---------------------------------------------------------------------------
+
+/// One host output's placement, for pairing portal streams with outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OutputGeom {
+    /// Layout position in the compositor's logical space.
+    pos: (i32, i32),
+    /// Mode divided by the integer scale.
+    logical: (i32, i32),
+}
+
+/// Which portal stream backs each output rank: the stream announcing the output's position,
+/// else the one announcing its logical size when that is unambiguous, else the stream at the
+/// same index (a backend that sends no geometry lists monitors in its output order).
+fn assign_streams(streams: &[PortalStream], geoms: &[OutputGeom]) -> Vec<Option<usize>> {
+    let mut taken = vec![false; streams.len()];
+    let mut out = vec![None; geoms.len()];
+    for (rank, g) in geoms.iter().enumerate() {
+        if let Some(i) = streams.iter().position(|s| s.position == Some(g.pos)) && !taken[i] {
+            out[rank] = Some(i);
+            taken[i] = true;
+        }
+    }
+    for (rank, g) in geoms.iter().enumerate() {
+        if out[rank].is_some() {
+            continue;
+        }
+        let mut same_size = streams.iter().enumerate().filter(|(i, s)| !taken[*i] && s.position.is_none() && s.size == Some(g.logical));
+        if let (Some((i, _)), None) = (same_size.next(), same_size.next()) {
+            out[rank] = Some(i);
+            taken[i] = true;
+        }
+    }
+    for (rank, slot) in out.iter_mut().enumerate() {
+        if slot.is_none() && rank < streams.len() && !taken[rank] {
+            *slot = Some(rank);
+            taken[rank] = true;
+        }
+    }
+    out
+}
+
+/// A live portal session: the D-Bus session, and the PipeWire connection its streams live on
+/// when frames come through it.
+pub(crate) struct PortalLive {
+    pub(crate) session: PortalSession,
+    pub(crate) core: Option<Arc<PwCore>>,
+    /// Numbers the session so an output thread notices a reopened one.
+    pub(crate) epoch: u64,
+    /// The cursor painting this session was opened for.
+    paint: bool,
+}
+
+#[derive(Default)]
+struct PortalInner {
+    /// The cursor painting the next session opens with; none until the first Start decides.
+    paint: Option<bool>,
+    live: Option<Arc<PortalLive>>,
+    epoch: u64,
+    restore_token: Option<String>,
+    dead: Option<String>,
+    closed: bool,
+}
+
+/// Session-wide portal state: the session thread opens (and, when the cursor mode changes,
+/// reopens) the portal session; the outputs and the input methods read the live one.
+pub(crate) struct PortalCtl {
+    inner: Mutex<PortalInner>,
+    changed: Condvar,
+    capture: bool,
+    devices: u32,
+}
+
+impl PortalCtl {
+    fn spawn(capture: bool, devices: u32) -> Arc<Self> {
+        let ctl = Arc::new(PortalCtl {
+            inner: Mutex::new(PortalInner::default()),
+            changed: Condvar::new(),
+            capture,
+            devices,
+        });
+        let worker = ctl.clone();
+        let _ = std::thread::Builder::new().name("pf-host-portal".into()).spawn(move || portal_thread(worker));
+        ctl
+    }
+
+    /// The cursor painting the session should carry (embedded cursor, or cursor metadata
+    /// for the consumer to draw); a change reopens the session.
+    fn set_paint(&self, paint: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.paint != Some(paint) {
+            inner.paint = Some(paint);
+            self.changed.notify_all();
+        }
+    }
+
+    pub(crate) fn live(&self) -> Option<Arc<PortalLive>> {
+        self.inner.lock().unwrap().live.clone()
+    }
+
+    fn dead(&self) -> bool {
+        self.inner.lock().unwrap().dead.is_some()
+    }
+
+    fn mark_dead(&self, why: String) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.dead.is_none() {
+            eprintln!("[HostCapture] portal session lost: {why}");
+            inner.dead = Some(why);
+        }
+        inner.live = None;
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.closed = true;
+        inner.live = None;
+        self.changed.notify_all();
+    }
+}
+
+/// The portal thread: opens the session once the first Start has decided the cursor mode,
+/// reopens it (restoring with the token the backend gave) whenever that mode changes, and
+/// ends with the host session.
+fn portal_thread(ctl: Arc<PortalCtl>) {
+    loop {
+        let (paint, token) = {
+            let mut inner = ctl.inner.lock().unwrap();
+            loop {
+                if inner.closed || inner.dead.is_some() {
+                    return;
+                }
+                if let Some(p) = inner.paint
+                    && inner.live.as_ref().is_none_or(|l| l.paint != p)
+                {
+                    break (p, inner.restore_token.clone().or_else(portal::saved_restore_token));
+                }
+                inner = ctl.changed.wait(inner).unwrap();
+            }
+        };
+        // The outgoing session closes outside the lock; its Close is what stops the backend's
+        // streams before the new session asks for them again.
+        let old = ctl.inner.lock().unwrap().live.take();
+        drop(old);
+        let cursor_mode = if ctl.capture && !paint { portal::CURSOR_METADATA } else { portal::CURSOR_EMBEDDED };
+        let opened = PortalSession::open(ctl.capture, ctl.devices, cursor_mode, token.as_deref()).and_then(|session| {
+            let core = if ctl.capture { Some(PwCore::connect(session.open_pipewire_remote()?)?) } else { None };
+            Ok((session, core))
+        });
+        let mut inner = ctl.inner.lock().unwrap();
+        match opened {
+            Ok((session, core)) => {
+                inner.epoch += 1;
+                if session.restore_token.is_some() {
+                    inner.restore_token = session.restore_token.clone();
+                }
+                println!(
+                    "[HostCapture] portal session open: {} stream(s), devices {}{}, cursor {}.",
+                    session.streams.len(),
+                    if session.devices & portal::DEVICE_KEYBOARD != 0 { "keyboard " } else { "" },
+                    if session.devices & portal::DEVICE_POINTER != 0 { "pointer" } else { "" },
+                    match session.cursor_mode {
+                        portal::CURSOR_METADATA => "metadata",
+                        portal::CURSOR_EMBEDDED => "embedded",
+                        _ => "hidden",
+                    }
+                );
+                inner.live = Some(Arc::new(PortalLive { session, core, epoch: inner.epoch, paint }));
+            }
+            Err(e) => {
+                eprintln!("[HostCapture] portal session failed: {e}");
+                inner.dead = Some(e);
+            }
+        }
+        ctl.changed.notify_all();
+    }
+}
+
+/// The capture thread of a portal-fed output: it holds the PipeWire stream of the output's
+/// portal stream for as long as a Start aims at it, re-offering the stream's configuration
+/// on every change, returning released buffers, and following the portal session across
+/// reopenings. Frames themselves are published by the stream's own thread.
+fn portal_capture_loop(
+    index: usize,
+    ctl: Arc<PortalCtl>,
+    from_main: Receiver<ToHost>,
+    sink: FrameSink,
+    cursor_tx: std::sync::mpsc::Sender<CursorJob>,
+    dma_formats: Vec<(u32, Vec<u64>)>,
+    geoms: Vec<OutputGeom>,
+) -> Result<(), String> {
+    let mut want: Option<Want> = None;
+    let mut stream: Option<(PwStream, u64)> = None;
+    let mut warned_unshared = false;
+    loop {
+        let first = match from_main.recv_timeout(Duration::from_millis(100)) {
+            Ok(m) => Some(m),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let mut pending: Vec<ToHost> = first.into_iter().collect();
+        loop {
+            match from_main.try_recv() {
+                Ok(m) => pending.push(m),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        for msg in pending {
+            match msg {
+                ToHost::Release { generation, slot } => {
+                    if let Some((s, _)) = &stream {
+                        s.release(generation, slot);
+                    }
+                }
+                ToHost::Idle => {
+                    want = None;
+                    if let Some((s, _)) = &stream {
+                        s.release_all();
+                        s.set_active(false);
+                    }
+                }
+                ToHost::Start { width, height, zero_copy, paint_cursor, fps_milli } => {
+                    want = Some(Want { size: (width, height), zero_copy, paint_cursor, fps_milli });
+                }
+            }
+        }
+        let live = ctl.live();
+        if let Some((_, epoch)) = &stream
+            && live.as_ref().is_none_or(|l| l.epoch != *epoch)
+        {
+            stream = None;
+        }
+        let Some(w) = want else { continue };
+        let Some(live) = live else { continue };
+        let Some(core) = live.core.as_ref() else { continue };
+        let cfg = StreamConfig {
+            zero_copy: w.zero_copy && !dma_formats.is_empty(),
+            dma_formats: dma_formats.clone(),
+            fps_milli: w.fps_milli,
+            expect: w.size,
+        };
+        match &stream {
+            Some((s, _)) => {
+                s.reconfigure(cfg);
+                s.set_active(true);
+                if s.errored() {
+                    ctl.mark_dead(format!("output {index}: PipeWire stream failed"));
+                    return Err("PipeWire stream failed".into());
+                }
+            }
+            None => {
+                let Some(si) = assign_streams(&live.session.streams, &geoms).get(index).copied().flatten() else {
+                    if !warned_unshared {
+                        warned_unshared = true;
+                        eprintln!("[HostCapture] output {index}: the portal shares no stream for it; nothing captured.");
+                    }
+                    continue;
+                };
+                match PwStream::connect(core, live.session.streams[si].node_id, sink.clone(), cursor_tx.clone(), cfg) {
+                    Ok(s) => stream = Some((s, live.epoch)),
+                    Err(e) => {
+                        ctl.mark_dead(format!("output {index}: {e}"));
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1880,8 +2386,8 @@ fn capture_loop(
                     }
                 }
                 ToHost::Idle => want = None,
-                ToHost::Start { width, height, zero_copy, paint_cursor } => {
-                    let next = Want { size: (width, height), zero_copy, paint_cursor };
+                ToHost::Start { width, height, zero_copy, paint_cursor, fps_milli } => {
+                    let next = Want { size: (width, height), zero_copy, paint_cursor, fps_milli };
                     if want != Some(next) {
                         warned_mismatch = false;
                     }
@@ -2092,7 +2598,8 @@ fn capture_loop(
                 slot: slot_idx,
                 dmabuf: None,
                 cpu: Some(HostCpuFrame {
-                    map: map.clone(),
+                    map: map.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>,
+                    offset: 0,
                     stride: *stride as usize,
                     format: *format,
                 }),
@@ -2186,8 +2693,8 @@ fn capture_loop_ext(
                     }
                 }
                 ToHost::Idle => *want = None,
-                ToHost::Start { width, height, zero_copy, paint_cursor } => {
-                    let next = Want { size: (width, height), zero_copy, paint_cursor };
+                ToHost::Start { width, height, zero_copy, paint_cursor, fps_milli } => {
+                    let next = Want { size: (width, height), zero_copy, paint_cursor, fps_milli };
                     if *want != Some(next) {
                         warned_mismatch = false;
                     }
@@ -2401,7 +2908,8 @@ fn capture_loop_ext(
                 slot: slot_idx,
                 dmabuf: None,
                 cpu: Some(HostCpuFrame {
-                    map: map.clone(),
+                    map: map.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>,
+                    offset: 0,
                     stride: *stride as usize,
                     format: *format,
                 }),
@@ -2507,8 +3015,8 @@ fn drain_ctl(
                     free.push(slot);
                 }
             }
-            Ok(ToHost::Start { width, height, zero_copy, paint_cursor }) => {
-                let next = Want { size: (width, height), zero_copy, paint_cursor };
+            Ok(ToHost::Start { width, height, zero_copy, paint_cursor, fps_milli }) => {
+                let next = Want { size: (width, height), zero_copy, paint_cursor, fps_milli };
                 if *want != Some(next) {
                     *want = Some(next);
                     out = Ctl::Renegotiate;

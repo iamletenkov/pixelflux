@@ -31,6 +31,11 @@ pub mod kdeproto;
 pub mod ficlient;
 /// Host-capture mode: capture/inject as a client of an external compositor.
 pub mod host;
+/// xdg-desktop-portal RemoteDesktop/ScreenCast session: streams and input for hosts without
+/// the privileged Wayland protocols.
+pub mod portal;
+/// PipeWire consumer turning a portal monitor stream into host frames.
+pub mod pwcapture;
 
 /// An enabled screen as clients see it: name, layout position and the size of
 /// the mode it currently holds.

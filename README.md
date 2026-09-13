@@ -122,6 +122,24 @@ buffer plan: with a GPU the host blits into GBM dmabufs that the encoder imports
 CPU copy anywhere), a host that cannot import our dmabufs (other GPU, software renderer) is
 captured through shm instead, and both are damage-gated so a static screen costs nothing.
 
+A host that offers neither protocol — GNOME, or KDE before its `ext-image-copy-capture`
+support — is captured through **xdg-desktop-portal** instead: one `RemoteDesktop` session on the
+session bus (`DBUS_SESSION_BUS_ADDRESS`) hands out a PipeWire stream per monitor, and takes the
+keyboard and pointer where the host has no virtual-input protocol for them. Each capability
+picks its rung from the registry, so a KWin that serves `ext-image-copy-capture` but no
+`zwlr-virtual-pointer` gets its frames natively and its pointer from the portal. The compositor
+owns the portal's buffers: a dmabuf frame is imported by the encoder where it lies (the stream
+offers the modifiers the encoder's display imports) and a memfd frame is read in place, cursor
+metadata delivers the host's own cursor sprite to the cursor callback, and the stream is asked
+for at most the capture's frame rate. Portal keys travel as keysyms resolved from the uploaded
+keymap, so the host applies its layout to the symbol. The portal's consent dialog, where a
+backend shows one (GNOME; KDE shows none to an unsandboxed process), blocks only the first
+start: the restore token the backend hands back is kept in
+`$XDG_STATE_HOME/pixelflux/portal-restore-token` (`~/.local/state` by default) and restores the
+session without a dialog when it is reopened to change the cursor mode and on every later
+start. `libpipewire-0.3` is loaded at run time as for the virtual camera; the bus client is pure
+Rust.
+
 Displays map onto host outputs by rank, so multi-display capture needs the host to expose that
 many outputs: `ScreenCapture.output_capacity()` reports the host's output count (`-1` when
 self-compositing, where outputs are created on demand), and `create_output` refuses ids the

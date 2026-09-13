@@ -98,6 +98,18 @@ budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test 
 wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
 from source ahead of FFmpeg.
 
+Host capture of an external Wayland compositor (`wayland/host.rs`, `wayland_host_display`) picks each
+rung per capability from the host's registry, never by a setting: frames through
+`ext-image-copy-capture` or `wlr-screencopy` into pixelflux-allocated dmabufs, else through an
+xdg-desktop-portal RemoteDesktop/ScreenCast session whose PipeWire streams are imported where they lie
+(`wayland/portal.rs` over the pure-Rust zbus client, `wayland/pwcapture.rs` over the run-time
+libpipewire binding shared with the webcam sink in `pipewire.rs`); keyboard and pointer through the
+virtual-keyboard and virtual-pointer protocols where offered, else through the same portal session by
+keysym. The KDE 5.27 session the sandbox can run (`kwin_wayland --virtual` with
+`xdg-desktop-portal-kde` on a private bus) is the real non-wlroots target for the portal rung; it shows
+no consent dialog to an unsandboxed app and offers memfd frames only, so the dmabuf import of a portal
+stream is verified against GNOME or KDE 6 on a GPU host.
+
 X11 capture has two backends and picks between them itself (`x11::run_capture`): NvFBC
 (`x11/nvfbc.rs`) where the NVIDIA driver composites the screen into video memory and the buffer is
 registered with NVENC in place, which is zero-copy and the lower-latency path, and the general

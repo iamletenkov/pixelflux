@@ -148,6 +148,8 @@ pub mod recorder;
 pub mod computer_use;
 /// Frame-processing policy shared by the X11 and Wayland backends.
 pub mod pipeline;
+/// Run-time libpipewire binding and SPA pod encoding shared by the webcam sink and host capture.
+pub mod pipewire;
 /// X11/XShm capture loop, stripe dispatch, and per-stripe change detection.
 pub mod x11;
 /// Multi-GPU NVENC device filtering via kernel ioctl.
@@ -1899,10 +1901,26 @@ fn start_capture_on_display(
         } else {
             None
         };
+        // The dmabuf formats the encoder's display imports are what a portal stream may
+        // offer the compositor for zero-copy frames; a CPU session offers none.
+        let dma_formats: Vec<(u32, Vec<u64>)> = match (&state.gles_renderer, state.use_gpu) {
+            (Some(renderer), true) => {
+                let formats = renderer.egl_context().display().dmabuf_texture_formats();
+                [Fourcc::Xrgb8888, Fourcc::Argb8888]
+                    .into_iter()
+                    .map(|code| {
+                        (code as u32, formats.iter().filter(|f| f.code == code).map(|f| u64::from(f.modifier)).collect())
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         match crate::wayland::host::HostSession::connect(
             &settings.wayland_host_display,
             gbm_path,
             state.host_frame_tx.clone(),
+            dma_formats,
+            state.cursor_tx.clone(),
         ) {
             Ok(h) => {
                 println!(
@@ -2167,6 +2185,7 @@ fn start_capture_on_display(
             settings.height,
             video_encoder.is_some(),
             settings.capture_cursor,
+            settings.target_fps,
         );
         state.host_layout_pending.insert(
             display_id,
@@ -2884,6 +2903,10 @@ fn render_node_tick(
             }
             RETAINED_OK
         });
+        // A fresh blit may still be in flight on the GPU when the compositor announces it.
+        if have_new && let Some(src) = host_enc_dmabuf.as_ref() {
+            wayland::host::wait_gpu_done(src);
+        }
         // GPU path: composite the watermark and serve screenshot readbacks with
         // the renderer. A bouncing watermark re-composes retained content into
         // this display's offscreen target every tick (drawing in place would
@@ -5160,7 +5183,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         && let Some(cap) = state.output_nodes[idx].capture.as_mut() {
                             if let Some(b) = bitrate_kbps { cap.settings.video_bitrate_kbps = b; }
                             if let Some(v) = vbv_multiplier { cap.settings.video_vbv_multiplier = v; }
-                            if let Some(f) = fps && f > 0.0 { cap.settings.target_fps = f; }
+                            if let Some(f) = fps && f > 0.0 {
+                                cap.settings.target_fps = f;
+                                if let Some(host) = state.host.as_ref() {
+                                    host.set_fps(display_id, f);
+                                }
+                            }
                             if let Some(enc) = cap.video_encoder.as_mut()
                                 && let Err(e) = enc.reconfigure_rate(&cap.settings) {
                                     // The failed re-open left no codec context: the next

@@ -9,294 +9,17 @@
 //!
 //! The stream is the graph driver: every published frame is copied into the node's latest-frame
 //! slot and one graph cycle is triggered; the process callback then fills whatever buffer the
-//! consumers negotiated (memfd-backed, mapped for us) from that slot.
+//! consumers negotiated (memfd-backed, mapped for us) from that slot. The library binding and the
+//! pod encoding live in `crate::pipewire`, shared with the portal screen capture.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use libloading::Library;
-
 use super::ring::{RingFormat, V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_MJPEG};
-
-const SPA_TYPE_ID: u32 = 3;
-const SPA_TYPE_INT: u32 = 4;
-const SPA_TYPE_RECTANGLE: u32 = 10;
-const SPA_TYPE_FRACTION: u32 = 11;
-const SPA_TYPE_OBJECT: u32 = 15;
-const SPA_TYPE_CHOICE: u32 = 19;
-const SPA_TYPE_OBJECT_FORMAT: u32 = 0x40003;
-const SPA_TYPE_OBJECT_PARAM_BUFFERS: u32 = 0x40004;
-const SPA_TYPE_OBJECT_PARAM_META: u32 = 0x40005;
-const SPA_PARAM_ENUM_FORMAT: u32 = 3;
-const SPA_PARAM_FORMAT: u32 = 4;
-const SPA_PARAM_BUFFERS: u32 = 5;
-const SPA_PARAM_META: u32 = 6;
-const SPA_FORMAT_MEDIA_TYPE: u32 = 1;
-const SPA_FORMAT_MEDIA_SUBTYPE: u32 = 2;
-const SPA_FORMAT_VIDEO_FORMAT: u32 = 0x20001;
-const SPA_FORMAT_VIDEO_SIZE: u32 = 0x20003;
-const SPA_FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
-const SPA_MEDIA_TYPE_VIDEO: u32 = 2;
-const SPA_MEDIA_SUBTYPE_RAW: u32 = 1;
-const SPA_MEDIA_SUBTYPE_MJPG: u32 = 0x20002;
-const SPA_VIDEO_FORMAT_I420: u32 = 2;
-const SPA_VIDEO_FORMAT_YUY2: u32 = 4;
-const SPA_VIDEO_FORMAT_NV12: u32 = 23;
-const SPA_PARAM_BUFFERS_BUFFERS: u32 = 1;
-const SPA_PARAM_BUFFERS_BLOCKS: u32 = 2;
-const SPA_PARAM_BUFFERS_SIZE: u32 = 3;
-const SPA_PARAM_BUFFERS_STRIDE: u32 = 4;
-const SPA_PARAM_BUFFERS_ALIGN: u32 = 5;
-const SPA_PARAM_BUFFERS_DATATYPE: u32 = 6;
-const SPA_PARAM_META_TYPE: u32 = 1;
-const SPA_PARAM_META_SIZE: u32 = 2;
-const SPA_META_HEADER: u32 = 1;
-const SPA_META_HEADER_SIZE: u32 = 32;
-const SPA_DATA_MEMPTR: u32 = 1;
-const SPA_DATA_MEMFD: u32 = 2;
-const SPA_CHOICE_RANGE: u32 = 1;
-const SPA_CHOICE_FLAGS: u32 = 4;
-const PW_DIRECTION_OUTPUT: c_int = 1;
-const PW_ID_ANY: u32 = 0xFFFF_FFFF;
-const PW_STREAM_FLAG_MAP_BUFFERS: u32 = 4;
-const PW_STREAM_FLAG_DRIVER: u32 = 8;
-const PW_STREAM_STATE_ERROR: c_int = -1;
-const PW_STREAM_STATE_PAUSED: c_int = 2;
-const PW_STREAM_STATE_STREAMING: c_int = 3;
-const PW_VERSION_STREAM_EVENTS: u32 = 2;
-
-#[repr(C)]
-struct PwStreamEvents {
-    version: u32,
-    destroy: Option<unsafe extern "C" fn(*mut c_void)>,
-    state_changed: Option<unsafe extern "C" fn(*mut c_void, c_int, c_int, *const c_char)>,
-    control_info: Option<unsafe extern "C" fn(*mut c_void, u32, *const c_void)>,
-    io_changed: Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32)>,
-    param_changed: Option<unsafe extern "C" fn(*mut c_void, u32, *const c_void)>,
-    add_buffer: Option<unsafe extern "C" fn(*mut c_void, *mut PwBuffer)>,
-    remove_buffer: Option<unsafe extern "C" fn(*mut c_void, *mut PwBuffer)>,
-    process: Option<unsafe extern "C" fn(*mut c_void)>,
-    drained: Option<unsafe extern "C" fn(*mut c_void)>,
-    command: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
-    trigger_done: Option<unsafe extern "C" fn(*mut c_void)>,
-}
-
-#[repr(C)]
-struct PwBuffer {
-    buffer: *mut SpaBuffer,
-    user_data: *mut c_void,
-    size: u64,
-    requested: u64,
-    time: u64,
-}
-
-#[repr(C)]
-struct SpaBuffer {
-    n_metas: u32,
-    n_datas: u32,
-    metas: *mut SpaMeta,
-    datas: *mut SpaData,
-}
-
-#[repr(C)]
-struct SpaMeta {
-    type_: u32,
-    size: u32,
-    data: *mut c_void,
-}
-
-#[repr(C)]
-struct SpaData {
-    type_: u32,
-    flags: u32,
-    fd: i64,
-    mapoffset: u32,
-    maxsize: u32,
-    data: *mut c_void,
-    chunk: *mut SpaChunk,
-}
-
-#[repr(C)]
-struct SpaChunk {
-    offset: u32,
-    size: u32,
-    stride: i32,
-    flags: i32,
-}
-
-#[repr(C)]
-struct SpaMetaHeader {
-    flags: u32,
-    offset: u32,
-    pts: i64,
-    dts_offset: i64,
-    seq: u64,
-}
-
-type PwInit = unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char);
-type PwThreadLoopNew = unsafe extern "C" fn(*const c_char, *const c_void) -> *mut c_void;
-type PwThreadLoopGetLoop = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
-type PwThreadLoopInt = unsafe extern "C" fn(*mut c_void) -> c_int;
-type PwThreadLoopVoid = unsafe extern "C" fn(*mut c_void);
-type PwContextNew = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
-type PwContextConnect = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
-type PwContextDestroy = unsafe extern "C" fn(*mut c_void);
-type PwCoreDisconnect = unsafe extern "C" fn(*mut c_void) -> c_int;
-type PwPropertiesNew = unsafe extern "C" fn(*const c_char, ...) -> *mut c_void;
-type PwPropertiesSet = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
-type PwStreamNew = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> *mut c_void;
-type PwStreamAddListener = unsafe extern "C" fn(*mut c_void, *mut c_void, *const PwStreamEvents, *mut c_void);
-type PwStreamConnect = unsafe extern "C" fn(*mut c_void, c_int, u32, u32, *mut *const c_void, u32) -> c_int;
-type PwStreamUpdateParams = unsafe extern "C" fn(*mut c_void, *mut *const c_void, u32) -> c_int;
-type PwStreamDequeueBuffer = unsafe extern "C" fn(*mut c_void) -> *mut PwBuffer;
-type PwStreamQueueBuffer = unsafe extern "C" fn(*mut c_void, *mut PwBuffer) -> c_int;
-type PwStreamTriggerProcess = unsafe extern "C" fn(*mut c_void) -> c_int;
-type PwStreamVoid = unsafe extern "C" fn(*mut c_void);
-type PwStreamInt = unsafe extern "C" fn(*mut c_void) -> c_int;
-
-/// Entry points resolved from `libpipewire-0.3.so.0`.
-#[derive(Clone, Copy)]
-struct Api {
-    thread_loop_new: PwThreadLoopNew,
-    thread_loop_get_loop: PwThreadLoopGetLoop,
-    thread_loop_start: PwThreadLoopInt,
-    thread_loop_stop: PwThreadLoopVoid,
-    thread_loop_lock: PwThreadLoopVoid,
-    thread_loop_unlock: PwThreadLoopVoid,
-    thread_loop_destroy: PwThreadLoopVoid,
-    context_new: PwContextNew,
-    context_connect: PwContextConnect,
-    context_destroy: PwContextDestroy,
-    core_disconnect: PwCoreDisconnect,
-    properties_new: PwPropertiesNew,
-    properties_set: PwPropertiesSet,
-    stream_new: PwStreamNew,
-    stream_add_listener: PwStreamAddListener,
-    stream_connect: PwStreamConnect,
-    stream_update_params: PwStreamUpdateParams,
-    stream_dequeue_buffer: PwStreamDequeueBuffer,
-    stream_queue_buffer: PwStreamQueueBuffer,
-    stream_trigger_process: PwStreamTriggerProcess,
-    stream_disconnect: PwStreamInt,
-    stream_destroy: PwStreamVoid,
-}
-
-/// The library handle is kept for the life of the process: PipeWire's own globals (pw_init) make
-/// unloading it unsafe, and every later camera reuses it.
-fn api() -> Result<&'static Api, String> {
-    static API: std::sync::OnceLock<Result<Api, String>> = std::sync::OnceLock::new();
-    API.get_or_init(|| unsafe {
-        let lib = Library::new("libpipewire-0.3.so.0").map_err(|e| format!("libpipewire-0.3 not available: {}", e))?;
-        macro_rules! sym {
-            ($name:literal, $t:ty) => {
-                *lib.get::<$t>(concat!($name, "\0").as_bytes()).map_err(|e| format!("{}: {}", $name, e))?
-            };
-        }
-        let init: PwInit = sym!("pw_init", PwInit);
-        let api = Api {
-            thread_loop_new: sym!("pw_thread_loop_new", PwThreadLoopNew),
-            thread_loop_get_loop: sym!("pw_thread_loop_get_loop", PwThreadLoopGetLoop),
-            thread_loop_start: sym!("pw_thread_loop_start", PwThreadLoopInt),
-            thread_loop_stop: sym!("pw_thread_loop_stop", PwThreadLoopVoid),
-            thread_loop_lock: sym!("pw_thread_loop_lock", PwThreadLoopVoid),
-            thread_loop_unlock: sym!("pw_thread_loop_unlock", PwThreadLoopVoid),
-            thread_loop_destroy: sym!("pw_thread_loop_destroy", PwThreadLoopVoid),
-            context_new: sym!("pw_context_new", PwContextNew),
-            context_connect: sym!("pw_context_connect", PwContextConnect),
-            context_destroy: sym!("pw_context_destroy", PwContextDestroy),
-            core_disconnect: sym!("pw_core_disconnect", PwCoreDisconnect),
-            properties_new: sym!("pw_properties_new", PwPropertiesNew),
-            properties_set: sym!("pw_properties_set", PwPropertiesSet),
-            stream_new: sym!("pw_stream_new", PwStreamNew),
-            stream_add_listener: sym!("pw_stream_add_listener", PwStreamAddListener),
-            stream_connect: sym!("pw_stream_connect", PwStreamConnect),
-            stream_update_params: sym!("pw_stream_update_params", PwStreamUpdateParams),
-            stream_dequeue_buffer: sym!("pw_stream_dequeue_buffer", PwStreamDequeueBuffer),
-            stream_queue_buffer: sym!("pw_stream_queue_buffer", PwStreamQueueBuffer),
-            stream_trigger_process: sym!("pw_stream_trigger_process", PwStreamTriggerProcess),
-            stream_disconnect: sym!("pw_stream_disconnect", PwStreamInt),
-            stream_destroy: sym!("pw_stream_destroy", PwStreamVoid),
-        };
-        init(ptr::null_mut(), ptr::null_mut());
-        mem::forget(lib);
-        Ok(api)
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
-}
-
-// --- SPA pod construction ---------------------------------------------------------------------
-
-fn push_u32(v: &mut Vec<u8>, x: u32) {
-    v.extend_from_slice(&x.to_ne_bytes());
-}
-
-fn pad8(v: &mut Vec<u8>) {
-    while !v.len().is_multiple_of(8) {
-        v.push(0);
-    }
-}
-
-fn pod_prim(v: &mut Vec<u8>, ty: u32, payload: &[u8]) {
-    push_u32(v, payload.len() as u32);
-    push_u32(v, ty);
-    v.extend_from_slice(payload);
-    pad8(v);
-}
-
-fn pod_id(v: &mut Vec<u8>, x: u32) {
-    pod_prim(v, SPA_TYPE_ID, &x.to_ne_bytes());
-}
-
-fn pod_int(v: &mut Vec<u8>, x: i32) {
-    pod_prim(v, SPA_TYPE_INT, &x.to_ne_bytes());
-}
-
-fn pod_rect(v: &mut Vec<u8>, w: u32, h: u32) {
-    let mut p = Vec::new();
-    push_u32(&mut p, w);
-    push_u32(&mut p, h);
-    pod_prim(v, SPA_TYPE_RECTANGLE, &p);
-}
-
-fn pod_frac(v: &mut Vec<u8>, num: u32, den: u32) {
-    let mut p = Vec::new();
-    push_u32(&mut p, num);
-    push_u32(&mut p, den);
-    pod_prim(v, SPA_TYPE_FRACTION, &p);
-}
-
-fn pod_choice_int(v: &mut Vec<u8>, choice: u32, values: &[i32]) {
-    let mut body = Vec::new();
-    push_u32(&mut body, choice);
-    push_u32(&mut body, 0);
-    push_u32(&mut body, 4);
-    push_u32(&mut body, SPA_TYPE_INT);
-    for x in values {
-        body.extend_from_slice(&x.to_ne_bytes());
-    }
-    pod_prim(v, SPA_TYPE_CHOICE, &body);
-}
-
-fn prop(v: &mut Vec<u8>, key: u32, value: impl FnOnce(&mut Vec<u8>)) {
-    push_u32(v, key);
-    push_u32(v, 0);
-    value(v);
-}
-
-fn object(ty: u32, id: u32, props: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    let mut body = Vec::new();
-    push_u32(&mut body, ty);
-    push_u32(&mut body, id);
-    props(&mut body);
-    let mut v = Vec::new();
-    pod_prim(&mut v, SPA_TYPE_OBJECT, &body);
-    v
-}
+use crate::pipewire::*;
 
 fn spa_video_format(fourcc: u32) -> Option<u32> {
     match fourcc {
@@ -473,18 +196,10 @@ impl PipeWireSink {
                 stream: ptr::null_mut(),
                 _hook: Box::new([0u64; 8]),
                 _events: Box::new(PwStreamEvents {
-                    version: PW_VERSION_STREAM_EVENTS,
-                    destroy: None,
                     state_changed: Some(on_state_changed),
-                    control_info: None,
-                    io_changed: None,
                     param_changed: Some(on_param_changed),
-                    add_buffer: None,
-                    remove_buffer: None,
                     process: Some(on_process),
-                    drained: None,
-                    command: None,
-                    trigger_done: None,
+                    ..PwStreamEvents::empty()
                 }),
                 _format_pod: format_pod(fmt, spa_format),
                 shared: Arc::new(Shared {
@@ -632,18 +347,8 @@ mod tests {
     /// Walk an object pod: (object type, param id, [keys]).
     fn parse_object(pod: &[u8]) -> (u32, u32, Vec<PodKey>) {
         assert_eq!(pod.len() % 8, 0);
-        assert_eq!(u32_at(pod, 0) as usize, pod.len() - 8);
-        assert_eq!(u32_at(pod, 4), SPA_TYPE_OBJECT);
-        let mut props = Vec::new();
-        let mut off = 16;
-        while off < pod.len() {
-            let key = u32_at(pod, off);
-            let size = u32_at(pod, off + 8) as usize;
-            let ty = u32_at(pod, off + 12);
-            props.push((key, ty, pod[off + 16..off + 16 + size].to_vec()));
-            off += 16 + size.div_ceil(8) * 8;
-        }
-        (u32_at(pod, 8), u32_at(pod, 12), props)
+        let (ty, id, props) = object_props(pod).unwrap();
+        (ty, id, props.into_iter().map(|p| (p.key, p.ty, p.payload.to_vec())).collect())
     }
 
     #[test]
@@ -701,18 +406,5 @@ mod tests {
         assert_eq!((mty, mid), (SPA_TYPE_OBJECT_PARAM_META, SPA_PARAM_META));
         assert_eq!(u32_at(&mprops[0].2, 0), SPA_META_HEADER);
         assert_eq!(u32_at(&mprops[1].2, 0), SPA_META_HEADER_SIZE);
-    }
-
-    #[test]
-    fn struct_layouts_match_libpipewire() {
-        assert_eq!(mem::size_of::<PwStreamEvents>(), 96);
-        assert_eq!(mem::size_of::<PwBuffer>(), 40);
-        assert_eq!(mem::size_of::<SpaBuffer>(), 24);
-        assert_eq!(mem::size_of::<SpaData>(), 40);
-        assert_eq!(mem::size_of::<SpaChunk>(), 16);
-        assert_eq!(mem::size_of::<SpaMetaHeader>(), 32);
-        assert_eq!(mem::offset_of!(PwStreamEvents, process), 64);
-        assert_eq!(mem::offset_of!(SpaData, data), 24);
-        assert_eq!(mem::offset_of!(SpaData, chunk), 32);
     }
 }
