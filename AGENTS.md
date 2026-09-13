@@ -104,8 +104,13 @@ rung per capability from the host's registry, never by a setting: frames through
 xdg-desktop-portal RemoteDesktop/ScreenCast session whose PipeWire streams are imported where they lie
 (`wayland/portal.rs` over the pure-Rust zbus client, `wayland/pwcapture.rs` over the run-time
 libpipewire binding shared with the webcam sink in `pipewire.rs`); keyboard and pointer through the
-virtual-keyboard and virtual-pointer protocols where offered, else through the same portal session by
-keysym, and a portal that refuses those devices is asked again for capture alone. The KDE 5.27 session the sandbox can run (`kwin_wayland --virtual` with
+virtual-keyboard and virtual-pointer protocols where offered, else through the portal — over libei
+(`wayland/eiclient.rs`, the pure-Rust `reis` client) where the backend answers `ConnectToEIS`, since
+that is the lower-latency channel and takes keyboard, pointer and touch, and otherwise the portal's
+own `Notify*` methods by keysym. A successful `ConnectToEIS` makes the session refuse `Notify*`, so
+libei is committed to only once its handshake binds a device, and the compositor's own keymap
+(delivered over EIS, read-only) resolves each key's base keysym with a raw-keycode fallback. A portal
+that refuses those devices is asked again for capture alone. The KDE 5.27 session the sandbox can run (`kwin_wayland --virtual` with
 `xdg-desktop-portal-kde` on a private bus) is the real non-wlroots target for the portal rung; it shows
 no consent dialog to an unsandboxed app and offers memfd frames only, so the dmabuf import of a portal
 stream is verified against GNOME or KDE 6 on a GPU host.

@@ -257,6 +257,7 @@ table below.
 | rayon | 1.12.0 | MIT OR Apache-2.0 | permissive | both |  |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 | permissive | both |  |
 | reborrow | 0.5.5 | MIT | permissive | both |  |
+| reis | 0.7.1 | MIT | permissive | both | pure-Rust libei/libeis; host-capture input over a portal EIS socket |
 | rgb | 0.8.53 | MIT | permissive | both |  |
 | rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |

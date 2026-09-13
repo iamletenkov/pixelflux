@@ -87,6 +87,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 
 use crate::wayland::cursor::CursorJob;
+use crate::wayland::eiclient::EiInjector;
 use crate::wayland::portal::{self, PortalSession, PortalStream};
 use crate::wayland::pwcapture::{PwCore, PwStream, StreamConfig};
 use crate::wayland::wlclient::{
@@ -1499,10 +1500,14 @@ impl HostSession {
         }
         let sym = keyboard.base_keysym(xkb_keycode);
         drop(keyboard);
-        self.with_portal(|p| match sym {
-            Some(sym) => p.keysym(sym as i32, pressed),
-            None => p.keycode(xkb_keycode as i32 - 8, pressed),
-        });
+        if let Some(live) = self.portal_ei() {
+            live.ei.as_ref().unwrap().key(xkb_keycode, sym, pressed);
+        } else {
+            self.with_portal(|p| match sym {
+                Some(sym) => p.keysym(sym as i32, pressed),
+                None => p.keycode(xkb_keycode as i32 - 8, pressed),
+            });
+        }
     }
 
     /// Run `f` with the portal session while one is live.
@@ -1510,6 +1515,15 @@ impl HostSession {
         if let Some(live) = self.portal.as_ref().and_then(|c| c.live()) {
             f(&live.session);
         }
+    }
+
+    /// The live portal session's libei injector, while one is up: input takes it over the
+    /// portal's `Notify*` methods where the backend granted an EIS socket.
+    fn portal_ei(&self) -> Option<Arc<PortalLive>> {
+        self.portal
+            .as_ref()
+            .and_then(|c| c.live())
+            .filter(|l| l.ei.as_ref().is_some_and(|e| e.alive()))
     }
 
     /// Union-layout bounding box of every active, output-backed display (the
@@ -1547,7 +1561,13 @@ impl HostSession {
 
     pub fn pointer_motion_abs(&self, x: f64, y: f64) {
         let Some(vp) = &self.vptr else {
-            if let Some((node, sx, sy)) = self.portal_target(x, y) {
+            if let Some(live) = self.portal_ei() {
+                let (w, h) = self.extent();
+                if w > 0 && h > 0 {
+                    let ei = live.ei.as_ref().unwrap();
+                    ei.pointer_motion_abs(x.clamp(0.0, (w - 1) as f64), y.clamp(0.0, (h - 1) as f64));
+                }
+            } else if let Some((node, sx, sy)) = self.portal_target(x, y) {
                 self.with_portal(|p| p.pointer_motion_abs(node, sx, sy));
             }
             return;
@@ -1573,7 +1593,11 @@ impl HostSession {
             return;
         }
         let Some(vp) = &self.vptr else {
-            self.with_portal(|p| p.pointer_motion(dx, dy));
+            if let Some(live) = self.portal_ei() {
+                live.ei.as_ref().unwrap().pointer_motion(dx, dy);
+            } else {
+                self.with_portal(|p| p.pointer_motion(dx, dy));
+            }
             return;
         };
         vp.motion(0, dx, dy);
@@ -1583,7 +1607,11 @@ impl HostSession {
 
     pub fn pointer_button(&self, btn: u32, pressed: bool) {
         let Some(vp) = &self.vptr else {
-            self.with_portal(|p| p.pointer_button(btn as i32, pressed));
+            if let Some(live) = self.portal_ei() {
+                live.ei.as_ref().unwrap().pointer_button(btn as i32, pressed);
+            } else {
+                self.with_portal(|p| p.pointer_button(btn as i32, pressed));
+            }
             return;
         };
         vp.button(
@@ -1605,17 +1633,28 @@ impl HostSession {
         }
         let steps = |value: f64| (value * crate::SCROLL_V120_PER_UNIT / 120.0).round() as i32;
         let Some(vp) = &self.vptr else {
-            self.with_portal(|p| {
+            let scroll = |axis: u32, value: f64, cont: &dyn Fn(f64, f64, bool), disc: &dyn Fn(u32, i32)| {
+                match steps(value) {
+                    0 => cont(if axis == 1 { value } else { 0.0 }, if axis == 0 { value } else { 0.0 }, true),
+                    n => disc(axis, n),
+                }
+            };
+            if let Some(live) = self.portal_ei() {
+                let ei = live.ei.as_ref().unwrap();
                 for (axis, value) in [(0u32, dy), (1u32, dx)] {
-                    if value == 0.0 {
-                        continue;
-                    }
-                    match steps(value) {
-                        0 => p.pointer_axis(if axis == 1 { value } else { 0.0 }, if axis == 0 { value } else { 0.0 }, true),
-                        n => p.pointer_axis_discrete(axis, n),
+                    if value != 0.0 {
+                        scroll(axis, value, &|x, y, f| ei.pointer_axis(x, y, f), &|a, n| ei.pointer_axis_discrete(a, n));
                     }
                 }
-            });
+            } else {
+                self.with_portal(|p| {
+                    for (axis, value) in [(0u32, dy), (1u32, dx)] {
+                        if value != 0.0 {
+                            scroll(axis, value, &|x, y, f| p.pointer_axis(x, y, f), &|a, n| p.pointer_axis_discrete(a, n));
+                        }
+                    }
+                });
+            }
             return;
         };
         for (axis, value) in [
@@ -1752,6 +1791,9 @@ pub(crate) struct PortalLive {
     pub(crate) epoch: u64,
     /// The cursor painting this session was opened for.
     paint: bool,
+    /// The libei injector when the portal handed out an EIS socket; input then rides it
+    /// instead of the portal's `Notify*` methods, which the session refuses once EIS is on.
+    ei: Option<EiInjector>,
 }
 
 #[derive(Default)]
@@ -1870,8 +1912,14 @@ fn portal_thread(ctl: Arc<PortalCtl>) {
                 if session.restore_token.is_some() {
                     inner.restore_token = session.restore_token.clone();
                 }
+                // Prefer libei where the backend offers it: the injector is kept only once its
+                // handshake binds a device, and a successful ConnectToEIS makes the session
+                // refuse the Notify* methods, so the choice stands for the session's life.
+                let ei = (session.devices != 0 && session.eis_capable())
+                    .then(|| open_eis(&session))
+                    .flatten();
                 println!(
-                    "[HostCapture] portal session open: {} stream(s), devices {}{}, cursor {}.",
+                    "[HostCapture] portal session open: {} stream(s), devices {}{}, cursor {}, input via {}.",
                     session.streams.len(),
                     if session.devices & portal::DEVICE_KEYBOARD != 0 { "keyboard " } else { "" },
                     if session.devices & portal::DEVICE_POINTER != 0 { "pointer" } else { "" },
@@ -1879,9 +1927,10 @@ fn portal_thread(ctl: Arc<PortalCtl>) {
                         portal::CURSOR_METADATA => "metadata",
                         portal::CURSOR_EMBEDDED => "embedded",
                         _ => "hidden",
-                    }
+                    },
+                    if ei.is_some() { "libei" } else { "portal notify" }
                 );
-                inner.live = Some(Arc::new(PortalLive { session, core, epoch: inner.epoch, paint }));
+                inner.live = Some(Arc::new(PortalLive { session, core, epoch: inner.epoch, paint, ei }));
             }
             Err(e) => {
                 eprintln!("[HostCapture] portal session failed: {e}");
@@ -1889,6 +1938,25 @@ fn portal_thread(ctl: Arc<PortalCtl>) {
             }
         }
         ctl.changed.notify_all();
+    }
+}
+
+/// Ask the portal for an EIS socket and bring an injector up on it, or `None` when the backend
+/// refuses `ConnectToEIS` (leaving the `Notify*` path live) or the EIS handshake binds nothing.
+fn open_eis(session: &PortalSession) -> Option<EiInjector> {
+    let fd = match session.connect_to_eis() {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("[HostCapture] portal offers no EIS socket ({e}); input goes through the portal.");
+            return None;
+        }
+    };
+    match EiInjector::spawn(fd) {
+        Ok(ei) => Some(ei),
+        Err(e) => {
+            eprintln!("[HostCapture] EIS injector unavailable ({e}); input goes through the portal.");
+            None
+        }
     }
 }
 

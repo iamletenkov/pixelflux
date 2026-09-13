@@ -63,6 +63,9 @@ pub struct PortalSession {
     pub devices: u32,
     pub cursor_mode: u32,
     pub restore_token: Option<String>,
+    /// RemoteDesktop interface version, 0 when the session drives no input. `ConnectToEIS`
+    /// exists from version 2.
+    pub rd_version: u32,
 }
 
 fn opt_u32(o: &mut Options<'_>, key: &'static str, v: u32) {
@@ -160,12 +163,14 @@ impl PortalSession {
             devices: 0,
             cursor_mode,
             restore_token: None,
+            rd_version: 0,
         };
         let opener = this.remote.clone().unwrap_or_else(|| this.screencast.clone());
         let rd_version: u32 = match &this.remote {
             Some(rd) => rd.get_property("version").map_err(|e| format!("no RemoteDesktop portal: {e}"))?,
             None => 0,
         };
+        this.rd_version = rd_version;
         let mut options = Options::new();
         options.insert("session_handle_token", Value::from(format!("pixelflux{}", std::process::id())));
         let (_, results) = this.request("CreateSession", options, |o| opener.call("CreateSession", &(o,)))?;
@@ -275,6 +280,23 @@ impl PortalSession {
             1 => Err(format!("{method}: the user cancelled the portal dialog")),
             _ => Err(format!("{method}: the portal refused (response {code})")),
         }
+    }
+
+    /// Whether this session can hand out an EIS socket: a RemoteDesktop session (input was
+    /// granted) on a backend new enough to carry `ConnectToEIS`.
+    pub fn eis_capable(&self) -> bool {
+        self.remote.is_some() && self.devices != 0 && self.rd_version >= 2
+    }
+
+    /// The EIS socket for this session's seat. A backend that answers hands input over libei
+    /// from here on and refuses the `Notify*` methods, so this is called once, at open, and
+    /// only when the injector is committed to.
+    pub fn connect_to_eis(&self) -> Result<OwnedFd, String> {
+        let rd = self.remote.as_ref().ok_or("session drives no input")?;
+        let fd: zbus::zvariant::OwnedFd = rd
+            .call("ConnectToEIS", &(self.session.clone(), Options::new()))
+            .map_err(|e| format!("ConnectToEIS: {e}"))?;
+        Ok(fd.into())
     }
 
     /// The PipeWire connection the streams live on, opened by the portal with the node

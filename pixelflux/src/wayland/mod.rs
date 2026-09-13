@@ -36,6 +36,8 @@ pub mod host;
 pub mod portal;
 /// PipeWire consumer turning a portal monitor stream into host frames.
 pub mod pwcapture;
+/// libei (EIS) input injection over a portal session's `ConnectToEIS` socket.
+pub mod eiclient;
 
 /// An enabled screen as clients see it: name, layout position and the size of
 /// the mode it currently holds.
