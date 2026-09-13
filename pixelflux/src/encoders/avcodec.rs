@@ -241,8 +241,9 @@ struct VaapiSession {
     buffersrc_ctx: *mut ff::AVFilterContext,
     buffersink_ctx: *mut ff::AVFilterContext,
     filtered_frame: *mut ff::AVFrame,
-    /// Whether the codec was opened on the low-power (VDENC) entry point, which some Intel
-    /// generations expose as the only one for HEVC, VP9 and AV1.
+    /// Whether the codec is opened on the low-power (VDENC) entry point. It is tried first: recent
+    /// Intel generations expose it as the only one for HEVC, VP9 and AV1, and it is the shorter
+    /// path where both exist. A driver without it refuses the open and the default one follows.
     low_power: bool,
 }
 
@@ -526,7 +527,7 @@ impl AvcodecEncoder {
             buffersrc_ctx: ptr::null_mut(),
             buffersink_ctx: ptr::null_mut(),
             filtered_frame: ptr::null_mut(),
-            low_power: false,
+            low_power: true,
         };
         let ret = ff::av_hwdevice_ctx_create_derived(
             &mut session.hw_device_ctx,
@@ -593,9 +594,9 @@ impl AvcodecEncoder {
         // shared open to reach.
         self.hw = Some(session);
         let qp = self.current_qp;
-        if let Err(e) = self.open_codec(qp) {
-            self.hw.as_mut().unwrap().low_power = true;
-            if let Err(lp) = self.open_codec(qp) {
+        if let Err(lp) = self.open_codec(qp) {
+            self.hw.as_mut().unwrap().low_power = false;
+            if let Err(e) = self.open_codec(qp) {
                 return Err(if self.is_fullcolor() {
                     format!(
                         "Failed to open {} for 4:4:4 ({}): {e}; low-power entry point: {lp}",
