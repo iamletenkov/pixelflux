@@ -15,24 +15,27 @@
 //! CPU. A software session converts a packed host frame into its planar input frame on the
 //! encode thread and hands the planes to the codec without a further copy.
 //!
-//! Chroma follows `video_fullcolor` where the codec carries 4:4:4 (H.264 and H.265): a
-//! hardware session negotiates the 4:4:4 surface format the driver reports, a software one
-//! takes planar 4:4:4 at full range like x264. Anything else encodes 4:2:0. Every session
-//! converts with the BT.709 matrix the sRGB source's own primaries and transfer belong to and
-//! declares it, at limited range for 4:2:0 and full range for software 4:4:4, like x264; VP8 is
-//! held to BT.601, the only matrix its bitstream can name.
+//! Chroma follows `video_fullcolor` where the codec carries 4:4:4 (H.264, H.265, and VP9 as
+//! profile 1): a hardware session negotiates a 4:4:4 surface format the driver both allocates
+//! and converts into on its video processor, a software one takes planar 4:4:4. Anything else
+//! encodes 4:2:0. Every session converts with the BT.709 matrix the sRGB source's own
+//! primaries and transfer belong to and declares it, at limited range everywhere but the
+//! software 4:4:4 of H.264 and H.265, which is full range like x264's; VP9 keeps the limited
+//! range of its 4:2:0 in profile 1, and VP8 is held to BT.601, the only matrix its bitstream
+//! can name.
 
 // Every operation in these functions is an FFmpeg or VA-API call, or a dereference of a
 // pointer one handed back; the safety contract is carried by the function signatures.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::ptr;
 
 use ffmpeg_sys_next as ff;
 use libc::{close, dup, lseek, SEEK_END};
+use libloading::{Library, Symbol};
 
 use super::codec::{
     av1_is_key, av1_level, frame_type_from_key, h264_frame_type, h264_level, h265_frame_type,
@@ -46,8 +49,10 @@ use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
 /// Plane/object fan-out of the `AVDRM*` descriptors, matching FFmpeg's `AV_DRM_MAX_PLANES`.
 const AV_DRM_MAX_PLANES: usize = 4;
-/// The 8-bit 4:4:4 surface formats FFmpeg's VA-API hardware context can carry, in the order a
-/// hardware session wants them: planar first, since it is what the host paths hold.
+/// The 8-bit 4:4:4 surface formats FFmpeg's VA-API hardware context can carry, in the order
+/// a session tries them. The order only breaks a tie on a driver whose video processor
+/// renders both: every frame reaches either through the convert, from a packed RGB upload or
+/// a mapped dmabuf, so neither is nearer the host.
 const FULLCOLOR_SW_FORMATS: [ff::AVPixelFormat; 2] = [
     ff::AVPixelFormat::AV_PIX_FMT_YUV444P,
     ff::AVPixelFormat::AV_PIX_FMT_VUYX,
@@ -170,11 +175,51 @@ fn vpp_chain(stage: &str, width: i32, height: i32, format: &str, matrix: &str) -
     )
 }
 
-/// The 4:4:4 surface formats to try on this VA device, in `FULLCOLOR_SW_FORMATS` order.
-/// This answers only the driver half: the surface pool, the VA-VPP output pad and
-/// `avcodec_open2` each still have to accept the format, so the caller tries them in turn.
+/// `AVVAAPIDeviceContext` of `libavutil/hwcontext_vaapi.h`, a header the bindings leave out:
+/// the VA display the device was opened on, then the driver quirks libavutil applies.
+#[repr(C)]
+struct VaapiDeviceContext {
+    display: *mut c_void,
+    _driver_quirks: c_uint,
+}
+
+/// `AVVAAPIHWConfig`: the VA configuration a frame-constraints query is scoped to.
+#[repr(C)]
+struct VaapiHwConfig {
+    config_id: u32,
+}
+
+/// `VAProfileNone`, the profile of a video-processing configuration.
+const VA_PROFILE_NONE: c_int = -1;
+/// `VAEntrypointVideoProc`, the entry point `scale_vaapi` runs on.
+const VA_ENTRYPOINT_VIDEO_PROC: c_int = 10;
+const VA_STATUS_SUCCESS: c_int = 0;
+/// The libva the probe calls into, by the soname libavutil links so the loader hands back the
+/// copy already in the process; the wheel keeps that name true by leaving libva unbundled.
+const LIBVA: &str = "libva.so.2";
+type VaCreateConfig =
+    unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut c_void, c_int, *mut u32) -> c_int;
+type VaDestroyConfig = unsafe extern "C" fn(*mut c_void, u32) -> c_int;
+
+/// The 4:4:4 surface formats to try on this VA device, in `FULLCOLOR_SW_FORMATS` order: the
+/// ones it allocates, held to what its video processor renders where libva answers, since
+/// every frame reaches the codec through `scale_vaapi` and a driver converts into fewer
+/// formats than it allocates (Intel's iHD allocates planar 444P but its VPP renders 4:4:4
+/// only packed, as XYUV). This answers only the driver half: the surface pool, the VA-VPP
+/// output pad and `avcodec_open2` each still have to accept the format, so the caller tries
+/// them in turn.
 unsafe fn fullcolor_sw_formats(device: *mut ff::AVBufferRef) -> Vec<ff::AVPixelFormat> {
-    let constraints = ff::av_hwdevice_get_hwframe_constraints(device, ptr::null());
+    let allocated = constrained_sw_formats(device, ptr::null());
+    preferred_fullcolor_formats(&allocated, vpp_sw_formats(device).as_deref())
+}
+
+/// The surface formats `device` reports under `hwconfig`: every format it allocates when
+/// that is null, the render targets of one VA configuration otherwise.
+unsafe fn constrained_sw_formats(
+    device: *mut ff::AVBufferRef,
+    hwconfig: *const c_void,
+) -> Vec<ff::AVPixelFormat> {
+    let constraints = ff::av_hwdevice_get_hwframe_constraints(device, hwconfig);
     if constraints.is_null() {
         return Vec::new();
     }
@@ -188,13 +233,77 @@ unsafe fn fullcolor_sw_formats(device: *mut ff::AVBufferRef) -> Vec<ff::AVPixelF
     }
     let mut owned = constraints;
     ff::av_hwframe_constraints_free(&mut owned);
-    preferred_fullcolor_formats(&carried)
+    carried
 }
 
-/// The formats a device reports that this build can encode 4:4:4 into, in
-/// `FULLCOLOR_SW_FORMATS` order.
-fn preferred_fullcolor_formats(carried: &[ff::AVPixelFormat]) -> Vec<ff::AVPixelFormat> {
-    FULLCOLOR_SW_FORMATS.into_iter().filter(|wanted| carried.contains(wanted)).collect()
+/// The formats the device's video processor renders into, read through a `VAProfileNone`
+/// configuration on the device's own display. `None` leaves the device-wide list to stand:
+/// where libva cannot be opened, said in the log, and where the driver offers no such
+/// configuration, on which the convert chain fails whatever the pick.
+unsafe fn vpp_sw_formats(device: *mut ff::AVBufferRef) -> Option<Vec<ff::AVPixelFormat>> {
+    let lib = match Library::new(LIBVA) {
+        Ok(lib) => lib,
+        Err(e) => return unverified_pick(&e),
+    };
+    let create: Symbol<VaCreateConfig> = match lib.get(b"vaCreateConfig\0") {
+        Ok(symbol) => symbol,
+        Err(e) => return unverified_pick(&e),
+    };
+    let destroy: Symbol<VaDestroyConfig> = match lib.get(b"vaDestroyConfig\0") {
+        Ok(symbol) => symbol,
+        Err(e) => return unverified_pick(&e),
+    };
+    let hwctx = (*((*device).data as *mut ff::AVHWDeviceContext)).hwctx as *mut VaapiDeviceContext;
+    let display = (*hwctx).display;
+    let mut config_id = 0u32;
+    let status = create(
+        display,
+        VA_PROFILE_NONE,
+        VA_ENTRYPOINT_VIDEO_PROC,
+        ptr::null_mut(),
+        0,
+        &mut config_id,
+    );
+    if status != VA_STATUS_SUCCESS {
+        return None;
+    }
+    let hwconfig = ff::av_hwdevice_hwconfig_alloc(device) as *mut VaapiHwConfig;
+    let rendered = if hwconfig.is_null() {
+        None
+    } else {
+        (*hwconfig).config_id = config_id;
+        let rendered = constrained_sw_formats(device, hwconfig as *const c_void);
+        ff::av_free(hwconfig as *mut c_void);
+        Some(rendered)
+    };
+    destroy(display, config_id);
+    rendered
+}
+
+/// Says in the log that the 4:4:4 surfaces go unverified against the video processor, and
+/// yields the `None` that leaves the device-wide list to stand.
+fn unverified_pick(err: &libloading::Error) -> Option<Vec<ff::AVPixelFormat>> {
+    eprintln!(
+        "[vaapi] {LIBVA} is unavailable to the surface probe ({err}); the 4:4:4 surfaces are \
+picked from what the device allocates alone."
+    );
+    None
+}
+
+/// The formats a device allocates that this build encodes 4:4:4 into, in
+/// `FULLCOLOR_SW_FORMATS` order, held to the ones its video processor renders where that
+/// list names any. libavutil hands back an empty list for a configuration whose formats it
+/// could not read and the convert chain then checks nothing against it, so an empty list
+/// narrows nothing here either.
+fn preferred_fullcolor_formats(
+    allocated: &[ff::AVPixelFormat],
+    rendered: Option<&[ff::AVPixelFormat]>,
+) -> Vec<ff::AVPixelFormat> {
+    let rendered = rendered.filter(|r| !r.is_empty());
+    FULLCOLOR_SW_FORMATS
+        .into_iter()
+        .filter(|wanted| allocated.contains(wanted) && rendered.is_none_or(|r| r.contains(wanted)))
+        .collect()
 }
 
 /// Format an FFmpeg error code through `av_strerror`.
@@ -454,6 +563,11 @@ impl AvcodecEncoder {
         )
     }
 
+    /// libavutil's name of the surface format frames reach the codec in, for the session log.
+    pub fn sw_format_name(&self) -> String {
+        pix_fmt_name(self.sw_format)
+    }
+
     /// Whether the session signals full range: the software 4:4:4 of x264's kind (x265), never
     /// a hardware session, and not VP9, whose 4:4:4 keeps the limited range of its 4:2:0 so the
     /// decoder hint the client sends for VP9 stays true.
@@ -542,7 +656,7 @@ impl AvcodecEncoder {
         self.sw_format = if fullcolor {
             let carried = fullcolor_sw_formats(session.hw_device_ctx);
             if carried.is_empty() {
-                return Err("4:4:4 requested but this VA-API driver carries no 4:4:4 surface format".into());
+                return Err("4:4:4 requested but this VA-API driver renders no 4:4:4 surface format".into());
             }
             *carried
                 .get(attempt)
@@ -1288,19 +1402,39 @@ fn vaapi_codec_name(codec: Codec) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The planar surface wins whenever a device carries it, because the host paths hold
-    /// planar 4:4:4; the packed one is taken only when it is the sole 4:4:4 format on offer,
-    /// and a device carrying neither yields nothing. The names handed to `scale_vaapi` have
-    /// to be the ones FFmpeg parses.
+    /// The planar surface is tried first wherever a device both allocates and renders it, the
+    /// order breaking that tie alone, the packed one after it or alone, and a device carrying
+    /// neither yields nothing. A video processor that renders fewer formats than the device
+    /// allocates (Intel's iHD: planar 444P allocated, only packed XYUV rendered) drops what it
+    /// does not write from the try list, since the convert lands every frame through it; a
+    /// list libavutil left empty, its answer for a configuration whose formats it could not
+    /// read, narrows nothing, as the convert chain checks nothing against it either. The names
+    /// handed to `scale_vaapi` have to be the ones FFmpeg parses.
     #[test]
     fn fullcolor_surface_preference_and_names() {
         use ff::AVPixelFormat::*;
-        assert!(preferred_fullcolor_formats(&[AV_PIX_FMT_NV12]).is_empty());
-        assert_eq!(preferred_fullcolor_formats(&[AV_PIX_FMT_NV12, AV_PIX_FMT_VUYX]), vec![AV_PIX_FMT_VUYX]);
+        assert!(preferred_fullcolor_formats(&[AV_PIX_FMT_NV12], None).is_empty());
+        assert_eq!(preferred_fullcolor_formats(&[AV_PIX_FMT_NV12, AV_PIX_FMT_VUYX], None), vec![AV_PIX_FMT_VUYX]);
         assert_eq!(
-            preferred_fullcolor_formats(&[AV_PIX_FMT_VUYX, AV_PIX_FMT_YUV444P]),
+            preferred_fullcolor_formats(&[AV_PIX_FMT_VUYX, AV_PIX_FMT_YUV444P], None),
             vec![AV_PIX_FMT_YUV444P, AV_PIX_FMT_VUYX],
             "a driver carrying both is tried planar first, then packed"
+        );
+        let intel = [AV_PIX_FMT_NV12, AV_PIX_FMT_YUV444P, AV_PIX_FMT_VUYX];
+        assert_eq!(
+            preferred_fullcolor_formats(&intel, Some(&[AV_PIX_FMT_NV12, AV_PIX_FMT_VUYX])),
+            vec![AV_PIX_FMT_VUYX],
+            "a format the video processor does not render is not tried"
+        );
+        assert!(preferred_fullcolor_formats(&intel, Some(&[AV_PIX_FMT_NV12])).is_empty());
+        assert_eq!(
+            preferred_fullcolor_formats(&intel, Some(&[])),
+            vec![AV_PIX_FMT_YUV444P, AV_PIX_FMT_VUYX],
+            "an empty render list narrows nothing"
+        );
+        assert_eq!(
+            preferred_fullcolor_formats(&[AV_PIX_FMT_NV12, AV_PIX_FMT_YUV444P], Some(&intel)),
+            vec![AV_PIX_FMT_YUV444P]
         );
         for fmt in FULLCOLOR_SW_FORMATS {
             let name = pix_fmt_name(fmt);

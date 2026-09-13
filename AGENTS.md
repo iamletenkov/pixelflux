@@ -16,7 +16,9 @@ Empirical testing is possible for everything here, including implementation, aud
 and every change is validated before it is reported. `cargo test --lib` in both feature configurations is the floor;
 the `#[ignore]`d `gpu_` tests need an NVIDIA GPU (`cargo test gpu_ -- --ignored --nocapture --test-threads=1`,
 serially, since concurrent session builds fault in the driver), the `gpu_dmabuf_` ones a render node as well, and the
-`gpu_bench_` ones print measurements to quote rather than assert. End to end, a change is a wheel
+`gpu_bench_` ones print measurements to quote rather than assert. The VA-API surface probe (`vpp_sw_formats`)
+runs only where a VA-API device opens, so the CI runners and NVIDIA hosts never test it; it is proven on Intel
+hardware in the selkies sandbox. End to end, a change is a wheel
 (`pip wheel . --no-deps`) installed into a selkies sandbox as the Agentic Development section of that repository's
 `docs/development.md` describes, driven by its suites over both transports on X11 and Wayland with the installed
 Firefox and Chrome and Playwright/Selenium/Puppeteer/Cypress WebKit in place of Safari; the `.devcontainer` here
@@ -57,12 +59,21 @@ as the default: that it is exposed is not proof it works, and a reviewer has to 
 The codec of a capture is `CaptureSettings.codec` (`jpeg`, `h264`, `h265`, `vp8`, `vp9`, `av1`), the
 `encoders::Codec` enum in Rust: it carries the wire id (the high nibble of a `0x04` frame's type byte, the
 low nibble being the frame kind), the per-codec quantizer domain the shared `video_crf` index maps onto, the
-level ladders and the bitstream reads that label frames. JPEG and H.264 may stripe (`encoders/software.rs`);
+level ladders and the bitstream reads that label frames. A session advertises its stream's level from the
+shared ladder at the current geometry (`codec.rs`), the lowest a decoder is asked to accept, so a hardware
+decoder that gates on the level — older Apple and Intel parts refuse a level above their ceiling even for a
+picture they could hold — takes the stream; NVENC re-declares it with a forced IDR on each in-place resize, and
+holds AV1 alone at the resize headroom's level, which NVENC validates its session against at init. JPEG and
+H.264 may stripe (`encoders/software.rs`);
 every other codec streams whole frames. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (NVENC on the NVIDIA driver, VA-API otherwise, then the codec's software
 encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback. `encoders/nvenc.rs`
 is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
-the libavcodec session: VA-API for all five codecs, and the software HEVC (x265 with the `gpl` feature, else
+the libavcodec session: VA-API for all five codecs (a 4:4:4 session tries the surface formats the
+driver allocates and its video processor renders, read through libva's `VAProfileNone`
+configuration, until one survives the surface pool, the convert and the codec open: Intel's iHD
+allocates planar 444P but its VPP writes 4:4:4 only packed, as XYUV, and its HEVC 4:4:4 entry point
+takes only what the VPP writes), and the software HEVC (x265 with the `gpl` feature, else
 kvazaar), VP8/VP9 (libvpx) and AV1 (SVT-AV1) encoders the linked FFmpeg carries — probed once
 (`encoders::software_encoder`, exported as `pixelflux.SOFTWARE_ENCODERS`), never assumed. Software H.264 is
 resolved at build time, never by a setting: the default `gpl` feature makes libx264 the encoder behind every
