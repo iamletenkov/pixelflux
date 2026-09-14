@@ -611,6 +611,33 @@ struct GpuCapture {
     screen: NVFBC_SIZE,
 }
 
+/// How long the driver may take to answer whether it can capture this X server at all.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `f` on a thread of its own and wait at most `timeout` for its answer. A call into a
+/// driver library that never returns then costs a bounded wait and a leaked thread instead of
+/// the caller, whose name `what` gives the refusal.
+fn answered_within<T: Send + 'static>(
+    timeout: Duration,
+    what: &str,
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("pf-{}-probe", what.to_lowercase()))
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|e| format!("{what} probe thread: {e}"))?;
+    match rx.recv_timeout(timeout) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("{what} did not answer within {} s", timeout.as_secs()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!("{what} ended without an answer")),
+    }
+}
+
 /// Why the NvFBC path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
     println!("[x11] GPU capture (NvFBC) unavailable: {reason}. Capturing through XShm.");
@@ -644,8 +671,10 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         return declined(&format!("the encode node's driver is {driver}"));
     }
     // The driver is asked before an encoder is built, so a host without NvFBC never pays for an
-    // NVENC session the XShm path would immediately build again.
-    let probed = (|| -> Result<(NvfbcSession, NVFBC_SIZE), String> {
+    // NVENC session the XShm path would immediately build again. It is asked on a thread of its
+    // own with a bound: a library that never answers (one at odds with the X server it finds)
+    // would otherwise hold the display's video with nothing said.
+    let probed = answered_within(PROBE_TIMEOUT, "NvFBC", || {
         let nvfbc = NvfbcSession::open()?;
         let status = nvfbc.status().map_err(|e| e.to_string())?;
         if status.bIsCapturePossible != NVFBC_TRUE {
@@ -654,9 +683,13 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         if status.bInModeset == NVFBC_TRUE {
             return Err("the X server is in a modeset".into());
         }
-        Ok((nvfbc, status.screenSize))
-    })();
-    let (mut nvfbc, screen) = match probed {
+        Ok(status.screenSize)
+    });
+    let screen = match probed {
+        Ok(v) => v,
+        Err(e) => return declined(&e),
+    };
+    let mut nvfbc = match NvfbcSession::open() {
         Ok(v) => v,
         Err(e) => return declined(&e),
     };
@@ -1012,6 +1045,22 @@ mod abi_tests {
     /// Every parameter struct carries its own `size_of` inside the version word the driver
     /// validates, so a layout that drifts from the SDK's is rejected at the first call with no
     /// other symptom. These are the sizes `NvFBC.h` (NvFBC 1.8) defines.
+    /// A probe that never answers costs the bounded wait and names itself; one that answers
+    /// hands its value straight through.
+    #[test]
+    fn probe_answers_are_bounded() {
+        let stuck = answered_within(Duration::from_millis(50), "Stuck", || -> Result<u32, String> {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(1)
+        });
+        assert_eq!(stuck, Err("Stuck did not answer within 0 s".to_string()));
+        assert_eq!(answered_within(Duration::from_secs(1), "Quick", || Ok(7u32)), Ok(7));
+        assert_eq!(
+            answered_within(Duration::from_secs(1), "Refused", || -> Result<u32, String> { Err("no".into()) }),
+            Err("no".to_string())
+        );
+    }
+
     #[test]
     fn struct_layouts_match_the_sdk() {
         assert_eq!(std::mem::size_of::<NVFBC_BOX>(), 16);

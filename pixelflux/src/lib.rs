@@ -6278,6 +6278,49 @@ pub(crate) fn unpremultiply_rgba(image: &mut image::RgbaImage) {
 /// Best-effort nice boost for the calling capture/encode/delivery thread. These threads
 /// compete with the very workload being captured, so a scheduling edge keeps frame pacing
 /// steady under load. Requires CAP_SYS_NICE (or root); otherwise EPERM and silently a no-op.
+/// How long a stop waits for a capture or delivery thread to end before leaving it behind.
+const STOP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Join `handle` if it ends within `STOP_JOIN_TIMEOUT`, else leave the thread behind with one
+/// line saying so: a thread held inside a driver call that never returns must not hold the
+/// stop, and with it every later capture of the session, with nothing said.
+pub(crate) fn join_within(handle: thread::JoinHandle<()>, what: &str) {
+    let deadline = std::time::Instant::now() + STOP_JOIN_TIMEOUT;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "[x11] the {what} thread did not end within {} s; it is left behind",
+                STOP_JOIN_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = handle.join();
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    /// A thread that ends is joined; one that does not is left behind once the bound passes.
+    #[test]
+    fn join_within_is_bounded() {
+        let quick = thread::spawn(|| {});
+        let started = std::time::Instant::now();
+        join_within(quick, "quick");
+        assert!(started.elapsed() < STOP_JOIN_TIMEOUT);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let stuck = thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let started = std::time::Instant::now();
+        join_within(stuck, "stuck");
+        assert!(started.elapsed() >= STOP_JOIN_TIMEOUT);
+        drop(tx);
+    }
+}
+
 pub(crate) fn boost_thread_priority(nice: libc::c_int) {
     unsafe {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
@@ -6501,13 +6544,12 @@ impl ScreenCapture {
             } else {
                 py.detach(|| {
                     if let Some(h) = handle {
-                        let _ = h.join();
+                        join_within(h, "capture");
                     }
-                    // The capture join above ends the encode thread, dropping the
-                    // delivery sender; the deliver thread then drains its one
-                    // queued frame and exits, so this join is bounded.
+                    // The capture thread's end drops the delivery sender, so the deliver
+                    // thread drains its one queued frame and exits behind it.
                     if let Some(h) = deliver_handle {
-                        let _ = h.join();
+                        join_within(h, "delivery");
                     }
                 });
             }
