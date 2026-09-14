@@ -381,10 +381,21 @@ fn stbl(sample_entry: &[u8]) -> Vec<u8> {
     mk_box(b"stbl", &[stsd, stts, stsc, stsz, stco].concat())
 }
 
+/// The `tkhd` fields that differ by media: a video track states its display size, an audio
+/// track its volume.
+enum TrakMedia {
+    Video { width: u32, height: u32 },
+    Audio { volume: u16 },
+}
+
 /// One `trak`: `tkhd` (enabled, in_movie) with the display size or, for audio, the volume;
 /// `mdhd` at `timescale`; the handler; then the media header given and the sample table.
 fn trak(track_id: u32, timescale: u32, handler: &[u8; 4], media_header: Vec<u8>,
-        sample_entry: &[u8], width: u32, height: u32, volume: u16) -> Vec<u8> {
+        sample_entry: &[u8], media: TrakMedia) -> Vec<u8> {
+    let (width, height, volume) = match media {
+        TrakMedia::Video { width, height } => (width, height, 0),
+        TrakMedia::Audio { volume } => (0, 0, volume),
+    };
     // tkhd payload in field order: creation/modification time, track_ID, reserved, duration,
     // reserved, layer, alternate_group, volume, reserved, the unity matrix, then the 16.16
     // display width and height.
@@ -496,11 +507,13 @@ impl<W: Write> FragmentWriter<W> {
         let mvhd = mk_full_box(b"mvhd", 0, 0, &mvhd_p);
 
         let vmhd = mk_full_box(b"vmhd", 0, 1, &[0u8; 8]);
-        let mut traks = trak(1, TIMESCALE, b"vide", vmhd, &cfg.sample_entry, cfg.width, cfg.height, 0);
+        let mut traks = trak(1, TIMESCALE, b"vide", vmhd, &cfg.sample_entry,
+            TrakMedia::Video { width: cfg.width, height: cfg.height });
         let mut mvex_p = trex(1, 0);
         if let Some(audio) = &self.audio {
             let smhd = mk_full_box(b"smhd", 0, 0, &[0u8; 4]);
-            traks.extend(trak(2, OPUS_TIMESCALE, b"soun", smhd, &audio.sample_entry, 0, 0, 0x0100));
+            traks.extend(trak(2, OPUS_TIMESCALE, b"soun", smhd, &audio.sample_entry,
+                TrakMedia::Audio { volume: 0x0100 }));
             mvex_p.extend(trex(2, 0));
         }
         let mvex = mk_box(b"mvex", &mvex_p);
