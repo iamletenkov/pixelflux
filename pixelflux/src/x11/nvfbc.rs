@@ -30,10 +30,12 @@
 //!    blend. What the loop can sustain is what NVENC can sustain.
 //!
 //! Requirements are checked rather than assumed, because none of them holds everywhere: the
-//! session must encode on NVENC (the device pointer is meaningless to any other encoder), the
-//! driver must offer NvFBC on this GPU and X server, and a watermark keeps the XShm path since
-//! blending it would mean reading the frame back. `open` reports what it found and returns
-//! `None`, and the caller streams through XShm instead.
+//! session must encode on NVENC (the device pointer is meaningless to any other encoder), the X
+//! server must be one the NVIDIA driver drives, the driver must offer NvFBC on this GPU and X
+//! server, and a watermark keeps the XShm path since blending it would mean reading the frame
+//! back. `open` reports what it found and returns `None`, and the caller streams through XShm
+//! instead. The X server is asked first and over our own connection, because the library's own
+//! answer is the one that may never come.
 //!
 //! The API is reached the way NVENC's is: `libnvidia-fbc.so.1` is loaded at run time and every
 //! entry point comes from the function table `NvFBCCreateInstance` fills, so the build links no
@@ -51,6 +53,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libloading::Library;
+use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
 
 use super::Controls;
 use crate::encoders::nvenc::NvencEncoder;
@@ -399,8 +402,15 @@ impl NvfbcSession {
     /// Open a client handle on the X server named by the environment, letting NvFBC create and
     /// manage the OpenGL context it captures through.
     ///
+    /// The server is asked for [`NVIDIA_GLX`] first, over a connection of our own: it is what the
+    /// library looks up here too, and where it is missing the library's own lookup is the call
+    /// that never returns.
+    ///
     /// The handle is bound to the calling thread, and every later call has to come from it.
     fn open() -> Result<Self, String> {
+        if !nvidia_driven_x_server()? {
+            return Err(format!("the X server offers no {NVIDIA_GLX}"));
+        }
         let (lib, funcs) = Self::load()?;
         let mut handle: NVFBC_SESSION_HANDLE = 0;
         let mut params = NVFBC_CREATE_HANDLE_PARAMS {
@@ -638,6 +648,25 @@ fn answered_within<T: Send + 'static>(
     }
 }
 
+/// The extension the NVIDIA driver's GLX registers, and the one `libnvidia-fbc` resolves on its
+/// own X connection before it will do anything: NvFBC captures the screen through a GLX context
+/// only that driver provides. An X server without it — an Xvfb, a Mesa-driven Xorg — has nothing
+/// for the library to attach to, and the lookup there is not merely futile: it can block inside
+/// the library and never return, which costs the capture thread and then the display's stop path.
+const NVIDIA_GLX: &str = "NV-GLX";
+
+/// Whether the X server this session would capture is driven by the NVIDIA driver. Asked over a
+/// connection of our own, so it costs one round trip and is answered by the X server rather than
+/// by the library whose answer cannot be relied on to come.
+fn nvidia_driven_x_server() -> Result<bool, String> {
+    let (conn, _) = x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
+    let cookie = conn
+        .query_extension(NVIDIA_GLX.as_bytes())
+        .map_err(|e| format!("{NVIDIA_GLX} query failed: {e}"))?;
+    let reply = cookie.reply().map_err(|e| format!("{NVIDIA_GLX} query failed: {e}"))?;
+    Ok(reply.present)
+}
+
 /// Why the NvFBC path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
     println!("[x11] GPU capture (NvFBC) unavailable: {reason}. Capturing through XShm.");
@@ -653,8 +682,8 @@ fn declined(reason: &str) -> Option<GpuCapture> {
 ///
 /// The path is declined, rather than failed, when it cannot be zero-copy: a codec no NVENC engine
 /// serves, software encoding requested, a device that is not NVIDIA, a watermark (which is
-/// composited into host pixels and would mean reading the frame back), or a driver that offers no
-/// NvFBC on this X server.
+/// composited into host pixels and would mean reading the frame back), an X server the NVIDIA
+/// driver does not drive, or a driver that offers no NvFBC on this X server.
 fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     if !settings.codec.is_video() {
         return declined("the codec is JPEG");
@@ -1059,6 +1088,26 @@ mod abi_tests {
             answered_within(Duration::from_secs(1), "Refused", || -> Result<u32, String> { Err("no".into()) }),
             Err("no".to_string())
         );
+    }
+
+    /// The gate is answered by the X server rather than by the library, so it agrees with the
+    /// extension list that server publishes, and it answers at all: a question that could hang
+    /// would be worth no more than the call it stands in front of.
+    #[test]
+    fn the_nvidia_gate_is_answered_by_the_server() {
+        let answered = answered_within(Duration::from_secs(5), "Gate", || Ok(nvidia_driven_x_server()))
+            .expect("the NV-GLX gate must answer");
+        let Ok(present) = answered else { return };
+        let (conn, _) = x11rb::connect(None).expect("a server that answered once answers again");
+        let listed = conn
+            .list_extensions()
+            .expect("the server takes the request")
+            .reply()
+            .expect("the server lists its extensions")
+            .names
+            .iter()
+            .any(|name| name.name == NVIDIA_GLX.as_bytes());
+        assert_eq!(present, listed);
     }
 
     #[test]
