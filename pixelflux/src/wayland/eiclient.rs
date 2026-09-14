@@ -578,10 +578,10 @@ mod tests {
                     return;
                 }
                 while let Some(pr) = ctx.pending_request() {
-                    if let PendingRequestResult::Request(req) = pr {
-                        if let Ok(Some(resp)) = handshaker.handle_request(req) {
-                            break 'hs resp;
-                        }
+                    if let PendingRequestResult::Request(req) = pr
+                        && let Ok(Some(resp)) = handshaker.handle_request(req)
+                    {
+                        break 'hs resp;
                     }
                 }
             };
