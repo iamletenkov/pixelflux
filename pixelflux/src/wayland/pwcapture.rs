@@ -504,7 +504,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     let Some(n) = *shared.negotiated.lock().unwrap() else { return };
     // Take everything queued: cursor-only buffers go straight back, and of several frames
     // only the newest is worth publishing.
-    let mut newest: *mut PwBuffer = ptr::null_mut();
+    let mut newest: Option<ptr::NonNull<PwBuffer>> = None;
     loop {
         let b = unsafe { (shared.api.stream_dequeue_buffer)(stream) };
         if b.is_null() {
@@ -523,17 +523,17 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             chunk.size > 0 && chunk.flags & SPA_CHUNK_FLAG_CORRUPTED == 0
         };
         if has_video {
-            if !newest.is_null() {
-                unsafe { (shared.api.stream_queue_buffer)(stream, newest) };
+            if let Some(previous) = newest {
+                unsafe { (shared.api.stream_queue_buffer)(stream, previous.as_ptr()) };
             }
-            newest = b;
+            newest = ptr::NonNull::new(b);
         } else {
             unsafe { (shared.api.stream_queue_buffer)(stream, b) };
         }
     }
-    if newest.is_null() {
+    let Some(newest) = newest.map(|p| p.as_ptr()) else {
         return;
-    }
+    };
     let buf = unsafe { &*(*newest).buffer };
     let idx = unsafe { (*newest).user_data } as usize;
     let generation = shared.generation.load(Ordering::Acquire);
