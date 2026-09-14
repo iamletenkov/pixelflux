@@ -993,15 +993,14 @@ impl HostSession {
         let portal_devices = if state.vk_mgr.is_none() { portal::DEVICE_KEYBOARD } else { 0 }
             | if state.vptr_mgr.is_none() { portal::DEVICE_POINTER } else { 0 };
         let portal = if !native_capture || portal_devices != 0 {
-            if PortalSession::available() {
-                Some(PortalCtl::spawn(!native_capture, portal_devices))
-            } else if native_capture {
-                None
-            } else {
-                return Err(
-                    "host compositor offers neither ext-image-copy-capture nor zwlr_screencopy_manager_v1 (v3), and no xdg-desktop-portal answers on the session bus"
-                        .into(),
-                );
+            match PortalSession::probe() {
+                Ok(()) => Some(PortalCtl::spawn(!native_capture, portal_devices)),
+                Err(_) if native_capture => None,
+                Err(why) => {
+                    return Err(format!(
+                        "host compositor offers neither ext-image-copy-capture nor zwlr_screencopy_manager_v1 (v3), and no xdg-desktop-portal answers on the session bus ({why})"
+                    ));
+                }
             }
         } else {
             None
