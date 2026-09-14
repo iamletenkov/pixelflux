@@ -514,6 +514,9 @@ impl AvcodecEncoder {
                 omit_stripe_headers: settings.omit_stripe_headers,
             };
             me.packet = ff::av_packet_alloc();
+            if me.packet.is_null() {
+                return Err("Failed to allocate the packet".into());
+            }
             let fullcolor = settings.video_fullcolor && codec.fullcolor();
             match backend {
                 Backend::Vaapi => me.open_vaapi(settings, fullcolor)?,
@@ -525,6 +528,9 @@ impl AvcodecEncoder {
                     };
                     me.open_codec(me.current_qp)?;
                     me.frame = ff::av_frame_alloc();
+                    if me.frame.is_null() {
+                        return Err("Failed to allocate the frame".into());
+                    }
                     (*me.frame).format = me.sw_format as i32;
                     (*me.frame).width = width;
                     (*me.frame).height = height;
@@ -830,6 +836,9 @@ impl AvcodecEncoder {
         }
         session.filtered_frame = ff::av_frame_alloc();
         self.frame = ff::av_frame_alloc();
+        if session.filtered_frame.is_null() || self.frame.is_null() {
+            return Err("Failed to allocate the filter frames".into());
+        }
         Ok(())
     }
 
