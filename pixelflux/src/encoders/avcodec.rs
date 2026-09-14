@@ -485,6 +485,16 @@ impl AvcodecEncoder {
             if avcodec.is_null() {
                 return Err(format!("{name} encoder not found in this FFmpeg"));
             }
+            let packet = ff::av_packet_alloc();
+            if packet.is_null() {
+                return Err("Failed to allocate the packet".into());
+            }
+            let frame = ff::av_frame_alloc();
+            if frame.is_null() {
+                let mut packet = packet;
+                ff::av_packet_free(&mut packet);
+                return Err("Failed to allocate the frame".into());
+            }
             let mut me = Self {
                 codec,
                 backend,
@@ -493,8 +503,8 @@ impl AvcodecEncoder {
                 avcodec,
                 encoder_ctx: ptr::null_mut(),
                 hw: None,
-                frame: ptr::null_mut(),
-                packet: ptr::null_mut(),
+                frame,
+                packet,
                 width,
                 height,
                 fps,
@@ -513,10 +523,6 @@ impl AvcodecEncoder {
                 max_qp: settings.video_max_qp,
                 omit_stripe_headers: settings.omit_stripe_headers,
             };
-            me.packet = ff::av_packet_alloc();
-            if me.packet.is_null() {
-                return Err("Failed to allocate the packet".into());
-            }
             let fullcolor = settings.video_fullcolor && codec.fullcolor();
             match backend {
                 Backend::Vaapi => me.open_vaapi(settings, fullcolor)?,
@@ -527,10 +533,6 @@ impl AvcodecEncoder {
                         ff::AVPixelFormat::AV_PIX_FMT_YUV420P
                     };
                     me.open_codec(me.current_qp)?;
-                    me.frame = ff::av_frame_alloc();
-                    if me.frame.is_null() {
-                        return Err("Failed to allocate the frame".into());
-                    }
                     (*me.frame).format = me.sw_format as i32;
                     (*me.frame).width = width;
                     (*me.frame).height = height;
