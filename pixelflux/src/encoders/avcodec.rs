@@ -194,12 +194,19 @@ const VA_PROFILE_NONE: c_int = -1;
 /// `VAEntrypointVideoProc`, the entry point `scale_vaapi` runs on.
 const VA_ENTRYPOINT_VIDEO_PROC: c_int = 10;
 const VA_STATUS_SUCCESS: c_int = 0;
+/// `VAEntrypointEncSlice` and `VAEntrypointEncSliceLP`, the entry points an encode
+/// configuration runs on; libavcodec's `*_vaapi` encoders open on either.
+const VA_ENTRYPOINT_ENC_SLICE: c_int = 6;
+const VA_ENTRYPOINT_ENC_SLICE_LP: c_int = 8;
 /// The libva the probe calls into, by the soname libavutil links so the loader hands back the
 /// copy already in the process; the wheel keeps that name true by leaving libva unbundled.
 const LIBVA: &str = "libva.so.2";
 type VaCreateConfig =
     unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut c_void, c_int, *mut u32) -> c_int;
 type VaDestroyConfig = unsafe extern "C" fn(*mut c_void, u32) -> c_int;
+type VaMaxNum = unsafe extern "C" fn(*mut c_void) -> c_int;
+type VaQueryConfigProfiles = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int;
+type VaQueryConfigEntrypoints = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int, *mut c_int) -> c_int;
 
 /// The 4:4:4 surface formats to try on this VA device, in `FULLCOLOR_SW_FORMATS` order: the
 /// ones it allocates, held to what its video processor renders where libva answers, since
@@ -304,6 +311,107 @@ fn preferred_fullcolor_formats(
         .into_iter()
         .filter(|wanted| allocated.contains(wanted) && rendered.is_none_or(|r| r.contains(wanted)))
         .collect()
+}
+
+/// The VA profiles libavcodec's `*_vaapi` encoder opens an 8-bit 4:2:0 session under, the
+/// session every hardware codec here comes up as before a 4:4:4 request is negotiated:
+/// `VAProfileH264ConstrainedBaseline`, `Main` and `High`; `VAProfileHEVCMain`;
+/// `VAProfileVP8Version0_3`; `VAProfileVP9Profile0`; `VAProfileAV1Profile0`.
+fn vaapi_profiles(codec: Codec) -> &'static [c_int] {
+    match codec {
+        Codec::H264 => &[13, 6, 7],
+        Codec::H265 => &[17],
+        Codec::Vp8 => &[14],
+        Codec::Vp9 => &[19],
+        Codec::Av1 => &[32],
+        Codec::Jpeg => &[],
+    }
+}
+
+/// The video codecs the VA-API driver of the render node behind `encode_node_index`
+/// encodes: those whose `*_vaapi` encoder the linked FFmpeg registers and one of whose
+/// profiles (`vaapi_profiles`) the driver lists with an encode entry point, which is what
+/// `vainfo` reports and what a session's `avcodec_open2` checks first. The device is opened
+/// the way a session opens it (a DRM device derived into a VA one) and released. An error
+/// names the step that failed: no such node, no VA driver on it, or a libva the probe cannot
+/// reach.
+pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String> {
+    set_log_level(false);
+    let render_node = format!("/dev/dri/renderD{}", 128 + encode_node_index.max(0));
+    let device_url = CString::new(render_node).unwrap();
+    unsafe {
+        let mut drm_device_ctx: *mut ff::AVBufferRef = ptr::null_mut();
+        let ret = ff::av_hwdevice_ctx_create(
+            &mut drm_device_ctx,
+            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
+            device_url.as_ptr(),
+            ptr::null_mut(),
+            0,
+        );
+        if ret < 0 {
+            return Err(format!("Failed to create DRM device: {}", ff_err_str(ret)));
+        }
+        let mut hw_device_ctx: *mut ff::AVBufferRef = ptr::null_mut();
+        let ret = ff::av_hwdevice_ctx_create_derived(
+            &mut hw_device_ctx,
+            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            drm_device_ctx,
+            0,
+        );
+        let result = if ret < 0 {
+            Err(format!("Failed to derive VAAPI device: {}", ff_err_str(ret)))
+        } else {
+            va_encode_codecs(hw_device_ctx)
+        };
+        ff::av_buffer_unref(&mut hw_device_ctx);
+        ff::av_buffer_unref(&mut drm_device_ctx);
+        result
+    }
+}
+
+/// The codecs a VA device encodes, by its profile and entry-point lists.
+unsafe fn va_encode_codecs(device: *mut ff::AVBufferRef) -> Result<Vec<Codec>, String> {
+    let lib = Library::new(LIBVA).map_err(|e| format!("{LIBVA} is unavailable to the encoder probe: {e}"))?;
+    let symbol = |e: libloading::Error| format!("{LIBVA} lacks a query the encoder probe needs: {e}");
+    let max_profiles: Symbol<VaMaxNum> = lib.get(b"vaMaxNumProfiles\0").map_err(symbol)?;
+    let query_profiles: Symbol<VaQueryConfigProfiles> = lib.get(b"vaQueryConfigProfiles\0").map_err(symbol)?;
+    let max_entrypoints: Symbol<VaMaxNum> = lib.get(b"vaMaxNumEntrypoints\0").map_err(symbol)?;
+    let query_entrypoints: Symbol<VaQueryConfigEntrypoints> =
+        lib.get(b"vaQueryConfigEntrypoints\0").map_err(symbol)?;
+    let hwctx = (*((*device).data as *mut ff::AVHWDeviceContext)).hwctx as *mut VaapiDeviceContext;
+    let display = (*hwctx).display;
+
+    let mut profiles = vec![0 as c_int; max_profiles(display).max(0) as usize];
+    let mut listed: c_int = 0;
+    if query_profiles(display, profiles.as_mut_ptr(), &mut listed) != VA_STATUS_SUCCESS {
+        return Err("vaQueryConfigProfiles failed".into());
+    }
+    profiles.truncate(listed.max(0) as usize);
+    let mut entrypoints = vec![0 as c_int; max_entrypoints(display).max(0) as usize];
+    let mut encodes = |profile: c_int| {
+        let mut count: c_int = 0;
+        query_entrypoints(display, profile, entrypoints.as_mut_ptr(), &mut count) == VA_STATUS_SUCCESS
+            && entrypoints[..count.max(0) as usize]
+                .iter()
+                .any(|&e| e == VA_ENTRYPOINT_ENC_SLICE || e == VA_ENTRYPOINT_ENC_SLICE_LP)
+    };
+
+    let mut served = Vec::new();
+    for codec in Codec::VIDEO {
+        let name = CString::new(format!("{}_vaapi", vaapi_codec_name(codec))).unwrap();
+        if ff::avcodec_find_encoder_by_name(name.as_ptr()).is_null() {
+            continue;
+        }
+        if vaapi_profiles(codec).iter().any(|p| profiles.contains(p) && encodes(*p)) {
+            served.push(codec);
+        }
+    }
+    Ok(served)
+}
+
+/// FFmpeg's process-wide log level: warnings and errors, or everything under debug logging.
+fn set_log_level(debug: bool) {
+    unsafe { ff::av_log_set_level(if debug { ff::AV_LOG_INFO } else { ff::AV_LOG_WARNING }) };
 }
 
 /// Format an FFmpeg error code through `av_strerror`.
@@ -461,6 +569,7 @@ impl AvcodecEncoder {
         if backend == Backend::Software && input == Input::Dmabuf {
             return Err("a software session takes host frames, not dmabufs".into());
         }
+        set_log_level(settings.debug_logging);
         let width = settings.width;
         let height = settings.height;
         let fps = (settings.target_fps as i32).max(1);

@@ -5,7 +5,8 @@
  */
 
 //! Encoder backends and what they share: the codec identities and wire framing, the
-//! rate-control policy, and which software encoder a build resolves each codec to.
+//! rate-control policy, which software encoder a build resolves each codec to, and which
+//! hardware encoder a render node serves each with.
 
 /// libavcodec-backed encoders: VA-API hardware sessions on a DRM render node, and the
 /// software HEVC / VP8 / VP9 / AV1 encoders the linked FFmpeg carries.
@@ -27,8 +28,9 @@ pub mod software;
 
 pub use codec::*;
 
+use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use avcodec::{AvcodecEncoder, Backend, Input};
 use nvenc::NvencEncoder;
@@ -48,6 +50,46 @@ compile_error!(
 pub struct SoftwareEncoder {
     pub library: &'static str,
     pub avcodec: &'static str,
+}
+
+/// The codecs a render node encodes in hardware, each with the backend's name.
+pub type HardwareEncoders = Vec<(Codec, &'static str)>;
+
+/// The hardware backend that serves each video codec on an encode node, as the name a
+/// session logs it in lower case (`"nvenc"` or `"vaapi"`), probed once per node and
+/// remembered for the life of the process: the ladder picks the backend by the node's
+/// driver exactly as `select_frame_encoder` does, and that backend lists the codecs its
+/// device has an engine for (`nvenc::probe_codecs`, `avcodec::probe_codecs`). A node whose
+/// backend cannot be brought up serves nothing, said once in the log, so a caller offers
+/// the codec only where a session would come up on hardware rather than demote. What a
+/// session is then refused for (a size past the engine's maximum, a 4:4:4 the engine lacks)
+/// is still the ladder's to fall through on.
+pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
+    static PROBED: OnceLock<Mutex<HashMap<i32, HardwareEncoders>>> = OnceLock::new();
+    let node = encode_node_index.max(0);
+    let mut probed = PROBED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if let Some(served) = probed.get(&node) {
+        return served.clone();
+    }
+    let driver = crate::get_gpu_driver(node);
+    let (backend, codecs) = if crate::driver_selects_nvenc(&driver) {
+        ("nvenc", nvenc::probe_codecs(node))
+    } else {
+        ("vaapi", avcodec::probe_codecs(node))
+    };
+    let served: HardwareEncoders = match codecs {
+        Ok(codecs) => codecs.into_iter().map(|codec| (codec, backend)).collect(),
+        Err(e) => {
+            eprintln!("[pixelflux] No hardware encoder on render node {node} ({backend}): {e}");
+            Vec::new()
+        }
+    };
+    if !served.is_empty() {
+        let names: Vec<&str> = served.iter().map(|(codec, _)| codec.display()).collect();
+        println!("[pixelflux] Render node {node} encodes {} on {backend}.", names.join(", "));
+    }
+    probed.insert(node, served.clone());
+    served
 }
 
 /// Whether the software encoder of a codec carries a 4:4:4 (`video_fullcolor`) request: x264

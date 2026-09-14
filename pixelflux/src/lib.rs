@@ -7680,6 +7680,24 @@ fn probe_wayland_gpu(
     Ok(d.into_any().unbind())
 }
 
+/// The hardware encoder of each video codec the GPU behind an encode node serves, by codec
+/// name (`"nvenc"` or `"vaapi"`), the hardware half of what `SOFTWARE_ENCODERS` says of the
+/// build: a codec absent from both has no path on this host, one absent from this alone runs
+/// in software whatever `use_cpu` says. Probed once per node and remembered, so a caller
+/// reads it at startup and never pays for it again. `encode_node_index` is the capture
+/// setting of that name; a negative value (no explicit pick) reads as the first node, as a
+/// capture reads it.
+#[pyfunction]
+#[pyo3(signature = (encode_node_index = 0))]
+fn hardware_encoders(py: Python<'_>, encode_node_index: i32) -> PyResult<Py<PyAny>> {
+    let served = py.detach(|| encoders::hardware_encoders(encode_node_index));
+    let d = pyo3::types::PyDict::new(py);
+    for (codec, backend) in served {
+        d.set_item(codec.name(), backend)?;
+    }
+    Ok(d.into_any().unbind())
+}
+
 /// The running compositor's Wayland socket name (e.g. "wayland-1"), or None when no
 /// compositor thread has been started (this never creates one).
 #[pyfunction]
@@ -7796,8 +7814,14 @@ fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {
 /// their Python-facing access; until that is proven safe the interpreter re-enables the
 /// GIL for this module on a free-threaded build rather than silently defaulting to the
 /// thread-safe claim pyo3 0.28+ makes.
+///
+/// `SVT_LOG` defaults to errors here: SVT-AV1's stderr banner follows that variable alone,
+/// and import is the one moment no thread exists to race the environment write.
 #[pymodule(gil_used = true)]
 fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    if std::env::var_os("SVT_LOG").is_none() {
+        unsafe { std::env::set_var("SVT_LOG", "1") };
+    }
     m.add_class::<WaylandBackend>()?;
     m.add_class::<StripeFrame>()?;
     m.add_class::<CaptureSettings>()?;
@@ -7813,6 +7837,7 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
         }
     }
     m.add("SOFTWARE_ENCODERS", software)?;
+    m.add_function(wrap_pyfunction!(hardware_encoders, m)?)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;

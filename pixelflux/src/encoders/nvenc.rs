@@ -731,6 +731,79 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
     }
 }
 
+/// The video codecs the NVENC of the GPU behind `encode_node_index` has an engine for, read
+/// from a bare session's GUID list the way a real session reads it (`device_encodes`): the
+/// driver is negotiated, the device bound by the render node's PCI bus id (the first CUDA
+/// device where the node names none), and the session opened on its primary context with no
+/// input buffers, EGL or encoder initialisation. An error names the step that failed: no
+/// driver, no device, or a session that would not open, each of which a real session would
+/// fail on too. The CUDA and NVENC libraries stay loaded like a session's, since the driver
+/// does not promise to survive `libcuda` being unloaded after `cuInit`.
+pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String> {
+    let cuda = std::mem::ManuallyDrop::new(NvencEncoder::load_cuda()?);
+    let nvenc_lib = std::mem::ManuallyDrop::new(NvencEncoder::load_nvenc()?);
+    nvenc_negotiate(&nvenc_lib);
+    crate::nvgpufilter::install();
+    unsafe {
+        let res = (cuda.cuInit)(0);
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(format!("Init CUDA failed: {}", NvencEncoder::get_error_string(&cuda, res)));
+        }
+        let mut cu_device: CUdevice = 0;
+        let bound = NvencEncoder::get_pci_bus_id(encode_node_index.max(0))
+            .and_then(|id| CString::new(id).ok())
+            .is_some_and(|id| (cuda.cuDeviceGetByPCIBusId)(&mut cu_device, id.as_ptr()) == CUresult::CUDA_SUCCESS);
+        if !bound && (cuda.cuDeviceGet)(&mut cu_device, 0) != CUresult::CUDA_SUCCESS {
+            return Err("Failed to get default CUDA device".into());
+        }
+        let mut cu_context: CUcontext = ptr::null_mut();
+        if (cuda.cuDevicePrimaryCtxRetain)(&mut cu_context, cu_device) != CUresult::CUDA_SUCCESS {
+            return Err("Failed to retain the device's primary CUDA context".into());
+        }
+        if (cuda.cuCtxPushCurrent_v2)(cu_context) != CUresult::CUDA_SUCCESS {
+            (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+            return Err("Failed to make the primary CUDA context current".into());
+        }
+        let result = probe_session_codecs(&nvenc_lib, cu_context);
+        (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+        (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+        result
+    }
+}
+
+/// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes,
+/// and close it.
+unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) -> Result<Vec<Codec>, String> {
+    let mut function_list = NV_ENCODE_API_FUNCTION_LIST {
+        version: sv(NvStruct::FunctionList),
+        ..Default::default()
+    };
+    if (nvenc_lib.create_instance)(&mut function_list) != NVENCSTATUS::NV_ENC_SUCCESS {
+        return Err("NvEncodeAPICreateInstance failed".into());
+    }
+    let (Some(open_fn), Some(destroy_fn)) = (function_list.nvEncOpenEncodeSessionEx, function_list.nvEncDestroyEncoder)
+    else {
+        return Err("the driver's NVENC function list has no session entry points".into());
+    };
+    let mut session_params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+        version: sv(NvStruct::OpenSessionExParams),
+        deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+        device: cu_context as *mut c_void,
+        apiVersion: neg_api(),
+        ..Default::default()
+    };
+    let mut session: *mut c_void = ptr::null_mut();
+    if open_fn(&mut session_params, &mut session) != NVENCSTATUS::NV_ENC_SUCCESS {
+        return Err("Failed to open NVENC session".into());
+    }
+    let codecs = Codec::VIDEO
+        .into_iter()
+        .filter(|&codec| codec_guid(codec).is_some_and(|guid| NvencEncoder::device_encodes(&function_list, session, &guid)))
+        .collect();
+    destroy_fn(session);
+    Ok(codecs)
+}
+
 /// `sliceMode = 3`: `sliceModeData` is the number of slices in the picture, which the driver
 /// divides evenly; the other modes count macroblocks, bytes or rows and drift with geometry.
 const SLICE_MODE_COUNT: u32 = 3;
