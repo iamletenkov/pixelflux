@@ -138,7 +138,9 @@ about 7 ms once per capture start to find that out. The NvFBC structures are han
 against the SDK by the layout and version assertions in that module, and `libnvidia-fbc.so.1` is
 loaded at run time like NVENC's library. The hardware checks are `#[ignore]`d
 (`cargo test gpu_nvfbc -- --ignored --nocapture --test-threads=1` with `DISPLAY` on an NVIDIA X
-server).
+server). They capture and paint the root of whatever `DISPLAY` names, so on a host where that is a
+live desktop a `gpu_` sweep runs with `--skip nvfbc` and the NvFBC checks run only against an X
+server of their own.
 
 The virtual camera (`pixelflux/src/webcam/`, Python class `VirtualCamera`) is the webcam counterpart of pcmflux's
 `AudioPlayback`: selkies only gates and hands encoded frames over; decoding (libavcodec, TurboJPEG), fitting into the
