@@ -1095,6 +1095,7 @@ impl HostSession {
             std::thread::Builder::new()
                 .name(format!("pf-host-cap{i}"))
                 .spawn(move || {
+                    crate::boost_thread_priority(-10);
                     let outcome = match portal_ctl {
                         Some(ctl) => portal_capture_loop(i, ctl, from_main, sink, cursor_tx, dma_formats, geoms),
                         None => capture_loop(&display, i, expect, gbm_path, from_main, wake_rd, sink),

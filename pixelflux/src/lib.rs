@@ -6331,10 +6331,38 @@ mod join_tests {
     }
 }
 
+/// Give the calling thread the nice level `nice`, below the default. `setpriority` takes it
+/// only with CAP_SYS_NICE or an RLIMIT_NICE that reaches it, which a session's process rarely
+/// has; where it refuses, the request goes to rtkit over the system bus, which grants a
+/// level within the daemon's own bounds to any process of the seat. A host without rtkit,
+/// or without a system bus at all as a container is, leaves the thread at the default, said
+/// once in the log.
 pub(crate) fn boost_thread_priority(nice: libc::c_int) {
-    unsafe {
-        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, nice);
+    static RTKIT: OnceLock<zbus::Result<zbus::blocking::Connection>> = OnceLock::new();
+    static REFUSED: std::sync::Once = std::sync::Once::new();
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) } == 0 {
+        return;
+    }
+    let granted = RTKIT
+        .get_or_init(zbus::blocking::Connection::system)
+        .as_ref()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| {
+            zbus::blocking::Proxy::new(
+                conn,
+                "org.freedesktop.RealtimeKit1",
+                "/org/freedesktop/RealtimeKit1",
+                "org.freedesktop.RealtimeKit1",
+            )
+            .and_then(|rtkit| rtkit.call_method("MakeThreadHighPriority", &(tid as u64, nice)))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        });
+    if let Err(why) = granted {
+        REFUSED.call_once(|| {
+            eprintln!("[pixelflux] Thread priority {nice} refused, and rtkit does not grant it: {why}");
+        });
     }
 }
 
