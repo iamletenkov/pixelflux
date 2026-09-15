@@ -186,10 +186,18 @@ struct VaapiDeviceContext {
 /// The VA display a derived VA-API device was opened on, or None where the reference, its
 /// device context or the display itself is null.
 unsafe fn va_display(device: *mut ff::AVBufferRef) -> Option<*mut c_void> {
-    let device_ctx = device.as_ref()?.data as *mut ff::AVHWDeviceContext;
-    let hwctx = device_ctx.as_ref()?.hwctx as *mut VaapiDeviceContext;
-    let display = hwctx.as_ref()?.display;
-    (!display.is_null()).then_some(display)
+    if device.is_null() {
+        return None;
+    }
+    let device_ctx = (*device).data as *mut ff::AVHWDeviceContext;
+    if device_ctx.is_null() {
+        return None;
+    }
+    let hwctx = (*device_ctx).hwctx as *mut VaapiDeviceContext;
+    if hwctx.is_null() || (*hwctx).display.is_null() {
+        return None;
+    }
+    Some((*hwctx).display)
 }
 
 /// `AVVAAPIHWConfig`: the VA configuration a frame-constraints query is scoped to.
@@ -356,7 +364,7 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String>
             ptr::null_mut(),
             0,
         );
-        if ret < 0 {
+        if ret < 0 || drm_device_ctx.is_null() {
             return Err(format!("Failed to create DRM device: {}", ff_err_str(ret)));
         }
         let mut hw_device_ctx: *mut ff::AVBufferRef = ptr::null_mut();
@@ -1116,17 +1124,17 @@ impl AvcodecEncoder {
                 if !self.is_fullcolor() {
                     dict_set(opts, "profile", "high");
                 }
-                dict_set(opts, "level", &h264_level(w, h, fps).to_string());
+                dict_set(opts, "level", &h264_level(w, h, fps, bitrate).to_string());
             }
             Codec::H265 => {
-                let level = h265_level(w, h, fps);
+                let level = h265_level(w, h, fps, bitrate, true);
                 dict_set(opts, "profile", if self.is_fullcolor() { "rext" } else { "main" });
                 dict_set(opts, "level", &level.to_string());
                 dict_set(opts, "tier", if h265_tier(level) == 1 { "high" } else { "main" });
             }
             Codec::Av1 => {
                 dict_set(opts, "profile", "main");
-                dict_set(opts, "level", &av1_level(w, h, fps).to_string());
+                dict_set(opts, "level", &av1_level(w, h, fps, bitrate).to_string());
             }
             Codec::Vp8 | Codec::Vp9 | Codec::Jpeg => {}
         }
