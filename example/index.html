@@ -77,10 +77,10 @@
             // The code branches based on the data type to use the correct parsing logic.
             if (dataType === 0x04) {
                 // --- H.264 Stripe Processing ---
-                const EXPECTED_H264_HEADER_LENGTH = 10;
+                const EXPECTED_H264_HEADER_LENGTH = 12;
                 if (receivedBuffer.byteLength < EXPECTED_H264_HEADER_LENGTH) return;
 
-                // --- Parse the 10-byte H.264 Prefix ---
+                // --- Parse the 12-byte H.264 Prefix ---
                 // Byte 1: Frame Type (0x01 for Key frame, 0x00 for Delta/P-frame)
                 const frameTypeByte = dataView.getUint8(1);
                 const chunkType = (frameTypeByte === 0x01) ? 'key' : 'delta';
@@ -94,7 +94,7 @@
                 // Bytes 8-9: Stripe Height
                 const stripeHeight = dataView.getUint16(8, false); // false for big-endian
 
-                // The actual H.264 NALU data starts after the 10-byte prefix.
+                // Bytes 10-11 name the frame this one predicts from; the H.264 NALU data starts after the 12-byte prefix.
                 const h264NaluData = receivedBuffer.slice(EXPECTED_H264_HEADER_LENGTH);
                 // --- End Prefix Parsing ---
 

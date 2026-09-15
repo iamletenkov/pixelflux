@@ -37,10 +37,10 @@ use libloading::{Library, Symbol};
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer, Fourcc};
 
 use super::codec::{
-    av1_level, h264_level, h265_level, h265_tier, push_video_header, Codec, FRAME_DELTA, FRAME_INTRA,
-    FRAME_KEY,
-    VIDEO_HEADER_LEN,
+    av1_level, h264_dpb_frames, h264_level, h265_dpb_frames, h265_level, h265_tier, push_video_header,
+    Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN,
 };
+use super::reference::{Invalidation, Reference, ReferenceWindow};
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
@@ -1149,6 +1149,14 @@ pub struct NvencEncoder {
     /// The 4:2:0 chroma convert, where the driver took the kernel and the session is not 4:4:4.
     /// `None` leaves NVENC's own conversion in place.
     csc: Option<ChromaConvert>,
+    /// The decoded picture buffer the session declared at open, in frames, which the driver
+    /// does not let a reconfigure change.
+    dpb: u32,
+    /// The frames the decoder holds, so a lost one can be left out of the predictions and each
+    /// frame can name what it predicts from; None where the device cannot invalidate a
+    /// reference, and nothing is tracked.
+    references: Option<ReferenceWindow>,
+    last_reference: Reference,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -1458,6 +1466,9 @@ impl NvencEncoder {
     ///    decoders don't buffer; an explicit level from `nvenc_level` pinned from frame 1 so the
     ///    level never bumps mid-stream; BT.709 primaries and transfer for the sRGB source, at
     ///    limited range, with the matrix whichever conversion the session uses produces;
+    ///    a decoded picture buffer of as many frames as the level admits, so a frame a client
+    ///    lost can be left out of the predictions (`invalidate_reference`) with earlier frames
+    ///    still there to predict from;
     ///    repeated parameter sets on every key frame; H.264 CABAC; no AUD; one AV1 tile; strict
     ///    GOP target; and lookahead disabled for real-time latency.
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to
@@ -1661,6 +1672,13 @@ impl NvencEncoder {
             }
 
             let is_444 = caps.fullcolor;
+            let invalidation = codec != Codec::Av1
+                && query_cap(
+                    &function_list,
+                    encoder_session,
+                    codec_guid,
+                    NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION,
+                ) == Some(1);
 
             let mut config = NV_ENC_CONFIG {
                 version: sv(NvStruct::Config),
@@ -1732,7 +1750,12 @@ impl NvencEncoder {
                 config.rcParams.maxBitRate as u64,
                 tuning.hevc_high_tier,
             );
-            Self::configure_codec(&mut config, codec, is_444, level, &tuning);
+            let dpb = match codec {
+                Codec::H265 => h265_dpb_frames(level, width, height),
+                Codec::Av1 => 1,
+                _ => h264_dpb_frames(level, width, height),
+            };
+            Self::configure_codec(&mut config, codec, is_444, level, dpb, &tuning);
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: sv(NvStruct::InitializeParams),
@@ -1913,6 +1936,9 @@ impl NvencEncoder {
                 pin_uploads: std::env::var("PIXELFLUX_NVENC_PIN").as_deref() != Ok("0"),
                 direct_dmabuf: std::env::var("PIXELFLUX_NVENC_DIRECT").as_deref() != Ok("0"),
                 csc,
+                dpb,
+                references: invalidation.then(|| ReferenceWindow::new(dpb)),
+                last_reference: Reference::Untracked,
             })
         }
     }
@@ -1960,6 +1986,7 @@ impl NvencEncoder {
         codec: Codec,
         fullcolor: bool,
         level: u32,
+        dpb: u32,
         tuning: &NvencTuning,
     ) {
         let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
@@ -1979,6 +2006,7 @@ impl NvencEncoder {
                 Codec::H265 => {
                     let c = &mut config.encodeCodecConfig.hevcConfig;
                     c.level = level;
+                    c.maxNumRefFramesInDPB = dpb;
                     c.tier = if tuning.hevc_high_tier { h265_tier(level) } else { 0 };
                     c.sliceMode = SLICE_MODE_COUNT;
                     c.sliceModeData = tuning.slices;
@@ -2011,6 +2039,7 @@ impl NvencEncoder {
                 _ => {
                     let c = &mut config.encodeCodecConfig.h264Config;
                     c.level = level;
+                    c.maxNumRefFrames = dpb;
                     c.sliceMode = SLICE_MODE_COUNT;
                     c.sliceModeData = tuning.slices;
                     c.idrPeriod = 0xFFFFFFFF;
@@ -2054,6 +2083,37 @@ impl NvencEncoder {
         }
     }
 
+    /// The decoded picture buffer, in frames, the level a `width` x `height` stream at `fps`
+    /// takes admits for this codec.
+    fn dpb_frames_at(&self, width: u32, height: u32, fps: u32) -> u32 {
+        let level = self.level_for(width, height, fps);
+        match self.codec {
+            Codec::H265 => h265_dpb_frames(level, width, height),
+            Codec::Av1 => 1,
+            _ => h264_dpb_frames(level, width, height),
+        }
+    }
+
+    /// The frame the last encoded frame predicted from.
+    pub fn last_reference(&self) -> Reference {
+        self.last_reference
+    }
+
+    /// Leave frame `frame_id` and every frame after it out of the predictions. False when the
+    /// device cannot or refuses, and the caller codes a key frame instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
+        let Some(references) = &mut self.references else {
+            return false;
+        };
+        match references.invalidate(frame_id) {
+            Invalidation::Forget(pts) => unsafe {
+                (self.nvenc_funcs.nvEncInvalidateRefFrames.unwrap())(self.encoder_session, pts)
+                    == NVENCSTATUS::NV_ENC_SUCCESS
+            },
+            Invalidation::KeyFrame | Invalidation::Ignored => true,
+        }
+    }
+
     /// The codec the session emits.
     pub fn codec(&self) -> Codec {
         self.codec
@@ -2071,8 +2131,9 @@ impl NvencEncoder {
     /// milliseconds instead of a full rebuild. Flow:
     ///
     /// 1. **Reject the unchangeable**: a different encode device or codec, a chroma-format flip
-    ///    (4:4:4), an RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode`
-    ///    headroom all return `Err` so the caller rebuilds.
+    ///    (4:4:4), an RC-mode flip, dimensions of zero or beyond the init-time `maxEncode`
+    ///    headroom, or a level whose decoded picture buffer is smaller than the one the session
+    ///    declared (the driver refuses to change it) all return `Err` so the caller rebuilds.
     /// 2. **Keep the stream at unchanged dimensions**: the reference chain, the input surface and
     ///    the dmabuf imports stay as they are, so the restart costs no IDR and no reset. Only the
     ///    pinned hosts are dropped -- the restart recreates the source buffers, often at the same
@@ -2123,6 +2184,9 @@ impl NvencEncoder {
             self.reconfigure_rate(settings);
             self.omit_stripe_headers = settings.omit_stripe_headers;
             return Ok(false);
+        }
+        if self.dpb_frames_at(new_w, new_h, settings.target_fps.max(1.0) as u32) < self.dpb {
+            return Err(format!("{new_w}x{new_h} admits fewer reference frames than the session holds"));
         }
 
         unsafe {
@@ -2496,6 +2560,7 @@ impl NvencEncoder {
         let output_bitstream = self.bitstream_buffers[self.current_buffer_idx];
         self.current_buffer_idx = (self.current_buffer_idx + 1) % self.bitstream_buffers.len();
 
+        let force_idr = force_idr || self.references.as_ref().is_some_and(|r| !r.has_reference());
         let mut pic_params = NV_ENC_PIC_PARAMS {
             version: sv(NvStruct::PicParams),
             inputWidth: self.width,
@@ -2509,6 +2574,7 @@ impl NvencEncoder {
             } else {
                 0
             },
+            inputTimeStamp: self.references.as_ref().map_or(0, ReferenceWindow::next_pts),
             ..Default::default()
         };
 
@@ -2534,13 +2600,16 @@ impl NvencEncoder {
         let data_size = lock_params.bitstreamSizeInBytes as usize;
         let header_sz = if self.omit_stripe_headers { 0 } else { VIDEO_HEADER_LEN };
         let mut output = Vec::with_capacity(header_sz + data_size);
+        let frame_type = match lock_params.pictureType {
+            NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR => FRAME_KEY,
+            NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I => FRAME_INTRA,
+            _ => FRAME_DELTA,
+        };
+        if let Some(references) = &mut self.references {
+            self.last_reference = references.record(frame_number as u16, frame_type != FRAME_DELTA);
+        }
 
         if !self.omit_stripe_headers {
-            let frame_type = match lock_params.pictureType {
-                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR => FRAME_KEY,
-                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I => FRAME_INTRA,
-                _ => FRAME_DELTA,
-            };
             push_video_header(
                 &mut output,
                 self.codec,
@@ -2549,6 +2618,7 @@ impl NvencEncoder {
                 0,
                 self.width as u16,
                 self.height as u16,
+                self.last_reference,
             );
         }
 
@@ -3186,6 +3256,7 @@ mod tests {
                     codec,
                     fullcolor,
                     nvenc_level(codec, 1280, 720, 60, 0, true),
+                    1,
                     &NvencTuning::default(),
                 );
                 let got = unsafe {
@@ -3500,6 +3571,89 @@ mod gpu_tests {
             } else {
                 assert!(!enc.is_fullcolor(), "{codec:?} never carries 4:4:4");
             }
+        }
+    }
+
+    /// A frame a client lost is left out of the device's predictions: the next frame predicts
+    /// from the newest frame before it and names it, a decoder that never saw the lost frames
+    /// decodes it as one that saw everything does, the stream declares the decoded picture
+    /// buffer the level admits and an in-place resize redeclares it. A device that cannot
+    /// invalidate a reference tracks none and says so. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_predicts_past_a_lost_frame() {
+        use crate::encoders::reference::{Reference, REFERENCE_FRAMES};
+        use crate::encoders::sps::h264_max_num_ref_frames;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (w, h) = (1280usize, 720usize);
+        let apart = |a: &crate::webcam::convert::I420View<'_>, b: &crate::webcam::convert::I420View<'_>| {
+            a.y.chunks(a.y_stride)
+                .zip(b.y.chunks(b.y_stride))
+                .take(a.height)
+                .flat_map(|(ra, rb)| ra[..a.width].iter().zip(&rb[..a.width]).map(|(&x, &y)| (x as f64 - y as f64).abs()))
+                .sum::<f64>()
+                / (a.width * a.height) as f64
+        };
+        for codec in [Codec::H264, Codec::H265] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            s.omit_stripe_headers = true;
+            let mut enc = match NvencEncoder::new(&s, ptr::null()) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+            };
+            let encode = |enc: &mut NvencEncoder, i: usize, w: usize, h: usize| {
+                let out = enc.encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0).expect("encode");
+                (out, enc.last_reference())
+            };
+            let (first, reference) = encode(&mut enc, 0, w, h);
+            if reference == Reference::Untracked {
+                println!("{codec:?}: this device cannot invalidate a reference, so nothing is tracked");
+                assert!(!enc.invalidate_reference(0));
+                continue;
+            }
+            assert_eq!(reference, Reference::None);
+            if codec == Codec::H264 {
+                assert_eq!(h264_max_num_ref_frames(&first), Some(REFERENCE_FRAMES), "the SPS declares the DPB");
+            }
+            let mut frames = vec![first];
+            for i in 1..8 {
+                let (out, reference) = encode(&mut enc, i, w, h);
+                assert_eq!(reference, Reference::Frame(i as u16 - 1), "{codec:?} frame {i}");
+                frames.push(out);
+            }
+            assert!(enc.invalidate_reference(5), "{codec:?}: the device refused the invalidation");
+            let (out, reference) = encode(&mut enc, 8, w, h);
+            assert_eq!(reference, Reference::Frame(4), "{codec:?}");
+            frames.push(out);
+            let (out, reference) = encode(&mut enc, 9, w, h);
+            assert_eq!(reference, Reference::Frame(8), "{codec:?}");
+            frames.push(out);
+            let (mut whole, mut lossy) = (AvDecoder::new(codec).unwrap(), AvDecoder::new(codec).unwrap());
+            for (i, f) in frames.iter().enumerate() {
+                assert!(whole.decode(f).expect("decode"), "{codec:?} frame {i}");
+                if !(5..8).contains(&i) {
+                    assert!(lossy.decode(f).expect("decode without 5-7"), "{codec:?} frame {i}");
+                }
+            }
+            let off = apart(&whole.frame().unwrap(), &lossy.frame().unwrap());
+            println!("{codec:?}: frame 9 without frames 5-7 is {off:.3} off the complete decode");
+            assert!(off < 0.5, "{codec:?}: the decoder that lost frames 5-7 shows frame 9 {off:.2} off the one that saw them");
+            // The driver keeps the DPB a session opened with, so a grow to a level admitting fewer
+            // frames is refused in place and the session rebuilt at the new size.
+            s.width = 1920;
+            s.height = 1080;
+            assert!(enc.reconfigure_resolution(&s).is_err(), "{codec:?}: 1080p admits fewer than the eight held at 720p");
+            let mut enc = NvencEncoder::new(&s, ptr::null()).expect("1080p session");
+            let (out, reference) = encode(&mut enc, 0, 1920, 1080);
+            assert_eq!(reference, Reference::None);
+            if codec == Codec::H264 {
+                assert_eq!(h264_max_num_ref_frames(&out), Some(4), "1080p at level 4.2 admits four");
+            }
+            assert_eq!(encode(&mut enc, 1, 1920, 1080).1, Reference::Frame(0), "{codec:?}");
         }
     }
 

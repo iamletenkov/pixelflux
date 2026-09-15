@@ -43,6 +43,7 @@ use super::codec::{
     VIDEO_HEADER_LEN,
 };
 use super::software::convert_to_yuv_mt;
+use super::reference::Reference;
 use super::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
@@ -1342,6 +1343,7 @@ impl AvcodecEncoder {
                     0,
                     self.width as u16,
                     self.height as u16,
+                    Reference::Untracked,
                 );
             }
             output.extend_from_slice(bytes);

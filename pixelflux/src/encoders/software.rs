@@ -14,8 +14,11 @@
 //! stateless.
 
 #[cfg(feature = "gpl")]
-use super::codec::{push_video_header, FRAME_DELTA, FRAME_INTRA, FRAME_KEY};
+use super::codec::{h264_dpb_frames, h264_level, push_video_header, FRAME_DELTA, FRAME_INTRA, FRAME_KEY};
 use super::codec::{push_jpeg_header, Codec};
+use super::reference::Reference;
+#[cfg(feature = "gpl")]
+use super::reference::{Invalidation, ReferenceWindow};
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
@@ -181,6 +184,10 @@ pub struct H264EncoderWrapper {
     threads: i32,
     min_qp: i32,
     max_qp: i32,
+    /// The frames the decoder holds, so a lost one can be left out of the predictions and
+    /// each frame can name what it predicts from.
+    references: ReferenceWindow,
+    last_reference: Reference,
 }
 
 #[cfg(feature = "gpl")]
@@ -230,6 +237,10 @@ impl H264EncoderWrapper {
     ///    baseline profile — CAVLC entropy coding with no 8x8 DCT — for minimal encode cost.
     /// 6. **Output**: repeated headers (SPS/PPS before each keyframe) and Annex-B framing, with
     ///    x264's own logging silenced.
+    /// 7. **References**: a decoded picture buffer of as many frames as the level admits
+    ///    (`i_dpb_size`, up to `REFERENCE_FRAMES`), so `invalidate_reference` can leave a frame a
+    ///    client lost out of the predictions with earlier frames still there to predict from.
+    ///    Motion search keeps its single reference.
     ///
     /// The `x264_encoder_open` call is serialized under `X264_OPEN_CLOSE_LOCK` because it mutates
     /// libx264 global state.
@@ -252,6 +263,13 @@ impl H264EncoderWrapper {
             param.i_fps_den = 1;
             param.i_keyint_max = x264_sys::X264_KEYINT_MAX_INFINITE as i32;
             param.i_scenecut_threshold = 0;
+            let bitrate_bps = if cbr_mode { bitrate_kbps.saturating_abs() as u64 * 1000 } else { 0 };
+            let dpb = h264_dpb_frames(
+                h264_level(width as u32, height as u32, param.i_fps_num, bitrate_bps),
+                width as u32,
+                height as u32,
+            );
+            param.i_dpb_size = dpb as i32;
             if cbr_mode {
                 let bk = bitrate_kbps.saturating_abs();
                 param.rc.i_rc_method = x264_sys::X264_RC_ABR as i32;
@@ -305,6 +323,8 @@ impl H264EncoderWrapper {
                     threads,
                     min_qp,
                     max_qp,
+                    references: ReferenceWindow::new(dpb),
+                    last_reference: Reference::Untracked,
                 })
             }
         }
@@ -387,6 +407,22 @@ impl H264EncoderWrapper {
         }
     }
 
+    /// The frame the last encoded frame predicted from.
+    pub fn last_reference(&self) -> Reference {
+        self.last_reference
+    }
+
+    /// Leave frame `frame_id` and every frame after it out of the predictions. False when x264
+    /// refuses, and the caller codes a key frame instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
+        match self.references.invalidate(frame_id) {
+            Invalidation::Forget(pts) => unsafe {
+                x264_sys::x264_encoder_invalidate_reference(self.encoder, pts as i64) == 0
+            },
+            Invalidation::KeyFrame | Invalidation::Ignored => true,
+        }
+    }
+
     /// Encode one YUV frame into H.264 and frame it for the wire, reporting whether the
     /// encoder actually emitted a bitstream this call.
     ///
@@ -397,8 +433,10 @@ impl H264EncoderWrapper {
     /// elementary stream.
     ///
     /// 1. **Picture setup**: wraps the borrowed Y/U/V planes and their strides in an
-    ///    `x264_picture_t` with the encoder's CSP, stamps the presentation timestamp with `frame_id`,
-    ///    and requests an IDR when `force_idr` is set (otherwise `X264_TYPE_AUTO`).
+    ///    `x264_picture_t` with the encoder's CSP, stamps the presentation timestamp with the
+    ///    session's count of encoded frames (the one an invalidation names), and requests an IDR
+    ///    when `force_idr` is set or no reference is left to predict from (otherwise
+    ///    `X264_TYPE_AUTO`).
     /// 2. **Encode**: calls `x264_encoder_encode`; a non-positive returned size means no frame was
     ///    emitted this call, so the function returns `false` without writing output.
     /// 3. **Framing**: `output_buf` is cleared and refilled. Unless `omit_headers` is set, the wire
@@ -439,8 +477,8 @@ impl H264EncoderWrapper {
             pic_in.img.i_stride[0] = y_stride;
             pic_in.img.i_stride[1] = u_stride;
             pic_in.img.i_stride[2] = v_stride;
-            pic_in.i_pts = frame_id as i64;
-            pic_in.i_type = if force_idr {
+            pic_in.i_pts = self.references.next_pts() as i64;
+            pic_in.i_type = if force_idr || !self.references.has_reference() {
                 x264_sys::X264_TYPE_IDR
             } else {
                 x264_sys::X264_TYPE_AUTO
@@ -459,16 +497,17 @@ impl H264EncoderWrapper {
             );
 
             if frame_size > 0 {
+                let frame_type = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
+                    FRAME_KEY
+                } else if pic_out.i_type == x264_sys::X264_TYPE_I as i32 {
+                    FRAME_INTRA
+                } else {
+                    FRAME_DELTA
+                };
+                self.last_reference = self.references.record(frame_id, frame_type != FRAME_DELTA);
                 output_buf.clear();
                 output_buf.reserve(super::codec::VIDEO_HEADER_LEN + frame_size as usize);
                 if !omit_headers {
-                    let frame_type = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
-                        FRAME_KEY
-                    } else if pic_out.i_type == x264_sys::X264_TYPE_I as i32 {
-                        FRAME_INTRA
-                    } else {
-                        FRAME_DELTA
-                    };
                     push_video_header(
                         output_buf,
                         Codec::H264,
@@ -477,6 +516,7 @@ impl H264EncoderWrapper {
                         y_start,
                         self.width as u16,
                         self.height as u16,
+                        self.last_reference,
                     );
                 }
 
@@ -613,6 +653,7 @@ impl StripeState {
 /// * `stripe_y_start` - Y pixel coordinate of the stripe's top edge within the frame.
 /// * `stripe_height` - Height of the stripe in pixels.
 /// * `frame_id` - Frame sequence number this stripe belongs to.
+/// * `reference` - The frame this stripe predicts from.
 pub struct EncodedStripe {
     pub data: Arc<Vec<u8>>,
     pub codec: Codec,
@@ -620,6 +661,7 @@ pub struct EncodedStripe {
     pub stripe_height: i32,
     pub frame_id: i32,
     pub timing: FrameTiming,
+    pub reference: Reference,
 }
 
 /// When a frame was captured and when its encode began and ended, as CLOCK_MONOTONIC
@@ -995,6 +1037,7 @@ pub fn encode_cpu(
                             stripe_height: actual_height as i32,
                             frame_id: frame_counter as i32,
                             timing: FrameTiming::default(),
+                            reference: Reference::Untracked,
                         })
                     })
                 } else {
@@ -1088,6 +1131,7 @@ pub fn encode_cpu(
                                 stripe_height: actual_height as i32,
                                 frame_id: frame_counter as i32,
                                 timing: FrameTiming::default(),
+                                reference: enc.last_reference(),
                             })
                         } else {
                             None
@@ -1143,6 +1187,7 @@ pub fn encode_cpu(
                             stripe_height: actual_height as i32,
                             frame_id: frame_counter as i32,
                             timing: FrameTiming::default(),
+                            reference: Reference::Untracked,
                         }),
                         Ok(_) => None,
                         Err(e) => {
@@ -1176,6 +1221,25 @@ pub fn encode_cpu(
 /// A full-frame session is one contiguous stream and so a single stripe; otherwise the frame
 /// fans out across cores, bounded so no stripe is shorter than a macroblock row. Both the
 /// encoder and the settings line report from here, so what is logged is what is encoded.
+/// Leave frame `frame_id` and every frame after it out of every stripe's predictions. False
+/// when an encoder cannot, and the caller codes a key frame instead.
+pub fn invalidate_reference(stripes: &mut [StripeState], frame_id: u16) -> bool {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "gpl")] {
+            // Every stripe is its own stream, so each one is told; a refusal from any of
+            // them still leaves the rest to forget the frame.
+            let mut forgotten = true;
+            for enc in stripes.iter_mut().filter_map(|s| s.h264_encoder.as_mut()) {
+                forgotten &= enc.invalidate_reference(frame_id);
+            }
+            forgotten
+        } else {
+            let _ = (stripes, frame_id);
+            false
+        }
+    }
+}
+
 pub fn stripe_count(height: i32, codec: Codec, fullframe: bool) -> usize {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     if !codec.stripes() || (codec.is_video() && fullframe) || height < MIN_STRIPE_HEIGHT {
@@ -1385,7 +1449,7 @@ mod tests {
             assert_eq!(u16::from_be_bytes([d[8], d[9]]) as usize, sh, "stripe height");
             assert_eq!((stripe.stripe_y_start as usize, stripe.stripe_height as usize), (y, sh));
             let mut dec = Decoder::new().expect("decoder");
-            let img = dec.decode(&d[10..]).expect("decode").expect("an IDR decodes on its own");
+            let img = dec.decode(&d[crate::encoders::codec::VIDEO_HEADER_LEN..]).expect("decode").expect("an IDR decodes on its own");
             assert_eq!(img.dimensions(), (w as usize, sh), "each stripe is its own stream");
         }
         let quiet = super::encode_cpu(
@@ -1734,6 +1798,77 @@ mod qp_bound_sweep {
         let worst = chart_error(&dec.frame().expect("frame"), BT709);
         println!("[chart] x264: worst |dRGB| {worst:.1}");
         assert!(worst <= 12.0, "the software H.264 path paints {worst:.1} off the chart");
+    }
+
+    /// A frame a client lost is left out of the predictions: the next frame predicts from the
+    /// newest frame before it and names it, a decoder that never saw the lost frames decodes it
+    /// as one that saw everything does, and a loss the window no longer covers becomes a key
+    /// frame. The stream declares the decoded picture buffer this needs.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_predicts_past_a_lost_frame() {
+        use crate::encoders::codec::{h264_frame_type, FRAME_DELTA, FRAME_KEY};
+        use crate::encoders::reference::{Reference, REFERENCE_FRAMES};
+        use crate::encoders::sps::h264_max_num_ref_frames;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let mut enc = H264EncoderWrapper::new(W as i32, H as i32, 20, false, 60.0, 4, false, 0, 0, 0, 0)
+            .expect("x264 init");
+        let encode = |enc: &mut H264EncoderWrapper, i: usize| {
+            let y = text_luma(i);
+            let mut out = Vec::new();
+            assert!(enc.encode_with_headers(&y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32,
+                                            i as u16, 0, i == 0, true, &mut out));
+            (out, enc.last_reference())
+        };
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..8 {
+            let (out, reference) = encode(&mut enc, i);
+            assert_eq!(reference, if i == 0 { Reference::None } else { Reference::Frame(i as u16 - 1) });
+            frames.push(out);
+        }
+        assert_eq!(h264_max_num_ref_frames(&frames[0]), Some(REFERENCE_FRAMES), "the SPS declares the DPB");
+        // Frame 5 is reported lost once 6 and 7 have gone out.
+        assert!(enc.invalidate_reference(5));
+        let (out, reference) = encode(&mut enc, 8);
+        assert_eq!(reference, Reference::Frame(4));
+        assert_eq!(h264_frame_type(&out), FRAME_DELTA);
+        frames.push(out);
+        let (out, reference) = encode(&mut enc, 9);
+        assert_eq!(reference, Reference::Frame(8));
+        frames.push(out);
+        let (mut whole, mut lossy) = (AvDecoder::new(Codec::H264).unwrap(), AvDecoder::new(Codec::H264).unwrap());
+        for (i, f) in frames.iter().enumerate() {
+            assert!(whole.decode(f).expect("decode"), "frame {i}");
+            if !(5..8).contains(&i) {
+                assert!(lossy.decode(f).expect("decode without 5-7"), "frame {i}");
+            }
+        }
+        let apart = luma_distance(&whole.frame().unwrap(), &lossy.frame().unwrap());
+        assert!(apart < 0.5, "the decoder that lost frames 5-7 shows frame 9 {apart:.2} off the one that saw them");
+        let source = text_luma(9);
+        let off = lossy.frame().unwrap().y.chunks(lossy.frame().unwrap().y_stride).take(H)
+            .zip(source.chunks(W))
+            .flat_map(|(row, src)| row[..W].iter().zip(src).map(|(&a, &b)| (a as f64 - b as f64).abs()))
+            .sum::<f64>() / (W * H) as f64;
+        assert!(off < 6.0, "frame 9 decoded without frames 5-7 is {off:.2} off the picture painted");
+        for i in 10..20 {
+            frames.push(encode(&mut enc, i).0);
+        }
+        // Frame 9 has left an 8-frame window holding 12..19, so every reference predicts
+        // through it: the next frame is a key frame.
+        assert!(enc.invalidate_reference(9));
+        let (out, reference) = encode(&mut enc, 20);
+        assert_eq!(reference, Reference::None);
+        assert_eq!(h264_frame_type(&out), FRAME_KEY);
+    }
+
+    /// Mean absolute luma difference between two decoded pictures.
+    #[cfg(feature = "gpl")]
+    fn luma_distance(a: &crate::webcam::convert::I420View<'_>, b: &crate::webcam::convert::I420View<'_>) -> f64 {
+        let rows = a.y.chunks(a.y_stride).zip(b.y.chunks(b.y_stride)).take(a.height);
+        rows.flat_map(|(ra, rb)| ra[..a.width].iter().zip(&rb[..a.width]).map(|(&x, &y)| (x as f64 - y as f64).abs()))
+            .sum::<f64>() / (a.width * a.height) as f64
     }
 
     /// Encode the same scrolling-text sequence through the OpenH264 full-frame encoder (luma

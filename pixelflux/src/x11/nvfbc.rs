@@ -834,6 +834,11 @@ where
             break;
         }
 
+        for frame_id in std::mem::take(&mut *controls.invalid_frames.lock().unwrap()) {
+            if !gpu.encoder.invalidate_reference(frame_id) {
+                pending_force_idr = true;
+            }
+        }
         if controls.force_idr.swap(false, Ordering::Relaxed)
             || recording_sink.as_ref().is_some_and(|s| s.should_force_idr())
         {
@@ -964,6 +969,7 @@ where
                             encode_start_ns,
                             encode_end_ns: crate::wayland::host::now_ns(),
                         },
+                        reference: gpu.encoder.last_reference(),
                     }];
                     if let Some(sink) = &recording_sink {
                         sink.write_frame(&stripes, gpu.settings.width, gpu.settings.height);

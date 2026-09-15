@@ -65,7 +65,12 @@ decoder that gates on the level — older Apple and Intel parts refuse a level a
 picture they could hold — takes the stream; NVENC re-declares it with a forced IDR on each in-place resize, and
 holds AV1 alone at the resize headroom's level, which NVENC validates its session against at init. JPEG and
 H.264 may stripe (`encoders/software.rs`);
-every other codec streams whole frames. Every full-frame session is chosen by one ladder,
+every other codec streams whole frames. Every session that can name what a frame predicts from
+does (`encoders/reference.rs`, `StripeFrame.reference_frame_id`), and `invalidate_reference`
+leaves a frame a consumer lost out of the predictions so recovery costs no keyframe: NVENC where
+the device reports reference-picture invalidation, libx264 always, and the stream declares the
+decoded picture buffer the level admits. A session that cannot refuses, and the caller forces an
+IDR instead. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (NVENC on the NVIDIA driver, VA-API otherwise, then the codec's software
 encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback. `encoders/nvenc.rs`
 is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is

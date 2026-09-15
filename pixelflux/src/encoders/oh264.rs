@@ -19,6 +19,7 @@
 //! BT.709 limited-range path the x264 encoder uses, then fed to OpenH264 as borrowed planes.
 
 use crate::encoders::codec::{push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN};
+use crate::encoders::reference::Reference;
 use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use openh264::encoder::{
@@ -544,6 +545,7 @@ impl Openh264Encoder {
                         y_start,
                         self.width as u16,
                         self.height as u16,
+                        Reference::Untracked,
                     );
                 }
                 bitstream.write_vec(&mut out);
@@ -657,7 +659,7 @@ mod tests {
         assert_eq!(&idr[2..6], &[0, 0, 0, 0], "frame_id 0 and y_start 0");
         assert_eq!(&idr[6..10], &[0, 128, 0, 96], "width/height big-endian");
         assert!(
-            idr[10..].starts_with(&[0, 0, 0, 1]) || idr[10..].starts_with(&[0, 0, 1]),
+            idr[VIDEO_HEADER_LEN..].starts_with(&[0, 0, 0, 1]) || idr[VIDEO_HEADER_LEN..].starts_with(&[0, 0, 1]),
             "payload must be Annex-B (start code prefixed)"
         );
         let p = enc.encode_host_argb(&busy_frame(128, 96, 0), stride, 7, false, false).expect("encode p");
@@ -850,7 +852,7 @@ mod tests {
             assert!(out.len() > 10, "rgba_input={rgba} must produce output");
             assert_eq!(out[0], 0x04, "rgba_input={rgba} output must carry the wire header");
             assert!(
-                out[10..].starts_with(&[0, 0, 0, 1]) || out[10..].starts_with(&[0, 0, 1]),
+                out[VIDEO_HEADER_LEN..].starts_with(&[0, 0, 0, 1]) || out[VIDEO_HEADER_LEN..].starts_with(&[0, 0, 1]),
                 "rgba_input={rgba} payload must be Annex-B"
             );
         }

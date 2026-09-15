@@ -241,7 +241,9 @@ settings.encode_node_path = None
 settings.render_node_path = None
 
 # --- Wire Format / Zero-Copy (X11) ---
-# False (default): prepend the per-stripe header to each packet (the WebSocket path).
+# False (default): prepend the per-stripe header to each packet (the WebSocket path): the tag,
+# the codec and frame kind, then the frame id, the stripe's top row, its width and height, and
+# the id of the frame it predicts from, all big-endian u16.
 # True: emit the raw encoded payload with no header (for a WebRTC path that frames itself).
 settings.omit_stripe_headers = False
 
@@ -300,6 +302,9 @@ def my_callback(frame):
     # frame.capture_ns, frame.encode_start_ns, frame.encode_end_ns
     #                      (CLOCK_MONOTONIC nanoseconds, comparable with time.monotonic_ns();
     #                       the stripes of a frame share them)
+    # frame.reference_frame_id
+    #                      (the frame this one predicts from: -1 when it decodes on its own,
+    #                       -2 where the encoder does not track its references)
     encoded_data = bytes(frame)          # copy out, or use memoryview(frame) zero-copy (below)
     # Send encoded_data to the client...
 ```
@@ -570,6 +575,12 @@ curl -s -X POST http://localhost:5000/computer-use \
 *   **Force a keyframe on demand:** `capture.request_idr_frame()` forces an IDR frame, e.g. when
     a client reconnects or its decoder is reset. It routes to whichever encoder is active
     (NVENC, VA-API, or software) and is a no-op while no capture is running.
+*   **Predict past a frame a client lost:** `capture.invalidate_reference(frame_id)` leaves that
+    frame and everything encoded after it out of the predictions, so the next frame decodes for a
+    client that never received it and the stream costs no keyframe. Each frame says what it
+    predicts from (`StripeFrame.reference_frame_id`), which is what a consumer holds the frames
+    behind a loss back by. NVENC and libx264 track their references, on the devices whose drivers
+    offer it; a session that does not reports `-2` and answers this with a keyframe instead.
 
 ### Colour conversion
 
@@ -648,6 +659,8 @@ session settled on rather than what was asked for.
     *   **Paint-Over:** Automatically improves quality for static regions.
     *   **Damage Throttling:** Limits processing during high-motion scenes.
     *   **On-demand keyframes:** `request_idr_frame()` forces an IDR for reconnecting clients.
+    *   **Reference invalidation:** `invalidate_reference(frame_id)` has the encoder predict past a
+        frame a client lost, so recovery costs no keyframe.
 *   **Input Handling:** Built-in input injection for mouse and keyboard (Wayland; XTEST on X11 via Computer Use).
 *   **Cursor Compositing:** Hardware cursor planes or software rendering options.
 *   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.

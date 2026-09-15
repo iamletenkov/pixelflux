@@ -193,6 +193,7 @@ fn get_shm_usage_bytes() -> u64 {
 
 use encoders::overlay::OverlayState;
 use encoders::software::MAX_STRIPE_CAPACITY;
+use encoders::reference::Reference;
 use encoders::{Codec, FrameEncoder, FrameSource};
 
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
@@ -694,6 +695,9 @@ pub enum ThreadCommand {
     /// On-demand keyframe request (client reconnect / decoder reset) for one display's
     /// capture: forces a send and an IDR even on a static screen.
     RequestIdr { display_id: u32 },
+    /// A client lost frame `frame_id` of one display's capture: the frames after it stop
+    /// predicting from it, so the next one decodes without a keyframe.
+    InvalidateReference { display_id: u32, frame_id: u16 },
     /// Live rate-control change for one display's capture (parity with the X11 `rate_dirty`
     /// path). Each field is `None` when that dimension is unchanged.
     UpdateRate {
@@ -1057,12 +1061,14 @@ impl WlFramePool {
 /// encode thread swaps it with Acquire and re-reads the payload, never seeing it half-applied.
 /// `force_idr` is swapped just before each encode, so an on-demand keyframe lands on the
 /// frame ALREADY in flight instead of waiting one pipeline stage for the next publish.
+/// `invalid_frames` are the frames clients reported lost, drained ahead of the same encode.
 pub struct WlEncodeControls {
     rate_dirty: AtomicBool,
     bitrate_kbps: AtomicI32,
     vbv_mult_milli: AtomicI32,
     fps_milli: AtomicU64,
     force_idr: AtomicBool,
+    invalid_frames: Mutex<Vec<u16>>,
     /// Pending per-frame tunables for the encode thread (mutex, not atomics: one struct, set
     /// rarely, read only when the dirty flag says so).
     tunables_dirty: AtomicBool,
@@ -1077,6 +1083,7 @@ impl WlEncodeControls {
             vbv_mult_milli: AtomicI32::new(0),
             fps_milli: AtomicU64::new(0),
             force_idr: AtomicBool::new(false),
+            invalid_frames: Mutex::new(Vec::new()),
             tunables_dirty: AtomicBool::new(false),
             tunables: Mutex::new(None),
         }
@@ -1279,6 +1286,15 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
         // decodable frame even when the screen is static. A sink whose capture has been
         // torn down is already gone, and its last frames are not recorded.
         let recording_sink = cfg.recording_sink.as_ref().and_then(|w| w.upgrade());
+        for frame_id in std::mem::take(&mut *cfg.controls.invalid_frames.lock().unwrap()) {
+            let forgotten = match video_encoder.as_mut() {
+                Some(encoder) => encoder.invalidate_reference(frame_id),
+                None => encoders::software::invalidate_reference(&mut stripes, frame_id),
+            };
+            if !forgotten {
+                cfg.controls.force_idr.store(true, Ordering::Relaxed);
+            }
+        }
         let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed)
             || recording_sink.as_ref().is_some_and(|s| s.should_force_idr());
 
@@ -1324,6 +1340,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                                     encode_start_ns,
                                     encode_end_ns: wayland::host::now_ns(),
                                 },
+                                reference: encoder.last_reference(),
                             });
                         }
                     }
@@ -2294,7 +2311,7 @@ fn start_capture_on_display(
                             for s in stripes {
                                 match Py::new(py, StripeFrame::new_owned_meta(
                                     s.data, s.codec.data_type(), s.stripe_y_start,
-                                    s.stripe_height, s.frame_id, s.timing,
+                                    s.stripe_height, s.frame_id, s.timing, s.reference,
                                 )) {
                                     Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
                                     Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
@@ -3494,6 +3511,7 @@ fn render_node_tick(
                                         encode_start_ns,
                                         encode_end_ns: wayland::host::now_ns(),
                                     },
+                                    reference: encoder.last_reference(),
                                 }];
                                 if let Some(ref socket) = cap.recording_sink {
                                     socket.write_frame(&stripes, width, height);
@@ -5213,6 +5231,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             cap.request_idr();
                         }
                 }
+                ThreadCommand::InvalidateReference { display_id, frame_id } => {
+                    if let Some(idx) = state.node_idx_for_id(display_id)
+                        && let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                            cap.invalidate_reference(frame_id);
+                        }
+                }
                 ThreadCommand::UpdateRate { display_id, bitrate_kbps, vbv_multiplier, fps } => {
                     if let Some(idx) = state.node_idx_for_id(display_id)
                         && let Some(cap) = state.output_nodes[idx].capture.as_mut() {
@@ -5532,6 +5556,10 @@ struct StripeFrame {
     encode_start_ns: i64,
     #[pyo3(get)]
     encode_end_ns: i64,
+    /// The frame this one predicts from: its id, -1 for a frame that decodes on its own, -2
+    /// where the encoder does not track its references.
+    #[pyo3(get)]
+    reference_frame_id: i32,
 }
 
 impl StripeFrame {
@@ -5545,6 +5573,7 @@ impl StripeFrame {
         stripe_height: i32,
         frame_id: i32,
         timing: FrameTiming,
+        reference: Reference,
     ) -> Self {
         Self {
             data,
@@ -5555,6 +5584,7 @@ impl StripeFrame {
             capture_ns: timing.capture_ns,
             encode_start_ns: timing.encode_start_ns,
             encode_end_ns: timing.encode_end_ns,
+            reference_frame_id: reference.frame_id(),
         }
     }
 }
@@ -5566,7 +5596,7 @@ impl StripeFrame {
     #[new]
     #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
     fn new(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
-        Self::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id, FrameTiming::default())
+        Self::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id, FrameTiming::default(), Reference::Untracked)
     }
 
     fn __len__(&self) -> usize {
@@ -5969,6 +5999,15 @@ impl WaylandBackend {
         Ok(())
     }
 
+    /// A client lost frame `frame_id` of the given display's capture: the frames after it stop
+    /// predicting from it, so the next one decodes there without a keyframe. An encoder that
+    /// cannot leave a frame out codes a keyframe instead.
+    #[pyo3(signature = (frame_id, display_id = 0))]
+    fn invalidate_reference(&self, frame_id: u16, display_id: u32) -> PyResult<()> {
+        self.send(ThreadCommand::InvalidateReference { display_id, frame_id })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to invalidate reference: {}", e)))
+    }
+
     /// Apply a live bitrate (kbps) / VBV (kb) / framerate change to the given display's
     /// running capture.
     #[pyo3(signature = (bitrate_kbps = None, vbv_multiplier = None, fps = None, display_id = 0))]
@@ -6104,7 +6143,7 @@ fn stripe_frame_from_buffer(
     stripe_height: i32,
     frame_id: i32,
 ) -> StripeFrame {
-    StripeFrame::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id, FrameTiming::default())
+    StripeFrame::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id, FrameTiming::default(), Reference::Untracked)
 }
 
 /// Capture configuration read by `start_capture` (each field by attribute name via
@@ -6786,6 +6825,7 @@ impl ScreenCapture {
                                 s.stripe_height,
                                 s.frame_id,
                                 s.timing,
+                                s.reference,
                             ),
                         ) {
                             Ok(f) => {
@@ -6905,6 +6945,31 @@ impl ScreenCapture {
                 if let Some(slot) = WAYLAND_BACKEND.get()
                     && let Some(be) = slot.lock().unwrap().as_ref() {
                         let _ = be.bind(py).borrow().request_idr_frame(did);
+                    }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A client lost frame `frame_id`: the frames after it stop predicting from it, so the next
+    /// one decodes there without a keyframe. An encoder that cannot leave a frame out of its
+    /// predictions codes a keyframe instead. Non-blocking, like `request_idr_frame`.
+    fn invalidate_reference(&self, py: Python<'_>, frame_id: u16) -> PyResult<()> {
+        let (backend, controls, did) = {
+            let st = self.inner.lock().unwrap();
+            (st.backend, st.controls.clone(), st.wl_display)
+        };
+        match backend {
+            1 => {
+                if let Some(c) = controls {
+                    c.invalid_frames.lock().unwrap().push(frame_id);
+                }
+            }
+            2 => {
+                if let Some(slot) = WAYLAND_BACKEND.get()
+                    && let Some(be) = slot.lock().unwrap().as_ref() {
+                        let _ = be.bind(py).borrow().invalidate_reference(frame_id, did);
                     }
             }
             _ => {}

@@ -420,6 +420,19 @@ impl WlCapture {
         }
         self.needs_full_render = true;
     }
+
+    /// Leave frame `frame_id` and every frame after it out of the predictions, for a client that
+    /// lost it: handed to the encode thread where one runs, applied to the calloop's own session
+    /// otherwise. An encoder that cannot codes a keyframe instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16) {
+        if self.encode_pool.is_some() {
+            self.encode_controls.invalid_frames.lock().unwrap().push(frame_id);
+        } else if let Some(encoder) = self.video_encoder.as_mut()
+            && !encoder.invalidate_reference(frame_id)
+        {
+            self.request_idr();
+        }
+    }
 }
 
 /// One virtual output and everything sized to it: the Smithay `Output` + its advertised

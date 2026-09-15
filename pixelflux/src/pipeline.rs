@@ -10,7 +10,7 @@
 //! which one produced a frame — a paint-over refresh or a recovery keyframe has to behave
 //! identically either way. Keeping the decision logic here, source-agnostic, is what guarantees it.
 
-use crate::encoders::software::{encode_cpu, EncodedStripe, StripeState};
+use crate::encoders::software::{encode_cpu, invalidate_reference, EncodedStripe, StripeState};
 use crate::encoders::{self, Codec, FrameEncoder, FrameSource};
 use crate::RustCaptureSettings;
 use std::sync::Arc;
@@ -228,6 +228,18 @@ impl X11Pipeline {
         self.pending_force_idr = true;
     }
 
+    /// Leave frame `frame_id` and every frame after it out of the predictions, for a client that
+    /// lost it; an encoder that cannot codes a keyframe instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16) {
+        let forgotten = match self.hw.as_mut() {
+            Some(enc) => enc.invalidate_reference(frame_id),
+            None => invalidate_reference(&mut self.stripes, frame_id),
+        };
+        if !forgotten {
+            self.pending_force_idr = true;
+        }
+    }
+
     /// The encoder's name for the stream log: the hardware backend, the software library of a
     /// full-frame session, or `CPU` for the striped software path.
     pub fn encoder_name(&self) -> String {
@@ -367,6 +379,7 @@ impl X11Pipeline {
                             stripe_height: height,
                             frame_id: self.frame_counter as i32,
                             timing: Default::default(),
+                            reference: enc.last_reference(),
                         }]
                     }
                     Ok(_) => {

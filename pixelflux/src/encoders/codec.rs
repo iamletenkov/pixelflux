@@ -24,6 +24,8 @@ pub enum Codec {
 }
 
 /// Wire tag of a JPEG stripe: `u8 reserved`, `u16 frame id`, `u16 stripe Y`, JPEG data.
+use super::reference::{Reference, REFERENCE_FRAMES};
+
 pub const WIRE_JPEG: u8 = 0x03;
 /// Wire tag of an encoded video frame or stripe: a type byte whose low nibble is the
 /// frame kind and whose high nibble is the codec's [`Codec::wire_id`], then `u16 frame
@@ -36,7 +38,7 @@ pub const FRAME_INTRA: u8 = 0x02;
 pub const FRAME_DELTA: u8 = 0x00;
 /// Bytes of the two stripe headers.
 pub const JPEG_HEADER_LEN: usize = 6;
-pub const VIDEO_HEADER_LEN: usize = 10;
+pub const VIDEO_HEADER_LEN: usize = 12;
 
 impl Codec {
     /// The video codecs, in wire-id order.
@@ -267,7 +269,11 @@ pub fn vpx_level(codec: Codec, qindex: u32) -> u32 {
     best as u32
 }
 
-/// Append the header of one encoded video frame or stripe.
+/// Append the header of one encoded video frame or stripe: the tag, the codec and frame kind,
+/// then the frame id, the stripe's top row, its width and height, and the id of the frame it
+/// predicts from, all big-endian u16. A frame that predicts from none, or whose encoder does
+/// not say, names itself there.
+#[allow(clippy::too_many_arguments)]
 pub fn push_video_header(
     out: &mut Vec<u8>,
     codec: Codec,
@@ -276,6 +282,7 @@ pub fn push_video_header(
     y_start: u16,
     width: u16,
     height: u16,
+    reference: Reference,
 ) {
     out.push(WIRE_VIDEO);
     out.push((frame_type & 0x0f) | (codec.wire_id() << 4));
@@ -283,6 +290,11 @@ pub fn push_video_header(
     out.extend_from_slice(&y_start.to_be_bytes());
     out.extend_from_slice(&width.to_be_bytes());
     out.extend_from_slice(&height.to_be_bytes());
+    let reference = match reference {
+        Reference::Frame(id) => id,
+        Reference::None | Reference::Untracked => frame_id,
+    };
+    out.extend_from_slice(&reference.to_be_bytes());
 }
 
 /// Append the header of one JPEG stripe.
@@ -337,6 +349,21 @@ pub fn h264_level(width: u32, height: u32, fps: u32, bitrate_bps: u64) -> u32 {
     62
 }
 
+/// The decoded picture buffer, in frames, an H.264 stream at `level` may declare for a
+/// `width` x `height` picture: the level's MaxDpbMbs over the picture's macroblocks, at most
+/// `REFERENCE_FRAMES`.
+pub fn h264_dpb_frames(level: u32, width: u32, height: u32) -> u32 {
+    let mbs = (width as u64).div_ceil(16) * (height as u64).div_ceil(16);
+    let max_dpb_mbs: u64 = match level {
+        41 => 32768,
+        42 => 34816,
+        50 => 110400,
+        51 | 52 => 184320,
+        _ => 696320,
+    };
+    ((max_dpb_mbs / mbs.max(1)) as u32).clamp(1, REFERENCE_FRAMES)
+}
+
 /// Lowest H.265 level whose Annex-A Tables A.8 and A.9 limits admit a `width` x `height`
 /// stream at `fps` carrying up to `bitrate_bps` (0 where no rate is declared) at the High
 /// tier or the Main one, as general_level_idc (123 = 4.1, 156 = 5.2, 186 = 6.2).
@@ -363,6 +390,29 @@ pub fn h265_level(width: u32, height: u32, fps: u32, bitrate_bps: u64, high_tier
         }
     }
     186
+}
+
+/// The reference frames an H.265 stream at `level` may hold for a `width` x `height`
+/// picture: the decoded picture buffer A.4.2 sizes (six pictures at the level's full
+/// MaxLumaPs, more for a smaller picture) less the picture being decoded, at most
+/// `REFERENCE_FRAMES`.
+pub fn h265_dpb_frames(level: u32, width: u32, height: u32) -> u32 {
+    let max_luma_ps: u64 = match level {
+        ..=123 => 2_228_224,
+        150..=156 => 8_912_896,
+        _ => 35_651_584,
+    };
+    let picture = width as u64 * height as u64;
+    let pictures = if picture <= max_luma_ps / 4 {
+        16
+    } else if picture <= max_luma_ps / 2 {
+        12
+    } else if picture <= max_luma_ps * 3 / 4 {
+        8
+    } else {
+        6
+    };
+    (pictures - 1).min(REFERENCE_FRAMES)
 }
 
 /// The tier an H.265 session declares at `level` (general_level_idc): High (1) from level 4.0
@@ -609,11 +659,14 @@ mod tests {
             assert!(seen.insert(codec.wire_id()));
             assert_eq!(Codec::from_wire_id(codec.wire_id()), Some(codec));
             let mut out = Vec::new();
-            push_video_header(&mut out, codec, FRAME_KEY, 0x1234, 7, 1920, 1080);
+            push_video_header(&mut out, codec, FRAME_KEY, 0x1234, 7, 1920, 1080, Reference::None);
             assert_eq!(out.len(), VIDEO_HEADER_LEN);
             assert_eq!(out[0], WIRE_VIDEO);
             assert_eq!(parse_video_type(out[1]), Some((codec, FRAME_KEY)));
-            assert_eq!(&out[2..], &[0x12, 0x34, 0, 7, 0x07, 0x80, 0x04, 0x38]);
+            assert_eq!(&out[2..], &[0x12, 0x34, 0, 7, 0x07, 0x80, 0x04, 0x38, 0x12, 0x34]);
+            out.clear();
+            push_video_header(&mut out, codec, FRAME_DELTA, 0x1235, 7, 1920, 1080, Reference::Frame(0x1230));
+            assert_eq!(&out[10..], &[0x12, 0x30], "a predicted frame names its reference");
         }
         assert_eq!(Codec::from_wire_id(0), None, "JPEG never rides the video tag");
         assert_eq!(Codec::from_wire_id(9), None);
@@ -681,6 +734,21 @@ mod tests {
             assert_eq!(vpx_level(Codec::Vp9, VPX_QINDEX[level as usize] as u32), level);
             assert_eq!(vpx_level(Codec::Vp8, VP8_LEVEL_QINDEX[level as usize] as u32), level);
         }
+    }
+
+    /// The decoded picture buffer follows the level and the picture: the reference frames a
+    /// session asks for where the level admits them, fewer where it does not.
+    #[test]
+    fn dpb_follows_the_level() {
+        assert_eq!(h264_dpb_frames(41, 1280, 720), REFERENCE_FRAMES);
+        assert_eq!(h264_dpb_frames(42, 1920, 1080), 4);
+        assert_eq!(h264_dpb_frames(50, 2560, 1440), 7);
+        assert_eq!(h264_dpb_frames(52, 3840, 2160), 5);
+        assert_eq!(h264_dpb_frames(62, 7680, 4320), 5);
+        assert_eq!(h265_dpb_frames(123, 1920, 1080), 5);
+        assert_eq!(h265_dpb_frames(123, 1280, 720), REFERENCE_FRAMES);
+        assert_eq!(h265_dpb_frames(156, 3840, 2160), 5);
+        assert_eq!(h265_dpb_frames(180, 3840, 2160), REFERENCE_FRAMES);
     }
 
     /// The level ladders start at their floors, step through the standard limits, and
