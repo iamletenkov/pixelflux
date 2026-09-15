@@ -1222,9 +1222,9 @@ impl Drop for NvencEncoder {
     }
 }
 
-/// The level an NVENC session advertises for a `width` x `height` stream at `fps`
-/// (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc for H.264, general_level_idc
-/// for HEVC, seq_level_idx for AV1).
+/// The level an NVENC session advertises for a `width` x `height` stream at `fps` carrying up
+/// to `bitrate_bps` (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc for H.264,
+/// general_level_idc for HEVC, seq_level_idx for AV1).
 ///
 /// H.264 and HEVC carry the current geometry's level, the lowest a decoder is asked to accept,
 /// so a hardware decoder that gates on it -- older Apple and Intel fixed-function parts refuse
@@ -1234,13 +1234,16 @@ impl Drop for NvencEncoder {
 /// common rates, which carries no IDR, never moves it. AV1 instead holds the resize headroom's
 /// level: NVENC validates an AV1 session's level against `maxEncodeWidth` x `maxEncodeHeight`
 /// at init and refuses one that cannot hold it, and an AV1 hardware decoder is recent enough to
-/// take that level whatever the picture.
-fn nvenc_level(codec: Codec, width: u32, height: u32, fps: u32) -> u32 {
+/// take that level whatever the picture. The driver holds every codec's level to its bitrate
+/// ceiling as well, refusing a CBR target past it as an invalid level, so a declared rate
+/// raises the level to the first that admits it; `hevc_high_tier` names the HEVC tier the
+/// session declares, whose ceiling is the one that applies.
+fn nvenc_level(codec: Codec, width: u32, height: u32, fps: u32, bitrate_bps: u64, hevc_high_tier: bool) -> u32 {
     let fps = fps.max(HEADROOM_FPS);
     match codec {
-        Codec::Av1 => av1_level(width.max(HEADROOM_WIDTH), height.max(HEADROOM_HEIGHT), fps),
-        Codec::H265 => h265_level(width, height, fps),
-        _ => h264_level(width, height, fps),
+        Codec::Av1 => av1_level(width.max(HEADROOM_WIDTH), height.max(HEADROOM_HEIGHT), fps, bitrate_bps),
+        Codec::H265 => h265_level(width, height, fps, bitrate_bps, hevc_high_tier),
+        _ => h264_level(width, height, fps, bitrate_bps),
     }
 }
 
@@ -1721,13 +1724,15 @@ impl NvencEncoder {
             config.rcParams.set_strictGOPTarget(1);
             config.rcParams.set_enableLookahead(0);
             config.rcParams.lookaheadDepth = 0;
-            Self::configure_codec(
-                &mut config,
+            let level = nvenc_level(
                 codec,
-                is_444,
-                nvenc_level(codec, width, height, settings.target_fps as u32),
-                &tuning,
+                width,
+                height,
+                settings.target_fps as u32,
+                config.rcParams.maxBitRate as u64,
+                tuning.hevc_high_tier,
             );
+            Self::configure_codec(&mut config, codec, is_444, level, &tuning);
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: sv(NvStruct::InitializeParams),
@@ -2020,9 +2025,28 @@ impl NvencEncoder {
         }
     }
 
+    /// The level the live config declares, read from its codec arm.
+    fn declared_level(&self) -> u32 {
+        let config = &self.encode_config.encodeCodecConfig;
+        unsafe {
+            match self.codec {
+                Codec::H265 => config.hevcConfig.level,
+                Codec::Av1 => config.av1Config.level,
+                _ => config.h264Config.level,
+            }
+        }
+    }
+
+    /// The level a `width` x `height` stream at `fps` takes at the live config's peak bitrate
+    /// and HEVC tier.
+    fn level_for(&self, width: u32, height: u32, fps: u32) -> u32 {
+        let high_tier = unsafe { self.encode_config.encodeCodecConfig.hevcConfig.tier == 1 };
+        nvenc_level(self.codec, width, height, fps, self.encode_config.rcParams.maxBitRate as u64, high_tier)
+    }
+
     /// Write the level for a new geometry or frame rate into the live config's codec arm.
     fn set_level(&mut self, width: u32, height: u32, fps: u32) {
-        let level = nvenc_level(self.codec, width, height, fps);
+        let level = self.level_for(width, height, fps);
         match self.codec {
             Codec::H265 => self.encode_config.encodeCodecConfig.hevcConfig.level = level,
             Codec::Av1 => self.encode_config.encodeCodecConfig.av1Config.level = level,
@@ -2135,7 +2159,6 @@ impl NvencEncoder {
                 }
             }
 
-            self.set_level(new_w, new_h, settings.target_fps as u32);
             if is_cbr {
                 let bps = cbr_bps(settings);
                 set_cbr_rate(&mut self.encode_config.rcParams, bps, cbr_vbv(settings, bps));
@@ -2146,6 +2169,7 @@ impl NvencEncoder {
                 self.encode_config.rcParams.constQP.qpIntra = qp;
                 self.current_qp = qp;
             }
+            self.set_level(new_w, new_h, settings.target_fps as u32);
             self.init_params.encodeWidth = new_w;
             self.init_params.encodeHeight = new_h;
             self.init_params.darWidth = new_w;
@@ -2389,12 +2413,16 @@ impl NvencEncoder {
     ///
     /// In CBR mode the target bitrate, max bitrate, VBV and its initial delay are updated (the VBV
     /// is ignored outside CBR); the target fps is updated in either mode. The session is
-    /// reconfigured only when one of these actually changed — no forced IDR, no RC reset — so
-    /// calling it every frame is cheap. A reconfigure the driver refuses leaves the session
-    /// encoding at its previous rate, logged with the driver's reason.
+    /// reconfigured only when one of these actually changed — no RC reset, and a forced IDR only
+    /// where a target past the declared level's bitrate ceiling raises the level, which the
+    /// decoder learns from the sequence header a key frame carries; a level a lower target no
+    /// longer needs stays, since a level only ever has to be high enough — so calling it every
+    /// frame is cheap. A reconfigure the driver refuses leaves the session encoding at its
+    /// previous rate, logged with the driver's reason.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> bool {
         unsafe {
             let mut changed = false;
+            let mut level_raised = false;
             if self.encode_config.rcParams.rateControlMode
                 == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
             {
@@ -2404,6 +2432,11 @@ impl NvencEncoder {
                 if rc.averageBitRate != bps || rc.maxBitRate != bps || rc.vbvBufferSize != vbv {
                     set_cbr_rate(rc, bps, vbv);
                     changed = true;
+                    let (w, h, fps) = (self.init_params.encodeWidth, self.init_params.encodeHeight, self.init_params.frameRateNum);
+                    if self.level_for(w, h, fps) > self.declared_level() {
+                        self.set_level(w, h, fps);
+                        level_raised = true;
+                    }
                 }
             }
             let fps = (settings.target_fps.max(1.0)) as u32;
@@ -2422,6 +2455,9 @@ impl NvencEncoder {
                 reInitEncodeParams: self.init_params,
                 ..Default::default()
             };
+            if level_raised {
+                reconfig_params.set_forceIDR(1);
+            }
             let reconfig_fn = self.nvenc_funcs.nvEncReconfigureEncoder.unwrap();
             let status = reconfig_fn(self.encoder_session, &mut reconfig_params);
             if status != NVENCSTATUS::NV_ENC_SUCCESS {
@@ -3149,7 +3185,7 @@ mod tests {
                     &mut config,
                     codec,
                     fullcolor,
-                    nvenc_level(codec, 1280, 720, 60),
+                    nvenc_level(codec, 1280, 720, 60, 0, true),
                     &NvencTuning::default(),
                 );
                 let got = unsafe {
@@ -3577,7 +3613,7 @@ mod gpu_tests {
                             .expect("an SPS on the key frame");
                         assert_eq!(
                             sps[3] as u32,
-                            nvenc_level(Codec::H264, w as u32, h as u32, 60),
+                            nvenc_level(Codec::H264, w as u32, h as u32, 60, 0, true),
                             "level_idc at {w}x{h}"
                         );
                     }
@@ -3594,7 +3630,7 @@ mod gpu_tests {
                         assert_eq!((sps[3] >> 5) & 1, 1, "general_tier_flag at {w}x{h}");
                         assert_eq!(
                             sps[14] as u32,
-                            nvenc_level(Codec::H265, w as u32, h as u32, 60),
+                            nvenc_level(Codec::H265, w as u32, h as u32, 60, 0, true),
                             "general_level_idc at {w}x{h}"
                         );
                     }
@@ -3808,7 +3844,7 @@ mod gpu_tests {
         match main {
             Ok(enc) => unsafe {
                 println!(
-                    "HEVC Main tier at {} kbps: also opened (driver did not enforce MaxBR), level {}",
+                    "HEVC Main tier at {} kbps: opened on level {}",
                     s.video_bitrate_kbps,
                     enc.encode_config.encodeCodecConfig.hevcConfig.level,
                 )
@@ -3817,6 +3853,28 @@ mod gpu_tests {
                 "HEVC Main tier at {} kbps: refused, the Main-tier ceiling: {e}",
                 s.video_bitrate_kbps,
             ),
+        }
+    }
+
+    /// On a real GPU, a 1080p60 CBR session whose target lies past the ceiling of the level the
+    /// picture alone would declare (H.264 4.2 at 62.5 Mbit/s, HEVC 4.1 High at 50) opens on the
+    /// level the rate raises it to, and a live raise past the ceiling is taken rather than
+    /// refused. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_cbr_targets_past_the_picture_level_open() {
+        for (codec, kbps, level) in [(Codec::H264, 100_000, 50), (Codec::H265, 60_000, 150)] {
+            let mut s = settings(1920, 1080, 60.0);
+            s.codec = codec;
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = kbps;
+            let mut enc = NvencEncoder::new(&s, ptr::null())
+                .unwrap_or_else(|e| panic!("{codec:?} at {kbps} kbps must open on level {level}: {e}"));
+            assert_eq!(enc.declared_level(), level, "{codec:?} level at {kbps} kbps");
+            s.video_bitrate_kbps = 200_000;
+            assert!(enc.reconfigure_rate(&s), "{codec:?} live raise to 200 Mbit/s refused");
+            assert!(enc.declared_level() > level, "{codec:?} level did not rise with the target");
+            println!("{codec:?}: {kbps} kbps opened on level {level}; 200 Mbit/s live took level {}", enc.declared_level());
         }
     }
 
@@ -4948,20 +5006,20 @@ mod decision_tests {
     fn nvenc_level_follows_geometry_except_av1() {
         // The 1080p60 level, the one older Apple and Intel decoders gate on, is well below the
         // 4K-headroom level the session used to pin: H.264 4.2 and HEVC 4.1 rather than 5.2/5.1.
-        assert_eq!(nvenc_level(Codec::H264, 1920, 1080, 60), 42);
-        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60), 123);
+        assert_eq!(nvenc_level(Codec::H264, 1920, 1080, 60, 0, true), 42);
+        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60, 0, true), 123);
         // The current level rises with the picture, back to the headroom level at 4K.
-        assert_eq!(nvenc_level(Codec::H264, 3840, 2160, 60), 52);
-        assert_eq!(nvenc_level(Codec::H265, 3840, 2160, 60), 153);
+        assert_eq!(nvenc_level(Codec::H264, 3840, 2160, 60, 0, true), 52);
+        assert_eq!(nvenc_level(Codec::H265, 3840, 2160, 60, 0, true), 153);
         // The current level admits the current picture on every codec.
         for (w, h) in [(1280u32, 720u32), (1920, 1080), (3840, 2160)] {
             let macroblocks = (w as u64 / 16) * (h as u64 / 16);
             assert!(
-                h264_max_macroblocks(nvenc_level(Codec::H264, w, h, 60)) >= macroblocks,
+                h264_max_macroblocks(nvenc_level(Codec::H264, w, h, 60, 0, true)) >= macroblocks,
                 "H.264 level at {w}x{h} cannot hold the picture"
             );
             assert!(
-                h265_max_picture(nvenc_level(Codec::H265, w, h, 60)) >= (w as u64) * (h as u64),
+                h265_max_picture(nvenc_level(Codec::H265, w, h, 60, 0, true)) >= (w as u64) * (h as u64),
                 "HEVC level at {w}x{h} cannot hold the picture"
             );
         }
@@ -4970,23 +5028,29 @@ mod decision_tests {
         let pixels = (HEADROOM_WIDTH * HEADROOM_HEIGHT) as u64;
         for (w, h) in [(1280, 720), (1920, 1080), (3840, 2160)] {
             assert_eq!(
-                nvenc_level(Codec::Av1, w, h, 60),
-                nvenc_level(Codec::Av1, HEADROOM_WIDTH, HEADROOM_HEIGHT, 60),
+                nvenc_level(Codec::Av1, w, h, 60, 0, true),
+                nvenc_level(Codec::Av1, HEADROOM_WIDTH, HEADROOM_HEIGHT, 60, 0, true),
                 "AV1 level moved with the capture at {w}x{h}"
             );
             assert!(
-                av1_max_picture(nvenc_level(Codec::Av1, w, h, 60)) >= pixels,
+                av1_max_picture(nvenc_level(Codec::Av1, w, h, 60, 0, true)) >= pixels,
                 "AV1 level at {w}x{h} cannot hold the headroom"
             );
         }
         // A live rate change between the common rates keeps the level, so it carries no IDR.
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             assert_eq!(
-                nvenc_level(codec, 1920, 1080, 30),
-                nvenc_level(codec, 1920, 1080, 60),
+                nvenc_level(codec, 1920, 1080, 30, 0, true),
+                nvenc_level(codec, 1920, 1080, 60, 0, true),
                 "{codec:?} level moved between 30 and 60 fps"
             );
         }
+        // A CBR target past the level's ceiling takes the first level that admits it: the
+        // driver refuses the session otherwise, as an invalid level.
+        assert_eq!(nvenc_level(Codec::H264, 1920, 1080, 60, 100_000_000, true), 50);
+        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60, 60_000_000, true), 150);
+        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60, 60_000_000, false), 156);
+        assert_eq!(nvenc_level(Codec::Av1, 1920, 1080, 60, 45_000_000, true), 14);
     }
 
     /// AV1 Annex A MaxPicSize for a seq_level_idx the ladder can return.

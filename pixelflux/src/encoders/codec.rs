@@ -304,55 +304,61 @@ pub fn frame_type_from_key(key: bool) -> u8 {
 }
 
 /// Lowest H.264 level whose Annex-A Table A-1 limits admit a `width` x `height` stream at
-/// `fps`, as level_idc (41 = 4.1, 52 = 5.2, 62 = 6.2).
+/// `fps` carrying up to `bitrate_bps` (0 where no rate is declared), as level_idc (41 = 4.1,
+/// 52 = 5.2, 62 = 6.2).
 ///
 /// A frame is charged two ways: **MaxFS**, its size in macroblocks, and **MaxMBPS**, that
-/// size times the frame rate. Advertising the lowest fitting level asks the least of a
-/// decoder, so clients that gate hardware decode on the level accept the widest range of
-/// streams. One shared ladder keeps every backend agreeing on the same geometry; it starts
-/// at 4.1 and a caller needing more raises the floor itself. Above 6.2's limits there is
-/// no higher level, so it returns 62 as a best effort.
-pub fn h264_level(width: u32, height: u32, fps: u32) -> u32 {
+/// size times the frame rate; a declared rate is charged against **MaxBR** at the High
+/// profile's factor of 1.25, which every session here encodes with (4:4:4 allows more), since
+/// an encoder that validates the level against the rate refuses a CBR target past it.
+/// Advertising the lowest fitting level asks the least of a decoder, so clients that gate
+/// hardware decode on the level accept the widest range of streams. One shared ladder keeps
+/// every backend agreeing on the same geometry; it starts at 4.1 and a caller needing more
+/// raises the floor itself. Above 6.2's limits there is no higher level, so it returns 62 as
+/// a best effort.
+pub fn h264_level(width: u32, height: u32, fps: u32, bitrate_bps: u64) -> u32 {
     let mbs = (width as u64).div_ceil(16) * (height as u64).div_ceil(16);
     let mbps = mbs * fps.max(1) as u64;
-    const LEVELS: [(u32, u64, u64); 8] = [
-        (41, 8192, 245760),
-        (42, 8704, 522240),
-        (50, 22080, 589824),
-        (51, 36864, 983040),
-        (52, 36864, 2073600),
-        (60, 139264, 4177920),
-        (61, 139264, 8355840),
-        (62, 139264, 16711680),
+    const LEVELS: [(u32, u64, u64, u64); 8] = [
+        (41, 8192, 245760, 50_000_000),
+        (42, 8704, 522240, 50_000_000),
+        (50, 22080, 589824, 135_000_000),
+        (51, 36864, 983040, 240_000_000),
+        (52, 36864, 2073600, 240_000_000),
+        (60, 139264, 4177920, 240_000_000),
+        (61, 139264, 8355840, 480_000_000),
+        (62, 139264, 16711680, 800_000_000),
     ];
-    for &(level, max_fs, max_mbps) in &LEVELS {
-        if mbs <= max_fs && mbps <= max_mbps {
+    for &(level, max_fs, max_mbps, max_br) in &LEVELS {
+        if mbs <= max_fs && mbps <= max_mbps && bitrate_bps <= max_br / 4 * 5 {
             return level;
         }
     }
     62
 }
 
-/// Lowest H.265 level whose Annex-A Tables A.8 and A.9 (Main tier) limits admit a `width` x
-/// `height` stream at `fps`, as general_level_idc (123 = 4.1, 156 = 5.2, 186 = 6.2).
+/// Lowest H.265 level whose Annex-A Tables A.8 and A.9 limits admit a `width` x `height`
+/// stream at `fps` carrying up to `bitrate_bps` (0 where no rate is declared) at the High
+/// tier or the Main one, as general_level_idc (123 = 4.1, 156 = 5.2, 186 = 6.2).
 ///
 /// A frame is charged by **MaxLumaPs**, its luma samples, and **MaxLumaSr**, those times the
-/// frame rate. The ladder starts at 4.1 like the H.264 one and answers 6.2 for anything
-/// beyond its limits.
-pub fn h265_level(width: u32, height: u32, fps: u32) -> u32 {
+/// frame rate; a declared rate by the tier's **MaxBR**, which an encoder that validates the
+/// level against the rate refuses a CBR target past. The ladder starts at 4.1 like the H.264
+/// one and answers 6.2 for anything beyond its limits.
+pub fn h265_level(width: u32, height: u32, fps: u32, bitrate_bps: u64, high_tier: bool) -> u32 {
     let ps = width as u64 * height as u64;
     let sr = ps * fps.max(1) as u64;
-    const LEVELS: [(u32, u64, u64); 7] = [
-        (123, 2_228_224, 133_693_440),
-        (150, 8_912_896, 267_386_880),
-        (153, 8_912_896, 534_773_760),
-        (156, 8_912_896, 1_069_547_520),
-        (180, 35_651_584, 1_069_547_520),
-        (183, 35_651_584, 2_139_095_040),
-        (186, 35_651_584, 4_278_190_080),
+    const LEVELS: [(u32, u64, u64, u64, u64); 7] = [
+        (123, 2_228_224, 133_693_440, 20_000_000, 50_000_000),
+        (150, 8_912_896, 267_386_880, 25_000_000, 100_000_000),
+        (153, 8_912_896, 534_773_760, 40_000_000, 160_000_000),
+        (156, 8_912_896, 1_069_547_520, 60_000_000, 240_000_000),
+        (180, 35_651_584, 1_069_547_520, 60_000_000, 240_000_000),
+        (183, 35_651_584, 2_139_095_040, 120_000_000, 480_000_000),
+        (186, 35_651_584, 4_278_190_080, 240_000_000, 800_000_000),
     ];
-    for &(level, max_ps, max_sr) in &LEVELS {
-        if ps <= max_ps && sr <= max_sr {
+    for &(level, max_ps, max_sr, main_br, high_br) in &LEVELS {
+        if ps <= max_ps && sr <= max_sr && bitrate_bps <= if high_tier { high_br } else { main_br } {
             return level;
         }
     }
@@ -367,31 +373,34 @@ pub fn h265_tier(level: u32) -> u32 {
     if level >= 120 { 1 } else { 0 }
 }
 
-/// Lowest AV1 level whose Annex A limits admit a `width` x `height` stream at `fps`, as
-/// seq_level_idx (8 = 4.0, 13 = 5.1, 19 = 6.3).
+/// Lowest AV1 level whose Annex A limits admit a `width` x `height` stream at `fps` carrying
+/// up to `bitrate_bps` (0 where no rate is declared), as seq_level_idx (8 = 4.0, 13 = 5.1,
+/// 19 = 6.3).
 ///
-/// A frame is charged by **MaxPicSize** and the per-axis **MaxHSize** / **MaxVSize**, and
-/// its rate by **MaxDisplayRate**. MaxPicSize is its own limit, far below the product of the
-/// axis maxima -- no level admits a picture that is both its widest and its tallest -- so it
-/// is carried per level rather than derived. The ladder starts at 4.0 and answers 6.3 for
+/// A frame is charged by **MaxPicSize** and the per-axis **MaxHSize** / **MaxVSize**, its
+/// rate by **MaxDisplayRate**, and a declared bitrate by the Main tier's **MaxBitrate**, the
+/// tier every hardware encoder declares, which an encoder that validates the level against
+/// the rate refuses a CBR target past. MaxPicSize is its own limit, far below the product of
+/// the axis maxima -- no level admits a picture that is both its widest and its tallest -- so
+/// it is carried per level rather than derived. The ladder starts at 4.0 and answers 6.3 for
 /// anything beyond its limits.
-pub fn av1_level(width: u32, height: u32, fps: u32) -> u32 {
+pub fn av1_level(width: u32, height: u32, fps: u32, bitrate_bps: u64) -> u32 {
     let ps = width as u64 * height as u64;
     let rate = ps * fps.max(1) as u64;
-    const LEVELS: [(u32, u64, u32, u32, u64); 10] = [
-        (8, 2_359_296, 6144, 3456, 70_778_880),
-        (9, 2_359_296, 6144, 3456, 141_557_760),
-        (12, 8_912_896, 8192, 4352, 267_386_880),
-        (13, 8_912_896, 8192, 4352, 534_773_760),
-        (14, 8_912_896, 8192, 4352, 1_069_547_520),
-        (15, 8_912_896, 8192, 4352, 1_069_547_520),
-        (16, 35_651_584, 16384, 8704, 1_069_547_520),
-        (17, 35_651_584, 16384, 8704, 2_139_095_040),
-        (18, 35_651_584, 16384, 8704, 4_278_190_080),
-        (19, 35_651_584, 16384, 8704, 4_278_190_080),
+    const LEVELS: [(u32, u64, u32, u32, u64, u64); 10] = [
+        (8, 2_359_296, 6144, 3456, 70_778_880, 12_000_000),
+        (9, 2_359_296, 6144, 3456, 141_557_760, 20_000_000),
+        (12, 8_912_896, 8192, 4352, 267_386_880, 30_000_000),
+        (13, 8_912_896, 8192, 4352, 534_773_760, 40_000_000),
+        (14, 8_912_896, 8192, 4352, 1_069_547_520, 60_000_000),
+        (15, 8_912_896, 8192, 4352, 1_069_547_520, 60_000_000),
+        (16, 35_651_584, 16384, 8704, 1_069_547_520, 60_000_000),
+        (17, 35_651_584, 16384, 8704, 2_139_095_040, 100_000_000),
+        (18, 35_651_584, 16384, 8704, 4_278_190_080, 160_000_000),
+        (19, 35_651_584, 16384, 8704, 4_278_190_080, 160_000_000),
     ];
-    for &(level, max_ps, max_w, max_h, max_rate) in &LEVELS {
-        if ps <= max_ps && width <= max_w && height <= max_h && rate <= max_rate {
+    for &(level, max_ps, max_w, max_h, max_rate, max_br) in &LEVELS {
+        if ps <= max_ps && width <= max_w && height <= max_h && rate <= max_rate && bitrate_bps <= max_br {
             return level;
         }
     }
@@ -575,8 +584,8 @@ mod tests {
     fn hevc_tier_follows_the_level() {
         assert_eq!(h265_tier(93), 0);
         assert_eq!(h265_tier(120), 1);
-        assert_eq!(h265_tier(h265_level(1280, 720, 30)), 1);
-        assert_eq!(h265_tier(h265_level(3840, 2160, 60)), 1);
+        assert_eq!(h265_tier(h265_level(1280, 720, 30, 0, true)), 1);
+        assert_eq!(h265_tier(h265_level(3840, 2160, 60, 0, true)), 1);
     }
 
     /// Names round-trip through the parser, and the aliases land on the same codec.
@@ -678,31 +687,54 @@ mod tests {
     /// saturate rather than fail past the top.
     #[test]
     fn level_ladders() {
-        assert_eq!(h264_level(1920, 1080, 60), 42);
-        assert_eq!(h264_level(1280, 720, 30), 41);
-        assert_eq!(h264_level(3840, 2160, 60), 52);
-        assert_eq!(h264_level(7680, 4320, 60), 61);
-        assert_eq!(h264_level(16384, 16384, 240), 62);
+        assert_eq!(h264_level(1920, 1080, 60, 0), 42);
+        assert_eq!(h264_level(1280, 720, 30, 0), 41);
+        assert_eq!(h264_level(3840, 2160, 60, 0), 52);
+        assert_eq!(h264_level(7680, 4320, 60, 0), 61);
+        assert_eq!(h264_level(16384, 16384, 240, 0), 62);
 
-        assert_eq!(h265_level(1920, 1080, 60), 123);
-        assert_eq!(h265_level(1920, 1080, 65), 150);
-        assert_eq!(h265_level(3840, 2160, 60), 153);
-        assert_eq!(h265_level(3840, 2160, 120), 156);
-        assert_eq!(h265_level(7680, 4320, 30), 180);
-        assert_eq!(h265_level(7680, 4320, 60), 183);
-        assert_eq!(h265_level(7680, 4320, 120), 186);
-        assert_eq!(h265_level(16384, 16384, 240), 186);
+        assert_eq!(h265_level(1920, 1080, 60, 0, true), 123);
+        assert_eq!(h265_level(1920, 1080, 65, 0, true), 150);
+        assert_eq!(h265_level(3840, 2160, 60, 0, true), 153);
+        assert_eq!(h265_level(3840, 2160, 120, 0, true), 156);
+        assert_eq!(h265_level(7680, 4320, 30, 0, true), 180);
+        assert_eq!(h265_level(7680, 4320, 60, 0, true), 183);
+        assert_eq!(h265_level(7680, 4320, 120, 0, true), 186);
+        assert_eq!(h265_level(16384, 16384, 240, 0, true), 186);
 
-        assert_eq!(av1_level(1280, 720, 30), 8);
-        assert_eq!(av1_level(1920, 1080, 60), 9);
-        assert_eq!(av1_level(3840, 2160, 60), 13);
-        assert_eq!(av1_level(3840, 2160, 120), 14);
-        assert_eq!(av1_level(4096, 2304, 30), 16, "larger than 5.x's MaxPicSize");
-        assert_eq!(av1_level(7680, 4320, 60), 17);
-        assert_eq!(av1_level(7680, 4320, 120), 18);
+        assert_eq!(av1_level(1280, 720, 30, 0), 8);
+        assert_eq!(av1_level(1920, 1080, 60, 0), 9);
+        assert_eq!(av1_level(3840, 2160, 60, 0), 13);
+        assert_eq!(av1_level(3840, 2160, 120, 0), 14);
+        assert_eq!(av1_level(4096, 2304, 30, 0), 16, "larger than 5.x's MaxPicSize");
+        assert_eq!(av1_level(7680, 4320, 60, 0), 17);
+        assert_eq!(av1_level(7680, 4320, 120, 0), 18);
         // Both axes fit 5.x, the picture does not: MaxPicSize is not the product of the axes.
-        assert_eq!(av1_level(8192, 4352, 60), 17);
-        assert_eq!(av1_level(8192, 4352, 240), 19);
+        assert_eq!(av1_level(8192, 4352, 60, 0), 17);
+        assert_eq!(av1_level(8192, 4352, 240, 0), 19);
+    }
+
+    /// A declared bitrate raises a level the picture alone would not: past 4.2's 62.5 Mbit/s
+    /// (High profile) for H.264 at 1080p60, past the tier's ceiling for HEVC, past the Main
+    /// tier's for AV1; a rate within the ceiling leaves the level where the picture put it.
+    #[test]
+    fn level_ladders_carry_the_bitrate() {
+        assert_eq!(h264_level(1920, 1080, 60, 62_500_000), 42);
+        assert_eq!(h264_level(1920, 1080, 60, 100_000_000), 50);
+        assert_eq!(h264_level(1920, 1080, 60, 300_000_000), 51);
+        assert_eq!(h264_level(1920, 1080, 60, 1_000_000_000), 62);
+
+        assert_eq!(h265_level(1920, 1080, 60, 50_000_000, true), 123);
+        assert_eq!(h265_level(1920, 1080, 60, 60_000_000, true), 150);
+        assert_eq!(h265_level(1920, 1080, 60, 60_000_000, false), 156);
+        assert_eq!(h265_level(1920, 1080, 60, 20_000_000, false), 123);
+        assert_eq!(h265_level(3840, 2160, 60, 200_000_000, true), 156);
+
+        assert_eq!(av1_level(1920, 1080, 60, 20_000_000), 9);
+        assert_eq!(av1_level(1920, 1080, 60, 25_000_000), 12);
+        assert_eq!(av1_level(3840, 2160, 60, 45_000_000), 14);
+        assert_eq!(av1_level(1280, 720, 30, 100_000_000), 17);
+        assert_eq!(av1_level(1280, 720, 30, 1_000_000_000), 19);
     }
 
     /// H.264 labels follow the NAL and slice types: an IDR is a key, an I slice in a

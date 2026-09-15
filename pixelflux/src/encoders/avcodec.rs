@@ -366,7 +366,7 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String>
             drm_device_ctx,
             0,
         );
-        let result = if ret < 0 {
+        let result = if ret < 0 || hw_device_ctx.is_null() {
             Err(format!("Failed to derive VAAPI device: {}", ff_err_str(ret)))
         } else {
             va_encode_codecs(hw_device_ctx)
@@ -1090,6 +1090,7 @@ impl AvcodecEncoder {
     /// and the low-power entry point when the default one refused.
     unsafe fn vaapi_options(&self, opts: &mut *mut ff::AVDictionary, qp: u32) {
         let (w, h, fps) = (self.width as u32, self.height as u32, self.fps as u32);
+        let bitrate = self.encoder_ctx.as_ref().map_or(0, |ctx| ctx.bit_rate.max(0) as u64);
         if self.cbr_mode {
             dict_set(opts, "rc_mode", "CBR");
         } else {
