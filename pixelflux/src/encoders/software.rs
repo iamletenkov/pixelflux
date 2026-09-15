@@ -619,6 +619,17 @@ pub struct EncodedStripe {
     pub stripe_y_start: i32,
     pub stripe_height: i32,
     pub frame_id: i32,
+    pub timing: FrameTiming,
+}
+
+/// When a frame was captured and when its encode began and ended, as CLOCK_MONOTONIC
+/// nanoseconds, so a consumer can attribute a frame's age to the host rather than the
+/// network or the decoder; zeros where a path does not stamp them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameTiming {
+    pub capture_ns: i64,
+    pub encode_start_ns: i64,
+    pub encode_end_ns: i64,
 }
 
 /// No stripe is shorter than a macroblock row.
@@ -967,6 +978,7 @@ pub fn encode_cpu(
                             stripe_y_start: y_start as i32,
                             stripe_height: actual_height as i32,
                             frame_id: frame_counter as i32,
+                            timing: FrameTiming::default(),
                         })
                     })
                 } else {
@@ -1059,6 +1071,7 @@ pub fn encode_cpu(
                                 stripe_y_start: y_start as i32,
                                 stripe_height: actual_height as i32,
                                 frame_id: frame_counter as i32,
+                                timing: FrameTiming::default(),
                             })
                         } else {
                             None
@@ -1113,6 +1126,7 @@ pub fn encode_cpu(
                             stripe_y_start: y_start as i32,
                             stripe_height: actual_height as i32,
                             frame_id: frame_counter as i32,
+                            timing: FrameTiming::default(),
                         }),
                         Ok(_) => None,
                         Err(e) => {

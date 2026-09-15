@@ -956,6 +956,8 @@ pub struct WlFrame {
     frame_id: u16,
     damage: Vec<Rectangle<i32, Physical>>,
     is_animated: bool,
+    /// CLOCK_MONOTONIC nanoseconds at which the pixels were in hand.
+    captured_ns: i64,
 }
 
 /// Interior state of `WlFramePool`: the free-buffer list plus the single publish slot.
@@ -1297,6 +1299,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 // framebuffer or a host frame, RGBA from a GLES readback: a hardware session
                 // converts on the GPU and a software one on its own threads, so no colour
                 // conversion runs here.
+                let encode_start_ns = wayland::host::now_ns();
                 let outcome = encoder.encode_host(
                     &f.buf,
                     (w * 4) as usize,
@@ -1316,6 +1319,11 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                                 stripe_y_start: 0,
                                 stripe_height: height,
                                 frame_id: f.frame_id as i32,
+                                timing: FrameTiming {
+                                    capture_ns: f.captured_ns,
+                                    encode_start_ns,
+                                    encode_end_ns: wayland::host::now_ns(),
+                                },
                             });
                         }
                     }
@@ -2284,7 +2292,7 @@ fn start_capture_on_display(
                             for s in stripes {
                                 match Py::new(py, StripeFrame::new_owned_meta(
                                     s.data, s.codec.data_type(), s.stripe_y_start,
-                                    s.stripe_height, s.frame_id,
+                                    s.stripe_height, s.frame_id, s.timing,
                                 )) {
                                     Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
                                     Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
@@ -3394,6 +3402,7 @@ fn render_node_tick(
                         frame_id: cap.frame_counter,
                         damage: std::mem::take(&mut damage_rects),
                         is_animated: node.overlay_state.is_animated(),
+                        captured_ns: wayland::host::now_ns(),
                     };
                     if let Some(pool) = cap.encode_pool.as_ref() {
                         pool.publish(frame);
@@ -3455,6 +3464,7 @@ fn render_node_tick(
                     let enc_dmabuf: Option<Dmabuf> = host_enc_dmabuf
                         .clone()
                         .or_else(|| node.offscreen_buffer.as_ref().map(|(_, d)| d.clone()));
+                    let encode_start_ns = wayland::host::now_ns();
                     let result = match enc_dmabuf {
                         Some(ref dmabuf) => {
                             encoder.encode_dmabuf(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
@@ -3477,6 +3487,11 @@ fn render_node_tick(
                                 let stripes = vec![EncodedStripe {
                                     data: Arc::new(data), codec: cap.settings.codec, stripe_y_start: 0,
                                     stripe_height: height, frame_id: cap.frame_counter as i32,
+                                    timing: FrameTiming {
+                                        capture_ns: new_stamp.unwrap_or(encode_start_ns),
+                                        encode_start_ns,
+                                        encode_end_ns: wayland::host::now_ns(),
+                                    },
                                 }];
                                 if let Some(ref socket) = cap.recording_sink {
                                     socket.write_frame(&stripes, width, height);
@@ -5495,7 +5510,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 /// Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
 /// exposes it read-only via the buffer protocol, so `bytes(frame)` /
 /// `memoryview(frame)` alias the Rust buffer instead of copying. Carries the
-/// four stripe-metadata ints as Python attributes.
+/// four stripe-metadata ints as Python attributes, and the frame's capture and
+/// encode times as CLOCK_MONOTONIC nanoseconds (`time.monotonic_ns()`), zero
+/// where a path does not stamp them.
 #[pyclass]
 struct StripeFrame {
     data: Arc<Vec<u8>>,
@@ -5507,14 +5524,36 @@ struct StripeFrame {
     stripe_height: i32,
     #[pyo3(get, set)]
     frame_id: i32,
+    #[pyo3(get)]
+    capture_ns: i64,
+    #[pyo3(get)]
+    encode_start_ns: i64,
+    #[pyo3(get)]
+    encode_end_ns: i64,
 }
 
 impl StripeFrame {
     /// Hot-path constructor: shares the encoder's buffer by `Arc` (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
-    fn new_owned_meta(data: Arc<Vec<u8>>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
-        Self { data, data_type, stripe_y_start, stripe_height, frame_id }
+    fn new_owned_meta(
+        data: Arc<Vec<u8>>,
+        data_type: i32,
+        stripe_y_start: i32,
+        stripe_height: i32,
+        frame_id: i32,
+        timing: FrameTiming,
+    ) -> Self {
+        Self {
+            data,
+            data_type,
+            stripe_y_start,
+            stripe_height,
+            frame_id,
+            capture_ns: timing.capture_ns,
+            encode_start_ns: timing.encode_start_ns,
+            encode_end_ns: timing.encode_end_ns,
+        }
     }
 }
 
@@ -5525,7 +5564,7 @@ impl StripeFrame {
     #[new]
     #[pyo3(signature = (data, data_type = 0, stripe_y_start = 0, stripe_height = 0, frame_id = 0))]
     fn new(data: Vec<u8>, data_type: i32, stripe_y_start: i32, stripe_height: i32, frame_id: i32) -> Self {
-        Self { data: Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id }
+        Self::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id, FrameTiming::default())
     }
 
     fn __len__(&self) -> usize {
@@ -6047,7 +6086,7 @@ fn read_display_id(settings: &Bound<'_, PyAny>) -> u32 {
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
-use crate::encoders::software::EncodedStripe;
+use crate::encoders::software::{EncodedStripe, FrameTiming};
 
 /// Let Python wrap already-encoded bytes back into a `StripeFrame`, for callers that produce or
 /// replay stripe data outside a live capture (tests, re-sends to a late joiner). It copies the
@@ -6063,7 +6102,7 @@ fn stripe_frame_from_buffer(
     stripe_height: i32,
     frame_id: i32,
 ) -> StripeFrame {
-    StripeFrame::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id)
+    StripeFrame::new_owned_meta(Arc::new(data), data_type, stripe_y_start, stripe_height, frame_id, FrameTiming::default())
 }
 
 /// Capture configuration read by `start_capture` (each field by attribute name via
@@ -6744,6 +6783,7 @@ impl ScreenCapture {
                                 s.stripe_y_start,
                                 s.stripe_height,
                                 s.frame_id,
+                                s.timing,
                             ),
                         ) {
                             Ok(f) => {
@@ -8145,7 +8185,7 @@ mod wl_frame_pool_tests {
             buf,
             frame_id: n,
             damage: Vec::new(),
-            is_animated: false,
+            is_animated: false, captured_ns: 0,
         }
     }
 

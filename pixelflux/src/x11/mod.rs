@@ -40,7 +40,7 @@ use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
 use crate::encoders::overlay::blend_pixel_premultiplied;
-use crate::encoders::software::EncodedStripe;
+use crate::encoders::software::{EncodedStripe, FrameTiming};
 use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
@@ -443,6 +443,8 @@ struct RawFrame {
     height: u16,
     stride: usize,
     generation: u64,
+    /// CLOCK_MONOTONIC nanoseconds at which the pixels were in hand.
+    captured_ns: i64,
 }
 /// `RawFrame` is `Send`: its raw pointer addresses a pooled shm surface that the pool
 /// guarantees is not reused until the encode thread recycles this frame, so the handle is safe to
@@ -732,7 +734,16 @@ where
             }
 
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
-        let stripes = pl.process(buf, frame.stride);
+        let encode_start_ns = crate::wayland::host::now_ns();
+        let mut stripes = pl.process(buf, frame.stride);
+        let timing = FrameTiming {
+            capture_ns: frame.captured_ns,
+            encode_start_ns,
+            encode_end_ns: crate::wayland::host::now_ns(),
+        };
+        for stripe in &mut stripes {
+            stripe.timing = timing;
+        }
         controls.codec.store(pl.codec().id(), Ordering::Relaxed);
         pool.recycle(frame.idx);
         if !stripes.is_empty() {
@@ -1127,6 +1138,7 @@ where
                     height: cap_h,
                     stride,
                     generation: pool.generation(),
+                    captured_ns: crate::wayland::host::now_ns(),
                 },
                 &controls.stop,
             );
@@ -1163,6 +1175,7 @@ mod pool_tests {
             height: 0,
             stride: 0,
             generation: 0,
+            captured_ns: 0,
         }
     }
 

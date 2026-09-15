@@ -375,6 +375,7 @@ mod cost_tests {
             stripe_y_start: 0,
             stripe_height: 720,
             frame_id: 0,
+            timing: Default::default(),
         }
     }
 

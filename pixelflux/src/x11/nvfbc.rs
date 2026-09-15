@@ -57,7 +57,7 @@ use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
 
 use super::Controls;
 use crate::encoders::nvenc::NvencEncoder;
-use crate::encoders::software::{EncodedStripe, StripeState};
+use crate::encoders::software::{EncodedStripe, FrameTiming, StripeState};
 use crate::pipeline::decide_hw_fullframe;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
@@ -914,6 +914,7 @@ where
                 continue;
             }
         };
+        let grabbed_ns = crate::wayland::host::now_ns();
         if frame.device_ptr == 0 || frame.width == 0 || frame.height == 0 {
             continue;
         }
@@ -941,6 +942,7 @@ where
         let mut delivered = false;
         if decision.send {
             let pitch = frame_pitch(frame.byte_size, frame.width, frame.height);
+            let encode_start_ns = crate::wayland::host::now_ns();
             match gpu.encoder.encode_cuda_pitch(
                 frame.device_ptr,
                 pitch,
@@ -957,6 +959,11 @@ where
                         stripe_y_start: 0,
                         stripe_height: gpu.settings.height,
                         frame_id: frame_counter as i32,
+                        timing: FrameTiming {
+                            capture_ns: grabbed_ns,
+                            encode_start_ns,
+                            encode_end_ns: crate::wayland::host::now_ns(),
+                        },
                     }];
                     if let Some(sink) = &recording_sink {
                         sink.write_frame(&stripes, gpu.settings.width, gpu.settings.height);

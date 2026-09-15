@@ -297,6 +297,9 @@ def my_callback(frame):
     # frame.frame_id
     # frame.stripe_y_start
     # frame.stripe_height
+    # frame.capture_ns, frame.encode_start_ns, frame.encode_end_ns
+    #                      (CLOCK_MONOTONIC nanoseconds, comparable with time.monotonic_ns(),
+    #                       0 where a path does not stamp them, as the striped software encoders do not)
     encoded_data = bytes(frame)          # copy out, or use memoryview(frame) zero-copy (below)
     # Send encoded_data to the client...
 ```

@@ -366,6 +366,7 @@ impl X11Pipeline {
                             stripe_y_start: 0,
                             stripe_height: height,
                             frame_id: self.frame_counter as i32,
+                            timing: Default::default(),
                         }]
                     }
                     Ok(_) => {
