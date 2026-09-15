@@ -582,13 +582,13 @@ curl -s -X POST http://localhost:5000/computer-use \
     behind a loss back by. NVENC and libx264 track their references, on the devices whose drivers
     offer it; a session that does not reports `-2` and answers this with a keyframe instead.
 
-### Colour conversion
+### Color conversion
 
 The desktop source is sRGB, which shares BT.709's primaries and transfer function, so every
 session converts with the **BT.709 matrix** and declares it: the software encoders' host
 conversion, the VA-API convert (`scale_vaapi`), and NVENC's GPU kernel, at limited range for
-4:2:0 and full range for the software 4:4:4 sessions (x264, x265). Chroma sits at the centre of
-each 2x2 block — the average of all four pixels — so the colour a subpixel-antialiased glyph
+4:2:0 and full range for the software 4:4:4 sessions (x264, x265). Chroma sits at the center of
+each 2x2 block — the average of all four pixels — so the color a subpixel-antialiased glyph
 edge carries cancels instead of tinting the chroma plane.
 
 NVENC takes the captured ARGB, so there is **no CUDA Toolkit / NVRTC requirement** — only the
@@ -602,12 +602,12 @@ array-typed one — and writing the NV12 the encoder takes. 4:4:4 subsamples not
 the hardware conversion, and so does a driver that refuses the kernel: the matrix is right
 either way and only the siting differs.
 
-VP8 is the one codec that cannot carry this: its keyframe header holds a single colour-space bit
+VP8 is the one codec that cannot carry this: its keyframe header holds a single color-space bit
 whose only defined value is BT.601. Told BT.709 out of band instead — in the decoder
-configuration a client passes and in the RTP colour-space header extension — Chromium and WebKit
-paint it correctly, while Firefox reads neither and inverts BT.601, shifting saturated colour by
+configuration a client passes and in the RTP color-space header extension — Chromium and WebKit
+paint it correctly, while Firefox reads neither and inverts BT.601, shifting saturated color by
 20 levels on both transports, so VP8 converts and declares BT.601 (WebKit's GStreamer ports
-invert BT.709 there whatever it carries, that port dropping the colour space the client declares).
+invert BT.709 there whatever it carries, that port dropping the color space the client declares).
 JPEG stripes are JFIF, which is BT.601 at full range by definition. Nothing extra to install at
 build or runtime beyond the driver.
 
@@ -615,9 +615,9 @@ Two receiver-side caveats, measured rather than inferred. Chromium and Firefox b
 through libyuv, whose default build clamps the BT.709 Cb→B coefficient to 2.0 because the true
 2.112 does not fit its fixed-point constant, so saturated blue arrives up to 12 levels short of
 the source wherever that conversion runs on the CPU; BT.601's coefficient is clamped the same way
-and loses 2. And Firefox drops the colour description of an **AV1** stream it receives over
+and loses 2. And Firefox drops the color description of an **AV1** stream it receives over
 WebRTC, painting it as BT.601 — its WebCodecs path and every other codec on both transports
-honour what the stream declares.
+honor what the stream declares.
 
 ## VA-API 4:4:4
 
@@ -637,7 +637,7 @@ rendering no 4:4:4 surface format, the driver refusing to allocate one, and `h26
 profile that matches it. **For H.264, on every current driver the third is what answers**: it has no
 `VAProfile` in libva at all, so FFmpeg's `h264_vaapi` advertises only 4:2:0 profiles (plus 10-bit
 4:2:0 from libva 1.18). A refusal falls back to the software path, where x264 does carry 4:4:4 —
-the request is honoured, on the CPU, rather than silently downgraded to 4:2:0 (a GPL-free build's
+the request is honored, on the CPU, rather than silently downgraded to 4:2:0 (a GPL-free build's
 OpenH264 is 4:2:0-only and says so in the log).
 
 Nothing here is pinned to that state of affairs: a driver and FFmpeg build that gain H.264 4:4:4
@@ -651,7 +651,7 @@ session settled on rather than what was asked for.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
     *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — both with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, all through the linked FFmpeg; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec, and `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` the codecs a render node's NVENC or VA-API serves, the node resolved as a capture resolves it, probed once per node at first call.
-    *   **Hardware:** NVIDIA NVENC (H.264, H.265 and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI colour signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9 and AV1, VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
+    *   **Hardware:** NVIDIA NVENC (H.264, H.265 and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI color signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9 and AV1, VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**

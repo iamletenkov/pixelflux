@@ -267,7 +267,7 @@ enum CtrlMsg {
 }
 
 /// The capture thread's end of one output's frame queue: the frames, an exact count of those
-/// queued and not yet taken (so a wake that the timer has already served is recognised as
+/// queued and not yet taken (so a wake that the timer has already served is recognized as
 /// such), and the calloop wake that follows every frame.
 #[derive(Clone)]
 pub(crate) struct FrameSink {
@@ -354,7 +354,7 @@ struct CtrlState {
     heads: Vec<(ZwlrOutputHeadV1, Option<String>)>,
     om_serial: Option<u32>,
     cfg_result: Option<bool>,
-    cfg_cancelled: bool,
+    cfg_canceled: bool,
     sync_done: bool,
 }
 
@@ -548,7 +548,7 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for CtrlState {
         match event {
             zwlr_output_configuration_v1::Event::Succeeded => state.cfg_result = Some(true),
             zwlr_output_configuration_v1::Event::Failed => state.cfg_result = Some(false),
-            zwlr_output_configuration_v1::Event::Cancelled => state.cfg_cancelled = true,
+            zwlr_output_configuration_v1::Event::Cancelled => state.cfg_canceled = true,
             _ => {}
         }
     }
@@ -1779,7 +1779,7 @@ fn stream_point(slot: &LayoutSlot, logical: (i32, i32), x: f64, y: f64) -> (f64,
 }
 
 /// Wait, bounded, until the GPU work the compositor queued on a host dmabuf has finished:
-/// the CUDA import reads the buffer without honouring its implicit fences, so a frame
+/// the CUDA import reads the buffer without honoring its implicit fences, so a frame
 /// encoded the instant it was announced could otherwise carry a half-blitted image. Drivers
 /// that attach no fence return at once.
 pub fn wait_gpu_done(dmabuf: &Dmabuf) {
@@ -2161,7 +2161,7 @@ fn control_loop(
 }
 
 /// Ask the host (wlr-output-management) to give every active output its wanted mode and
-/// layout position in one atomic configuration. Retries across a `cancelled` (stale serial).
+/// layout position in one atomic configuration. Retries across a `canceled` (stale serial).
 /// Returns whether the host said it applied the layout: `false` for a refusal, no answer by
 /// `LAYOUT_DEADLINE`, or no manager at all (KWin offers only its own kde_output_management
 /// protocol). Either answer settles the request, and the session owner then re-sizes its
@@ -2190,7 +2190,7 @@ fn apply_layout(
             return false;
         };
         state.cfg_result = None;
-        state.cfg_cancelled = false;
+        state.cfg_canceled = false;
         let cfg = mgr.create_configuration(serial, qh, ());
         let mut any = false;
         for (i, slot) in slots.iter().enumerate() {
@@ -2224,14 +2224,14 @@ fn apply_layout(
         }
         cfg.apply();
         let _ = queue.flush();
-        while state.cfg_result.is_none() && !state.cfg_cancelled && Instant::now() < deadline {
+        while state.cfg_result.is_none() && !state.cfg_canceled && Instant::now() < deadline {
             if !pump_ctrl(conn, queue, state) {
                 cfg.destroy();
                 return false;
             }
         }
         cfg.destroy();
-        if state.cfg_cancelled {
+        if state.cfg_canceled {
             // Stale serial: the compositor re-announces its state with a fresh one.
             state.om_serial = None;
             continue;
@@ -3303,7 +3303,7 @@ mod tests {
         assert_eq!(shm_src_layout(wl_shm::Format::Argb8888 as u32), (4, false));
     }
 
-    /// A known pixel round-trips to BGRA. The logical colour is R=0x11, G=0x22, B=0x33; in a
+    /// A known pixel round-trips to BGRA. The logical color is R=0x11, G=0x22, B=0x33; in a
     /// `Bgr888` buffer its little-endian bytes are R,G,B (0x11,0x22,0x33) and the destination must be
     /// B,G,R,A (0x33,0x22,0x11,0xff). Without the R/B swap this path produced 0x11,0x22,0x33 —
     /// red and blue transposed.
@@ -3316,7 +3316,7 @@ mod tests {
         assert_eq!(dst, [0x33, 0x22, 0x11, 0xff]);
     }
 
-    /// The same logical colour in an `Rgb888` buffer is already B,G,R in memory
+    /// The same logical color in an `Rgb888` buffer is already B,G,R in memory
     /// (0x33,0x22,0x11), so it copies straight to B,G,R,A with an opaque alpha and no swap.
     #[test]
     fn rgb888_known_pixel_copies_straight() {

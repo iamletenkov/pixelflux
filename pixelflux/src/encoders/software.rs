@@ -40,7 +40,7 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 /// Convert a packed BGRA/RGBA buffer to planar YUV (4:2:0 or 4:4:4) for the software H.264
 /// encoders, spreading the conversion across up to `bands` threads so it never bottlenecks a frame.
 ///
-/// **Why the band split exists.** Colour conversion is a non-trivial slice of per-frame CPU. The
+/// **Why the band split exists.** Color conversion is a non-trivial slice of per-frame CPU. The
 /// striped path already parallelizes it for free — each stripe converts on its own rayon worker —
 /// but a single full-frame consumer (the whole-frame x264 stripe, a full-frame OpenH264
 /// instance, a libavcodec session) would otherwise convert its entire image on one thread and
@@ -163,7 +163,7 @@ static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Rebuilding an x264 encoder is expensive and forces a fresh IDR, so a stripe keeps its instance
 /// across frames and only nudges CRF, bitrate, VBV, and frame rate live; the tracked `current_*`
 /// fields are that mirror, letting a reconfigure skip the FFI call whenever nothing actually changed.
-/// `is_i444` (4:4:4 vs 4:2:0) is baked into the encoder's colour space at open, so a change to it is
+/// `is_i444` (4:4:4 vs 4:2:0) is baked into the encoder's color space at open, so a change to it is
 /// one of the few things that forces a full rebuild; `is_cbr` records which rate-control mode was
 /// chosen at open and gates which of the live reconfigures apply. The manual `Send` impl exists only
 /// because a raw pointer is not `Send` by default and the handle must move onto the rayon stripe
@@ -212,7 +212,7 @@ impl H264EncoderWrapper {
     /// encoder is optimized for latency over compression ratio: the `ultrafast` preset keeps encode
     /// time under the frame budget, and `zerolatency` bars the frame reordering and lookahead
     /// buffering that would otherwise add pipeline delay. Everything below then bends x264 toward the
-    /// pipeline's own keyframe and colour model instead of its broadcast-oriented defaults.
+    /// pipeline's own keyframe and color model instead of its broadcast-oriented defaults.
     ///
     /// 1. **Preset/tune**: starts from the `ultrafast` preset with the `zerolatency` tune, then
     ///    overrides resolution, frame rate (floored to 30 fps when under 1), and thread count.
@@ -230,7 +230,7 @@ impl H264EncoderWrapper {
     ///      when the VBV underflows, which leaves rows of the picture frozen on old content. A
     ///      budget the content cannot meet overshoots instead, as NVENC and libvpx do.
     ///    - **CRF** (default): constant-quality with `f_rf_constant = crf`.
-    /// 4. **Colour**: I444 at full range or I420 at limited range, a VUI declaring that range
+    /// 4. **Color**: I444 at full range or I420 at limited range, a VUI declaring that range
     ///    with the BT.709 primaries, transfer and matrix the sRGB source and the conversion
     ///    carry, and the matching `high444` / `baseline` profile.
     /// 5. **Coding tools**: CABAC and the 8x8 transform are disabled, matching the low-latency
@@ -775,7 +775,7 @@ const CARRY_FALL: f32 = 0.05;
 ///      rescales with live changes.
 /// 7. **Dispatch**: a single full-frame stripe runs inline (sequential — empirically faster than a
 ///    one-element rayon job) with one fewer encode thread than the available cores, clamped to
-///    `[1, 4]` (x264 with a single-band colour conversion; OpenH264 adds four slices and a four-band
+///    `[1, 4]` (x264 with a single-band color conversion; OpenH264 adds four slices and a four-band
 ///    conversion of its own). The slice threads keep the in-frame encode latency inside the frame
 ///    budget at high resolutions; the cap is four because `zerolatency` makes x264 slice-threaded
 ///    and more than four slices trips decode glitches in some Chromium builds, and the minus-one
@@ -1630,10 +1630,10 @@ mod tests {
         }
     }
 
-    /// The host convert sites chroma at the centre of the block on both its paths, the
+    /// The host convert sites chroma at the center of the block on both its paths, the
     /// single-threaded one and the banded one, and a band boundary never splits a chroma pair.
     #[test]
-    fn the_host_convert_sites_chroma_at_the_block_centre() {
+    fn the_host_convert_sites_chroma_at_the_block_center() {
         use super::convert_to_yuv_mt;
         let (w, h) = (64usize, 64usize);
         let bgra = crate::encoders::chroma_siting::bgra(w, h);
@@ -1653,7 +1653,7 @@ mod tests {
     /// The JPEG stripes a WebSockets session sends by default hand BGRA to libjpeg-turbo, which
     /// subsamples chroma itself, so the tile is held to the same neutral chroma there.
     #[test]
-    fn the_jpeg_path_sites_chroma_at_the_block_centre() {
+    fn the_jpeg_path_sites_chroma_at_the_block_center() {
         use super::Codec;
         use crate::webcam::decode::new_decoder;
         let (w, h) = (64usize, 64usize);
@@ -1729,7 +1729,7 @@ mod qp_bound_sweep {
     }
 
     /// Encode `FRAMES` scrolling-text luma frames through the x264 stripe encoder at the
-    /// given rate-control settings (constant grey chroma), returning each frame's raw bitstream.
+    /// given rate-control settings (constant gray chroma), returning each frame's raw bitstream.
     #[cfg(feature = "gpl")]
     fn encode_x264(cbr: bool, kbps: i32, crf: i32, min_qp: i32, max_qp: i32) -> Vec<Vec<u8>> {
         let mut enc = H264EncoderWrapper::new(
@@ -1771,12 +1771,12 @@ mod qp_bound_sweep {
             assert!(enc.encode_with_headers(&y, &u, &v, w as i32, cw as i32, cw as i32, 0, 0, true, true, &mut out));
             let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
             assert!(dec.decode(&out).expect("decode"), "i444={i444}");
-            assert_eq!(dec.colour_tags(), Some(want), "i444={i444}");
+            assert_eq!(dec.color_tags(), Some(want), "i444={i444}");
         }
     }
 
-    /// The colour chart, converted by the host path and encoded by x264, decodes back to the
-    /// colour that was painted when the BT.709 the stream declares is inverted — the check a
+    /// The color chart, converted by the host path and encoded by x264, decodes back to the
+    /// color that was painted when the BT.709 the stream declares is inverted — the check a
     /// client's presentation path performs on every frame, here with no browser in the way.
     #[cfg(feature = "gpl")]
     #[test]
@@ -1872,7 +1872,7 @@ mod qp_bound_sweep {
     }
 
     /// Encode the same scrolling-text sequence through the OpenH264 full-frame encoder (luma
-    /// broadcast to a grey BGRA frame), returning each frame's bitstream for comparison with the
+    /// broadcast to a gray BGRA frame), returning each frame's bitstream for comparison with the
     /// x264 run.
     fn encode_oh264(cbr: bool, kbps: i32, crf: i32, min_qp: i32, max_qp: i32) -> Vec<Vec<u8>> {
         let s = RustCaptureSettings {
@@ -1957,7 +1957,7 @@ mod qp_bound_sweep {
     ///
     /// Encodes worst-case scrolling text at 2 Mbps CBR across a sweep of `max_qp` values (plus a
     /// separate `min_qp` sweep on an over-provisioned 12 Mbps budget), measuring luma PSNR against a
-    /// near-lossless CRF-12 reference from the same encoder so colour-conversion differences cancel
+    /// near-lossless CRF-12 reference from the same encoder so color-conversion differences cancel
     /// out. Capping `max_qp` at 30 on rate-starved content must lift fidelity by more than 0.5 dB
     /// over the unclamped run — proving the clamp reaches the encoder rather than being silently
     /// dropped (paid for in bitrate overshoot).

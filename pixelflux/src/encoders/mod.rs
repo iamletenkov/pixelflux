@@ -557,10 +557,10 @@ pub(crate) mod sps {
 /// The fixture the chroma-siting checks of every backend share.
 #[cfg(test)]
 pub(crate) mod chroma_siting {
-    /// Four colours averaging to grey, of which no pixel, row pair or column pair does: the
+    /// Four colors averaging to gray, of which no pixel, row pair or column pair does: the
     /// chroma of a block comes out neutral only where all four were averaged. A 4:2:0 convert
     /// that keeps one pixel of the block, or one row or column of it, leaves the saturation
-    /// subpixel-antialiased text carries on its glyph edges in the picture as visible colour.
+    /// subpixel-antialiased text carries on its glyph edges in the picture as visible color.
     pub const TILE: [[u8; 3]; 4] = [[0, 0, 128], [0, 255, 0], [128, 128, 255], [255, 0, 0]];
 
     /// `TILE` laid out as a `w`x`h` BGRA frame.
@@ -610,7 +610,7 @@ pub(crate) mod chroma_siting {
         [r, g, b].map(|c| (c * 255.0).clamp(0.0, 255.0))
     }
 
-    /// The eight-patch colour chart the matrix checks paint: the neutrals, whose chroma a wrong
+    /// The eight-patch color chart the matrix checks paint: the neutrals, whose chroma a wrong
     /// matrix leaves alone, and the saturated corners, which it moves by tens of levels.
     pub const CHART: [[u8; 3]; 8] = [
         [255, 255, 255], [128, 128, 128], [0, 0, 0], [255, 0, 0],

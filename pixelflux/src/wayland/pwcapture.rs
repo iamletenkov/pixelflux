@@ -24,7 +24,7 @@
 //! answers with memfd buffers; the compositor picks, and the fixated format decides whether
 //! dmabuf or memfd buffers are requested. Cursor metadata is requested so a metadata-mode
 //! session delivers the host's real cursor sprite to the cursor callback, and damage metadata
-//! so unchanged stripes are recognised.
+//! so unchanged stripes are recognized.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::os::fd::{FromRawFd, OwnedFd};

@@ -172,7 +172,7 @@ impl RecordingSink {
         })
     }
 
-    /// Returns `true` exactly once after a new client connects, signalling that the next encode
+    /// Returns `true` exactly once after a new client connects, signaling that the next encode
     /// should produce an IDR so the consumer starts from a clean reference frame.
     pub fn should_force_idr(&self) -> bool {
         self.client_connected.swap(false, Ordering::Relaxed)

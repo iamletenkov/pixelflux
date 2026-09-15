@@ -159,7 +159,7 @@ const SPRITE_CACHE_MAX: usize = 100;
 /// Apply the size cap to a **premultiplied** sprite and encode it as a straight-alpha PNG.
 ///
 /// `cap <= 0`, or a sprite already within it, is encoded at its source size. Resizing happens
-/// while the pixels are still premultiplied — filtering straight alpha pulls the (zero) colour
+/// while the pixels are still premultiplied — filtering straight alpha pulls the (zero) color
 /// of transparent texels into the edges and leaves a dark fringe, and Lanczos3 overshoot has no
 /// headroom to land in — which is the order the X11 XFixes path uses.
 fn cap_and_encode(mut img: RgbaImage, cap: i32) -> Option<CappedSprite> {
@@ -359,7 +359,7 @@ impl Cursor {
 
     /// A named cursor icon as a premultiplied RGBA image plus its hotspot (x, y), ready for
     /// `cap_and_encode` to size and convert to the straight alpha web clients want. Xcursor
-    /// stores premultiplied colour, which is also what the compositing paths (`get_image*`)
+    /// stores premultiplied color, which is also what the compositing paths (`get_image*`)
     /// need for blending, so it is carried through unconverted.
     pub fn get_sprite(&self, name: &str) -> Option<(RgbaImage, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;

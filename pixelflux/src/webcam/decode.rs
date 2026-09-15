@@ -98,9 +98,9 @@ pub struct AvDecoder {
 unsafe impl Send for AvDecoder {}
 
 impl AvDecoder {
-    /// The colour matrix and range the last decoded frame carries, as the bitstream
+    /// The color matrix and range the last decoded frame carries, as the bitstream
     /// declared them; unspecified where the codec cannot declare a matrix (VP8).
-    pub fn colour_tags(&self) -> Option<(ff::AVColorSpace, ff::AVColorRange)> {
+    pub fn color_tags(&self) -> Option<(ff::AVColorSpace, ff::AVColorRange)> {
         if !self.have_frame {
             return None;
         }

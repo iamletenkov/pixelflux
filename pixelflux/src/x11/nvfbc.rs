@@ -521,7 +521,7 @@ impl NvfbcSession {
         self.grab_with(NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY, timeout)
     }
 
-    /// The grab above, with the driver's wait behaviour named explicitly.
+    /// The grab above, with the driver's wait behavior named explicitly.
     fn grab_with(&mut self, flags: u32, timeout: Duration) -> Result<GrabbedFrame, NvfbcError> {
         let mut device_ptr: CUdeviceptr = 0;
         let mut info = NVFBC_FRAME_GRAB_INFO::default();
@@ -1250,11 +1250,11 @@ mod gpu_tests {
         }
     }
 
-    /// Test helper: paint the whole root of `$DISPLAY` one solid colour and let the server
+    /// Test helper: paint the whole root of `$DISPLAY` one solid color and let the server
     /// finish, so the next capture has a known picture in it.
     ///
     /// The screen saver is turned off first: a test display sees no input, so a server left with
-    /// the default ten-minute blanking timeout hands the capture a black screen and every colour
+    /// the default ten-minute blanking timeout hands the capture a black screen and every color
     /// comparison below fails for a reason that has nothing to do with the capture.
     fn paint_root(rgb: (u8, u8, u8)) -> bool {
         let _ = std::process::Command::new("xset").args(["s", "off", "s", "noblank"]).output();
@@ -1354,12 +1354,12 @@ mod gpu_tests {
 
     /// The whole zero-copy path against a real X server and GPU: the driver composites the root
     /// into video memory, NVENC encodes that buffer in place, and the decoded picture is the
-    /// colour that was painted.
+    /// color that was painted.
     ///
     /// The zero-copy property is asserted rather than assumed, three ways: the driver reports it
     /// needed no post-processing pass (the native BGRA request means no conversion copy), every
     /// grab hands back the *same* device pointer (so the encoder's registration is made once and
-    /// reused instead of per frame), and repainting the root changes the decoded colour, which it
+    /// reused instead of per frame), and repainting the root changes the decoded color, which it
     /// could not if the encoder were reading a stale copy. Ignored by default.
     #[test]
     #[ignore]

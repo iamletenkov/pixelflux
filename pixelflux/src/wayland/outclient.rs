@@ -73,14 +73,14 @@ fn logical_size(mode: (i32, i32), scale: f64) -> (i32, i32) {
 /// edge meets it still; every other coordinate is kept. A session places its
 /// screens in its logical space, where a scaled screen is smaller than its mode,
 /// so an arrangement stated in capture pixels closes up around it here, and a
-/// screen changing scale carries its neighbours with it.
+/// screen changing scale carries its neighbors with it.
 pub(crate) fn close_gaps(
     rects: &[(i32, i32, i32, i32)],
     sizes: &[(i32, i32)],
 ) -> Vec<(i32, i32, i32, i32)> {
     let mut out: Vec<(i32, i32, i32, i32)> =
         rects.iter().zip(sizes).map(|(r, s)| (r.0, r.1, s.0, s.1)).collect();
-    // Each axis in the order of the old coordinate, so a neighbour is placed
+    // Each axis in the order of the old coordinate, so a neighbor is placed
     // before the rectangle that follows it.
     let mut order: Vec<usize> = (0..out.len()).collect();
     order.sort_by_key(|&i| rects[i].0);
@@ -112,7 +112,7 @@ struct OutState {
     /// The refusal was a cancellation: the configuration went stale under a
     /// state change of the compositor's own, so the same plan on a fresh
     /// serial can still land.
-    cancelled: bool,
+    canceled: bool,
     sync_done: bool,
 }
 
@@ -248,7 +248,7 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for OutState {
             zwlr_output_configuration_v1::Event::Succeeded => state.applied = Some(true),
             zwlr_output_configuration_v1::Event::Failed => state.applied = Some(false),
             zwlr_output_configuration_v1::Event::Cancelled => {
-                state.cancelled = true;
+                state.canceled = true;
                 state.applied = Some(false);
             }
             _ => {}
@@ -455,7 +455,7 @@ struct Plan {
 
 /// Why a configuration did not land.
 enum ConfigErr {
-    /// The compositor cancelled it, which says only that its own state moved
+    /// The compositor canceled it, which says only that its own state moved
     /// while the configuration was alive. The serial is what went stale, not
     /// the plan.
     Stale,
@@ -468,7 +468,7 @@ impl From<String> for ConfigErr {
     }
 }
 
-/// Rebuilds a cancelled configuration until this much time is spent. A screen
+/// Rebuilds a canceled configuration until this much time is spent. A screen
 /// arriving or leaving cancels whatever is in flight, and that is the same
 /// moment a display's mode and scale are being applied. Cancellations arrive in
 /// bursts, so the budget is a duration rather than a count of attempts: a count
@@ -497,7 +497,7 @@ where
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "the compositor cancelled the configuration {stale} times"
+                "the compositor canceled the configuration {stale} times"
             ));
         }
     }
@@ -506,7 +506,7 @@ where
 /// One attempt: a connection of its own, the heads and the serial that
 /// stamps them, and `plan` applied against that state. A retry reconnects
 /// rather than waiting for a fresh serial on the one it has, because the change
-/// that cancelled it is often a head arriving or leaving, and the heads a kept
+/// that canceled it is often a head arriving or leaving, and the heads a kept
 /// connection holds do not survive that.
 fn configure_once<F>(socket_path: &str, plan: &F) -> Result<usize, ConfigErr>
 where
@@ -564,7 +564,7 @@ where
     let _ = queue.flush();
     match state.applied {
         Some(true) => Ok(wanted.len()),
-        _ if state.cancelled => Err(ConfigErr::Stale),
+        _ if state.canceled => Err(ConfigErr::Stale),
         _ => Err(ConfigErr::Other(
             "the compositor refused the configuration".to_string(),
         )),

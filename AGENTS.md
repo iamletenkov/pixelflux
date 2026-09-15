@@ -10,7 +10,8 @@ not too verbose (do not add comments more fit for a PR summary than a comment). 
 as issue or task numbers) in the code or documentation. Do not use inline comments. Do not use comments or
 documentation that describe arbitrary code changes of previous states compared to the current code that do not need
 explanation. The code commenting should reflect the current state of the codebase and be used to convey information
-to an LLM bot or developer.
+to an LLM bot or developer. Write American English -- color, behavior, center, initialize, canceled -- except
+where a name belongs to something upstream, such as a Wayland `Cancelled` event or an NVENC `colourMatrix` field.
 
 Empirical testing is possible for everything here, including implementation, auditing, validation and verification,
 and every change is validated before it is reported. `cargo test --lib` in both feature configurations is the floor;
@@ -46,10 +47,10 @@ what you would do next. The same applies to a failure you cannot reproduce yet -
 fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
 A change is ready when four questions have answers, and the commit or pull request gives them to the reviewer:
-was the defect, or the missing behaviour, reproduced on the code before the change (a failing check or a measurement
+was the defect, or the missing behavior, reproduced on the code before the change (a failing check or a measurement
 on the old tree, not an argument from the source); is it gone, or present, on the exact code being committed, through
 the path a user takes rather than a switch a user would never flip (a developer toggle, a debug key, a knob of the
-rig); can the change affect behaviour it was not aimed at, and what was run to know; and is the change stripped to what
+rig); can the change affect behavior it was not aimed at, and what was run to know; and is the change stripped to what
 makes it work, since every line the first two answers do not need is noise the maintainers have to sift. A change in an
 area a maintainer has said they are working on goes to a branch and a pull request carrying those answers, never
 straight to `main`, whatever standing permission to push `main` exists. An optional path another component may offer
@@ -87,17 +88,17 @@ CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_E
 (`encoders/oh264.rs`, one instance per stripe) with the same wire framing; selkies derives its rate-control
 default from the exported names. Every session, on every backend, converts with the BT.709 matrix — the sRGB
 desktop's own primaries and transfer — at limited range for 4:2:0 and full range for the software
-4:4:4 sessions, and declares it; VP8 is the exception its bitstream forces, one colour-space bit
+4:4:4 sessions, and declares it; VP8 is the exception its bitstream forces, one color-space bit
 whose only defined value is BT.601 — told BT.709 out of band, Firefox reads neither the decoder
-configuration nor the RTP colour-space extension and inverts the other matrix. Chroma sits at
-the centre of each 2x2 block, which NVENC's own conversion does not: it weights the two columns
+configuration nor the RTP color-space extension and inverts the other matrix. Chroma sits at
+the center of each 2x2 block, which NVENC's own conversion does not: it weights the two columns
 of a block 3:1 (its matrix follows what the session declares, measured on Volta and Pascal, so
 only the siting is at stake). A 4:2:0 session therefore converts with `ChromaConvert`, a PTX
 kernel the driver JIT-compiles (`encoders/argb_to_nv12.cu`, `scripts/build-ptx.sh`) that reads
 the packed surface, a pitch-linear dmabuf import or a texture over an array-typed one and writes
 the NV12 NVENC encodes; 4:4:4 subsamples nothing and keeps the hardware conversion, as does a
 driver that refuses the kernel.
-`AvDecoder::colour_tags` reads what a stream declares, and the unit tests hold each
+`AvDecoder::color_tags` reads what a stream declares, and the unit tests hold each
 encoder to it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
 ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265

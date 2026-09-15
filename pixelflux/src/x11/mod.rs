@@ -549,7 +549,7 @@ impl FramePool {
         }
     }
 
-    /// Encode: block until a frame is available (`Some`) or stop is signalled (`None`).
+    /// Encode: block until a frame is available (`Some`) or stop is signaled (`None`).
     ///
     /// The wait is bounded (re-checking `stop` every 20ms) as defense-in-depth against a lost wakeup,
     /// so a stop that races the park can never leave the encode thread blocked forever.

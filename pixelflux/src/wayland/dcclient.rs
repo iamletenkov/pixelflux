@@ -162,7 +162,7 @@ struct DcState {
     /// Compositor told this device it is done (seat gone).
     finished: bool,
     /// The write path's source lost the selection to another client.
-    cancelled: bool,
+    canceled: bool,
     /// Mime -> bytes served by the write path's source.
     serve: Vec<(String, Vec<u8>)>,
     sync_done: bool,
@@ -365,7 +365,7 @@ impl Dispatch<ExtDataControlSourceV1, ()> for DcState {
                 state.on_send(&mime_type, fd);
             }
             ext_data_control_source_v1::Event::Cancelled => {
-                state.cancelled = true;
+                state.canceled = true;
             }
             _ => {}
         }
@@ -386,7 +386,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for DcState {
                 state.on_send(&mime_type, fd);
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
-                state.cancelled = true;
+                state.canceled = true;
             }
             _ => {}
         }
@@ -493,7 +493,7 @@ fn serve_selection(
     device: DcDevice,
     source: DcSource,
 ) -> Result<(), String> {
-    while !state.cancelled && !state.finished {
+    while !state.canceled && !state.finished {
         // Sends are served inside dispatch; block until the compositor has
         // something (with a poll so a dead compositor can't pin the thread).
         queue.flush().map_err(|e| format!("flush: {e}"))?;

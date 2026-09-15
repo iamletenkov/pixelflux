@@ -27,7 +27,7 @@
 //! KWin restricts the global to trusted clients unless
 //! `KWIN_WAYLAND_NO_PERMISSION_CHECKS` is set in its environment; a session that
 //! withholds it simply never shows the global here. Authentication is requested
-//! once after binding, as the protocol requires before any event is honoured.
+//! once after binding, as the protocol requires before any event is honored.
 //!
 //! The connection is made on its own thread when selkies names the app
 //! compositor ([`arm`]), and re-made on demand, rate-limited, after a failure,

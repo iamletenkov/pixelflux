@@ -152,8 +152,8 @@ fn color_space_name(space: ff::AVColorSpace) -> String {
 
 /// The matrix a session converts with and declares: BT.709, whose primaries and transfer the
 /// sRGB desktop source already carries. VP8 is held to BT.601, the only matrix its keyframe
-/// header's one colour-space bit can name: told BT.709 out of band, Chromium and WebKit paint
-/// it correctly but Firefox reads the bit and inverts BT.601, which shifts saturated colour by
+/// header's one color-space bit can name: told BT.709 out of band, Chromium and WebKit paint
+/// it correctly but Firefox reads the bit and inverts BT.601, which shifts saturated color by
 /// 20 levels.
 fn declared_colorspace(codec: Codec) -> ff::AVColorSpace {
     if codec == Codec::Vp8 {
@@ -166,9 +166,9 @@ fn declared_colorspace(codec: Codec) -> ff::AVColorSpace {
 /// The VA-VPP convert that lands an input on a `format` surface, behind `stage`: `hwmap` for a
 /// dmabuf mapped in place, `hwupload` for a packed host frame. `matrix` is libavutil's name for
 /// the matrix the session declares, so the pixels cannot drift from the signal. Chroma is sited
-/// at the centre of each 2x2 block, the average the software convert produces; left unset, the
+/// at the center of each 2x2 block, the average the software convert produces; left unset, the
 /// Intel driver keeps the left pixel of each pair and subpixel-antialiased text holds the
-/// coloured fringes of its glyph edges.
+/// colored fringes of its glyph edges.
 fn vpp_chain(stage: &str, width: i32, height: i32, format: &str, matrix: &str) -> String {
     format!(
         "{stage},scale_vaapi=w={width}:h={height}:format={format}\
@@ -1587,7 +1587,7 @@ mod tests {
     /// The convert a hardware session is handed has to parse where no VA device exists, since a
     /// driver is otherwise the only thing that reports an unparsable one. Every option name is
     /// one the filter registers, the matrix is the one the session declares, and chroma is sited
-    /// at the centre of each 2x2 block, which is where the software convert puts it.
+    /// at the center of each 2x2 block, which is where the software convert puts it.
     #[test]
     fn the_convert_chain_parses_and_carries_the_declared_matrix() {
         let filter = unsafe { ff::avfilter_get_by_name(c"scale_vaapi".as_ptr()) };
@@ -1636,7 +1636,7 @@ mod tests {
                     assert_eq!(
                         sited,
                         ff::AVChromaLocation::AVCHROMA_LOC_CENTER as c_int,
-                        "{chain} does not site chroma at the block centre"
+                        "{chain} does not site chroma at the block center"
                     );
                 }
                 checked += 1;
@@ -1658,14 +1658,14 @@ mod tests {
         }
     }
 
-    /// Four colours whose 2x2 average is grey, tiled: a decoded block's chroma comes out
-    /// neutral only where the session sited chroma at the centre of the block, and saturated
-    /// wherever it kept one pixel, row or column of it — the colour a browser then shows along
+    /// Four colors whose 2x2 average is gray, tiled: a decoded block's chroma comes out
+    /// neutral only where the session sited chroma at the center of the block, and saturated
+    /// wherever it kept one pixel, row or column of it — the color a browser then shows along
     /// the glyph edges of subpixel-antialiased text. Every session this host can open is
     /// measured, since a hardware one runs the driver's own downsampler and a unit test cannot
     /// pin that.
     #[test]
-    fn decoded_chroma_is_neutral_on_a_tile_that_averages_to_grey() {
+    fn decoded_chroma_is_neutral_on_a_tile_that_averages_to_gray() {
         use crate::encoders::chroma_siting;
         use crate::webcam::decode::{AvDecoder, Decoder as _};
         const N: usize = 128;
@@ -1702,13 +1702,13 @@ mod tests {
         assert!(measured > 0, "no session opened to measure");
     }
 
-    /// The eight-patch chart, encoded and decoded, comes back as the colour that was painted
+    /// The eight-patch chart, encoded and decoded, comes back as the color that was painted
     /// when a receiver inverts the matrix the session declares — the check a client's
     /// presentation path performs on every frame. A convert or a declaration that name
     /// different matrices leaves the neutrals exact and the saturated patches tens of levels
-    /// out, which is what the browsers show as washed-out or shifted colour.
+    /// out, which is what the browsers show as washed-out or shifted color.
     #[test]
-    fn the_chart_decodes_to_the_colour_that_was_painted() {
+    fn the_chart_decodes_to_the_color_that_was_painted() {
         use crate::encoders::chroma_siting;
         use crate::webcam::decode::{AvDecoder, Decoder as _};
         const N: usize = 256;
@@ -1913,7 +1913,7 @@ mod software_tests {
     /// The byte order a session is built for reaches the conversion: a red picture handed as
     /// B,G,R,A and as R,G,B,A decodes to the same red on both.
     #[test]
-    fn host_byte_order_is_honoured() {
+    fn host_byte_order_is_honored() {
         for codec in software_codecs() {
             let s = settings(codec);
             let mut means = Vec::new();
@@ -2002,7 +2002,7 @@ mod software_tests {
 
     /// Every session declares the BT.709 matrix it converts with, at limited range for 4:2:0
     /// and full range for the x265 4:4:4 one, like x264. VP8 reads back as BT.470BG whatever it
-    /// is handed: its keyframe header holds one colour-space bit and BT.601 is its only defined
+    /// is handed: its keyframe header holds one color-space bit and BT.601 is its only defined
     /// value, so the transports carry the real matrix for that codec themselves.
     #[test]
     fn sessions_declare_the_matrix_they_convert_with() {
@@ -2015,7 +2015,7 @@ mod software_tests {
             let mut dec = AvDecoder::new(codec).expect("decoder");
             assert!(decode_one(&mut dec, &out));
             let want = if codec == Codec::Vp8 { AVCOL_SPC_BT470BG } else { AVCOL_SPC_BT709 };
-            assert_eq!(dec.colour_tags(), Some((want, AVCOL_RANGE_MPEG)), "{codec:?}");
+            assert_eq!(dec.color_tags(), Some((want, AVCOL_RANGE_MPEG)), "{codec:?}");
             if super::super::software_fullcolor(codec) {
                 s.video_fullcolor = true;
                 let mut enc = session(codec, &s, false);
@@ -2024,7 +2024,7 @@ mod software_tests {
                 let mut dec = AvDecoder::new(codec).expect("decoder");
                 assert!(decode_one(&mut dec, &out));
                 let want = if codec == Codec::Vp9 { (AVCOL_SPC_BT709, AVCOL_RANGE_MPEG) } else { (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG) };
-                assert_eq!(dec.colour_tags(), Some(want), "{codec:?} 4:4:4");
+                assert_eq!(dec.color_tags(), Some(want), "{codec:?} 4:4:4");
             }
         }
     }

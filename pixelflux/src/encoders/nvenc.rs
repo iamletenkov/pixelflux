@@ -13,7 +13,7 @@
 //! drives drivers from NVENC 10.0 (~R445) through 13.0. Frames reach the GPU two ways: a
 //! zero-copy dmabuf import (EGLImage → CUDA, the mapped plane registered with NVENC in place as
 //! pitch-linear memory or as a CUDA array), and a pinned host→device upload of packed BGRA / RGBA.
-//! Colour is converted on the GPU either way. The codec is a session parameter: the same rate
+//! Color is converted on the GPU either way. The codec is a session parameter: the same rate
 //! control, GOP, VUI and latency posture is programmed into whichever of the three codec
 //! configurations the device offers, and a codec the device lacks (AV1 before Ada) is refused at
 //! open so the caller falls back. Sessions reconfigure resolution and rate control in place, so a
@@ -735,7 +735,7 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
 /// from a bare session's GUID list the way a real session reads it (`device_encodes`): the
 /// driver is negotiated, the device bound by the render node's PCI bus id (the first CUDA
 /// device where the node names none), and the session opened on its primary context with no
-/// input buffers, EGL or encoder initialisation. An error names the step that failed: no
+/// input buffers, EGL or encoder initialization. An error names the step that failed: no
 /// driver, no device, or a session that would not open, each of which a real session would
 /// fail on too. The CUDA and NVENC libraries stay loaded like a session's, since the driver
 /// does not promise to survive `libcuda` being unloaded after `cuInit`.
@@ -883,7 +883,7 @@ fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
 
 /// The 4:2:0 convert that replaces NVENC's own, because the hardware's fixed-function
 /// conversion weights the two columns of a block 3:1 instead of averaging them, leaving half the
-/// colour of a subpixel-antialiased glyph edge in the chroma plane where the software and VA-API
+/// color of a subpixel-antialiased glyph edge in the chroma plane where the software and VA-API
 /// converts leave none. It follows the matrix the session declares
 /// (`gpu_hardware_conversion_matches_the_declared_matrix`), so only the siting is at stake, and
 /// 4:4:4 — which subsamples nothing — keeps it.
@@ -1962,7 +1962,7 @@ impl NvencEncoder {
 
     /// Program the codec-specific arm of `config`: `level`, an infinite IDR period, the chroma
     /// format, 8-bit input and output, parameter sets repeated on every key frame, and the
-    /// colour description every session converts with.
+    /// color description every session converts with.
     ///
     /// The whole description is BT.709 at limited range. Primaries and transfer describe the
     /// source, sRGB desktop pixels, which shares both with BT.709; the matrix is what
@@ -1972,14 +1972,14 @@ impl NvencEncoder {
     /// restricts reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC.
     /// H.264 and HEVC frames carry `SLICES_PER_FRAME` slices; AV1 asks for one tile, since tiles
     /// cost bitrate and buy no quality, and tier 0, the only tier NVENC takes for it. The driver
-    /// honours a 1x1 request below 1986 pixels of picture height; above that it forces a second
+    /// honors a 1x1 request below 1986 pixels of picture height; above that it forces a second
     /// tile row whatever is asked for, in the low-latency presets this one is among but not from
     /// P5 up, so a 4K AV1 session codes two tile rows.
     ///
     /// HEVC declares the tier `h265_tier` names for its level, High: NVENC validates a CBR target
     /// against the MaxBR of the pinned level, and the Main-tier ceiling of the 5.x levels
     /// (40 Mbit/s at 5.1) is one a 4K desktop session reaches, where a Main-tier open is refused
-    /// and a live rate change past it is declined. The tier is a signalled cap, not a coding
+    /// and a live rate change past it is declined. The tier is a signaled cap, not a coding
     /// tool; it does change the codec string a client derives from the SPS (`H153` for `L153`).
     fn configure_codec(
         config: &mut NV_ENC_CONFIG,
@@ -2939,7 +2939,7 @@ impl NvencEncoder {
     }
 
     /// Encode a host packed-pixel frame by uploading it straight into the packed input surface,
-    /// with no CPU-side colour conversion: the surface is either the chroma convert's source or,
+    /// with no CPU-side color conversion: the surface is either the chroma convert's source or,
     /// where the kernel did not load, NVENC's own conversion's; a host prepass would cost this
     /// path its copy-free property.
     ///
@@ -3245,7 +3245,7 @@ mod tests {
 
     /// Every codec's arm declares the BT.709 matrix the session converts with, in both chroma
     /// formats and with no device involved. A stream whose pixels and signal disagree shifts
-    /// every saturated colour on the client, and only a GPU would otherwise report it.
+    /// every saturated color on the client, and only a GPU would otherwise report it.
     #[test]
     fn every_codec_declares_the_conversion_matrix() {
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
@@ -4071,7 +4071,7 @@ mod gpu_tests {
     /// writes for 4:2:0 and what NVENC's own conversion follows for 4:4:4. Primaries and
     /// transfer follow the source, which is sRGB desktop pixels and therefore BT.709 too. A
     /// client that inverts the wrong matrix, or expands a limited-range frame as full-range,
-    /// shifts colour visibly.
+    /// shifts color visibly.
     #[test]
     #[ignore]
     fn gpu_vui_describes_the_conversion() {
@@ -4094,13 +4094,13 @@ mod gpu_tests {
     }
 
     /// On a real GPU with a render node: the chroma convert reaches the zero-copy path too. A
-    /// dmabuf painted with alternating single-pixel columns whose pair averages to grey comes
+    /// dmabuf painted with alternating single-pixel columns whose pair averages to gray comes
     /// back with neutral chroma, whichever way the driver mapped the import — pitch-linear, read
     /// in place, or a CUDA array, read through a texture. Neither case copies the RGB.
     /// Ignored by default.
     #[test]
     #[ignore]
-    fn gpu_dmabuf_chroma_is_sited_at_the_block_centre() {
+    fn gpu_dmabuf_chroma_is_sited_at_the_block_center() {
         use crate::webcam::decode::{AvDecoder, Codec, Decoder as _};
         let (w, h) = (256u32, 256u32);
         let s = settings(w as i32, h as i32, 60.0);
@@ -4129,7 +4129,7 @@ mod gpu_tests {
     }
 
     /// A dmabuf painted with alternating single-pixel columns of blue and yellow, whose pair
-    /// averages to grey.
+    /// averages to gray.
     fn column_dmabuf(
         gbm: &gbm::Device<std::fs::File>,
         renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
@@ -4161,11 +4161,11 @@ mod gpu_tests {
         (bo, dmabuf)
     }
 
-    /// On a real GPU: a 4:2:0 session sites chroma at the centre of the block on both axes.
-    /// Rows of a colour pair that averages to grey, and columns of the same pair, both come back
+    /// On a real GPU: a 4:2:0 session sites chroma at the center of the block on both axes.
+    /// Rows of a color pair that averages to gray, and columns of the same pair, both come back
     /// neutral. NVENC's own conversion averages the rows but weights the columns 3:1, which is
     /// what `ChromaConvert` replaces; with the convert disabled the column case lands three
-    /// quarters of the way to the left column's chroma, which is the colour subpixel-antialiased
+    /// quarters of the way to the left column's chroma, which is the color subpixel-antialiased
     /// text would keep on its glyph edges. That conversion follows the BT.709 the session
     /// declares, so the mix is compared against BT.709 here and against BT.601 in
     /// `gpu_hardware_conversion_matches_the_declared_matrix`, which declares that instead. A
@@ -4173,15 +4173,15 @@ mod gpu_tests {
     /// default.
     #[test]
     #[ignore]
-    fn gpu_chroma_is_sited_at_the_block_centre() {
+    fn gpu_chroma_is_sited_at_the_block_center() {
         use crate::encoders::chroma_siting::{chroma, BT709};
         let (w, h) = (256usize, 256usize);
         let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
         let st = settings(w as i32, h as i32, 60.0);
         let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
         assert!(enc.csc.is_some(), "this GPU took no chroma convert");
-        let rows = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, false));
-        let cols = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
+        let rows = encode_and_measure(&mut enc, &color_pair(w, h, blue, yellow, false));
+        let cols = encode_and_measure(&mut enc, &color_pair(w, h, blue, yellow, true));
         println!("[chroma-siting] convert: rows {rows:?} columns {cols:?}");
         for (label, (u, v)) in [("rows", rows), ("columns", cols)] {
             let off = (u - 128.0).hypot(v - 128.0);
@@ -4195,7 +4195,7 @@ mod gpu_tests {
             }
             (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
-        let hardware = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
+        let hardware = encode_and_measure(&mut enc, &color_pair(w, h, blue, yellow, true));
         let weighted = chroma([0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]), BT709);
         println!("[chroma-siting] hardware: columns {hardware:?} against 3:1 {weighted:?}");
         assert!(
@@ -4210,14 +4210,14 @@ mod gpu_tests {
         }
     }
 
-    /// On a real GPU, in both chroma formats: the colour chart decodes back to the painted
-    /// colour when the matrix the VUI declares is inverted, which is what a client does with
+    /// On a real GPU, in both chroma formats: the color chart decodes back to the painted
+    /// color when the matrix the VUI declares is inverted, which is what a client does with
     /// every frame. 4:2:0 comes through the kernel and 4:4:4 through NVENC's own conversion, so
     /// this is what holds both to the declared matrix — the siting check cannot see a wrong one,
     /// its tile being neutral whichever matrix converts it. Ignored by default.
     #[test]
     #[ignore]
-    fn gpu_chart_decodes_to_the_colour_that_was_painted() {
+    fn gpu_chart_decodes_to_the_color_that_was_painted() {
         use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
         use crate::webcam::decode::{AvDecoder, Decoder as _};
         let (w, h) = (256usize, 128usize);
@@ -4279,7 +4279,7 @@ mod gpu_tests {
         println!("[csc] NVENC's own conversion: chart worst |dRGB| {worst:.1}");
         assert!(worst <= 8.0, "the hardware conversion paints {worst:.1} off the declared matrix");
 
-        let hardware = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
+        let hardware = encode_and_measure(&mut enc, &color_pair(w, h, blue, yellow, true));
         let mix = [0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]);
         let (weighted_601, weighted_709) = (chroma(mix, BT601), chroma(mix, BT709));
         let off = |c: (f64, f64)| (hardware.0 - c.0).hypot(hardware.1 - c.1);
@@ -4294,8 +4294,8 @@ mod gpu_tests {
     }
 
     /// On a real GPU: the external-pointer path encodes the caller's buffer where it lies. The
-    /// session's own staging surface is painted a colour the frame does not contain first, so a
-    /// picture that had been copied through it would decode to that colour instead — this is the
+    /// session's own staging surface is painted a color the frame does not contain first, so a
+    /// picture that had been copied through it would decode to that color instead — this is the
     /// X11 NvFBC hand-over, without needing NvFBC to reach it. A pitch that cannot cover the
     /// session's rows is refused rather than read past. Ignored by default.
     #[test]
@@ -4349,7 +4349,7 @@ mod gpu_tests {
         }
     }
 
-    /// Test helper: fill a pitched device surface with one BGRA colour.
+    /// Test helper: fill a pitched device surface with one BGRA color.
     unsafe fn paint_surface(
         cuda: &CudaFunctions,
         dst: CUdeviceptr,
@@ -4376,9 +4376,9 @@ mod gpu_tests {
         assert_eq!((cuda.cuMemcpy2D_v2)(&copy), CUresult::CUDA_SUCCESS, "paint the surface");
     }
 
-    /// A frame of two colours alternating by column or by row, so every 2x2 block averages to
-    /// the grey between them.
-    fn colour_pair(w: usize, h: usize, a: [f64; 3], b: [f64; 3], by_column: bool) -> Vec<u8> {
+    /// A frame of two colors alternating by column or by row, so every 2x2 block averages to
+    /// the gray between them.
+    fn color_pair(w: usize, h: usize, a: [f64; 3], b: [f64; 3], by_column: bool) -> Vec<u8> {
         let mut f = vec![255u8; w * h * 4];
         for y in 0..h {
             for x in 0..w {
@@ -4503,11 +4503,11 @@ mod gpu_tests {
         crate::gpu_render_init(std::path::Path::new(&node)).expect("GPU render init")
     }
 
-    /// Background and block colours painted into test dmabufs, as `Color32F` components.
+    /// Background and block colors painted into test dmabufs, as `Color32F` components.
     const BG: [f32; 3] = [0.1, 0.2, 0.8];
     const FG: [f32; 3] = [0.9, 0.3, 0.1];
 
-    /// Limited-range Y/Cb/Cr of a painted colour, whose components are 0..1.
+    /// Limited-range Y/Cb/Cr of a painted color, whose components are 0..1.
     fn painted_ycbcr(rgb: [f32; 3]) -> [f64; 3] {
         use crate::encoders::chroma_siting::{ycbcr, BT709};
         ycbcr(rgb.map(|c| f64::from(c) * 255.0), BT709)
@@ -4589,7 +4589,7 @@ mod gpu_tests {
     }
 
     /// Assert decoded region means sit within `tol` of the limited-range values of the painted
-    /// colours — a wrong pitch, byte order or stale buffer lands far outside this.
+    /// colors — a wrong pitch, byte order or stale buffer lands far outside this.
     fn assert_painted(label: &str, block: [f64; 3], bg: [f64; 3], tol: f64) {
         let (eb, eg) = (painted_ycbcr(FG), painted_ycbcr(BG));
         for i in 0..3 {
@@ -4624,7 +4624,7 @@ mod gpu_tests {
     }
 
     /// On a real GPU with a render node: two GLES-painted dmabufs encode through the dmabuf path
-    /// and decode to the painted colours at the painted positions, first with the direct
+    /// and decode to the painted colors at the painted positions, first with the direct
     /// registration enabled (in place when the driver maps the import pitch-linear, otherwise the
     /// copy arm) and then with it disabled — the two streams must agree, and the decoded content
     /// of both must match the paint. Prints which path the driver gave. Ignored by default; needs
@@ -4654,7 +4654,7 @@ mod gpu_tests {
             out
         };
 
-        // Painting the session's own staging surface a colour neither frame contains proves the
+        // Painting the session's own staging surface a color neither frame contains proves the
         // direct arm never passes through it: a copied frame would decode to this instead.
         if all_direct(&enc) {
             unsafe {
@@ -4692,7 +4692,7 @@ mod gpu_tests {
     }
 
     /// On a real GPU: a host frame handed over as BGRA (`rgba_input = false`) and the same image
-    /// handed over as RGBA bytes (`rgba_input = true`) both decode to the painted colours — the
+    /// handed over as RGBA bytes (`rgba_input = true`) both decode to the painted colors — the
     /// input surface is re-registered in the other byte order in place — and the session keeps
     /// encoding across the switch. Ignored by default.
     #[test]

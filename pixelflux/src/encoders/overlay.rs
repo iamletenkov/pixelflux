@@ -116,7 +116,7 @@ pub(crate) fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
 /// `blend_pixel` on premultiplied input multiplies alpha in twice and darkens
 /// every translucent pixel (visible dark fringes on the composited cursor).
 ///
-/// The sum saturates: some toolkits ship cursors whose colour exceeds its alpha, and on those
+/// The sum saturates: some toolkits ship cursors whose color exceeds its alpha, and on those
 /// a wrapping cast would turn an over-bright pixel into a dark one.
 pub(crate) fn blend_pixel_premultiplied(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     if a == 255 {

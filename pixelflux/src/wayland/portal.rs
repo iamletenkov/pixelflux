@@ -276,7 +276,7 @@ impl PortalSession {
         let (code, results): (u32, HashMap<String, OwnedValue>) = msg.body().deserialize().map_err(|e| format!("{method}: {e}"))?;
         match code {
             0 => Ok((code, results)),
-            1 => Err(format!("{method}: the user cancelled the portal dialog")),
+            1 => Err(format!("{method}: the user canceled the portal dialog")),
             _ => Err(format!("{method}: the portal refused (response {code})")),
         }
     }

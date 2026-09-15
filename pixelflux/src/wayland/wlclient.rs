@@ -181,7 +181,7 @@ pub(crate) fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd), String> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-/// Non-blocking CLOEXEC pipe for wake signalling (read end, write end).
+/// Non-blocking CLOEXEC pipe for wake signaling (read end, write end).
 pub(crate) fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {

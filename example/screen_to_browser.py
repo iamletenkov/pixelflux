@@ -203,7 +203,7 @@ ACTIVE_CLIENTS = {}
 async def send_stripes_task(websocket, queue):
     """
     Pulls video stripes from a client-specific queue and sends them.
-    This task is cancelled when the client disconnects.
+    This task is canceled when the client disconnects.
     """
     print(f"Send task started for client {websocket.remote_address}.")
     try:
@@ -232,7 +232,7 @@ async def send_stripes_task(websocket, queue):
 
     except asyncio.CancelledError:
         # This happens when the main handler cancels us during cleanup.
-        print(f"Send task was cancelled for {websocket.remote_address}.")
+        print(f"Send task was canceled for {websocket.remote_address}.")
 
     except Exception as e:
         # Catch any other unexpected errors.

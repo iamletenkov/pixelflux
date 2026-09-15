@@ -539,7 +539,7 @@ mod tests {
     fn keyboard_resolves_against_the_host_keymap() {
         let text = compile_rmlvo("", "", "us", "", "").expect("us keymap");
         let policy = policy_from_text(&text).expect("policy");
-        // 'a' sits at level 0 on AD01's neighbour; take it from the keymap itself.
+        // 'a' sits at level 0 on AD01's neighbor; take it from the keymap itself.
         let (a_kc, a_level) = policy.resolve(0x61).expect("a resolves");
         assert_eq!(a_level, 0, "lowercase is unshifted");
         // 'A' is the same key one level up, so it needs Shift.

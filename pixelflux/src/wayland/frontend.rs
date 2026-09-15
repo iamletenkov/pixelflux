@@ -478,7 +478,7 @@ pub struct OutputNode {
     pub target_seeded: bool,
     /// Deadline for this output's post-reconfigure content hold. While it is set, the
     /// display composites but does not publish: a resized or freshly created output paints
-    /// its clear colour wherever a client has not yet answered the new size, and that grey
+    /// its clear color wherever a client has not yet answered the new size, and that gray
     /// must not reach the stream. Cleared by the first tick a client covers the output, and
     /// by the deadline for one that never does.
     pub content_hold_until: Option<Instant>,
@@ -583,9 +583,9 @@ pub const PARKED_POS: (i32, i32) = (-(1 << 20), -(1 << 20));
 
 /// The logical size a parked screen is held at. A nested session lays its desktop out across
 /// every screen it has, including one waiting here: at the size of a real screen it would
-/// double the session's coordinate space, sending anything a client centres on the desktop
+/// double the session's coordinate space, sending anything a client centers on the desktop
 /// (X11 applications place themselves) onto the screen nobody is watching. Small enough not
-/// to move that centre, large enough to lay out on; `place_window_on_output` configures the
+/// to move that center, large enough to lay out on; `place_window_on_output` configures the
 /// real size the moment the screen is given an output.
 pub const PARKED_LOGICAL_SIZE: (i32, i32) = (320, 240);
 

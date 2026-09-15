@@ -1313,7 +1313,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 let force_idr = decision.force_idr;
                 // The readback rows go to the encoder as they are — BGRA from the pixman
                 // framebuffer or a host frame, RGBA from a GLES readback: a hardware session
-                // converts on the GPU and a software one on its own threads, so no colour
+                // converts on the GPU and a software one on its own threads, so no color
                 // conversion runs here.
                 let encode_start_ns = wayland::host::now_ns();
                 let outcome = encoder.encode_host(
@@ -2356,7 +2356,7 @@ fn start_capture_on_display(
 
     node.capture = Some(cap);
     // The start reprogrammed this output, and until a client answers at the new size the
-    // compositor paints its clear colour over whatever the client does not cover — a
+    // compositor paints its clear color over whatever the client does not cover — a
     // freshly created output, whose session window is still parked at a placeholder size,
     // is covered by none of it. Those frames are held rather than streamed as a blank
     // screen; the deadline releases an output no client ever draws on.
@@ -2715,9 +2715,9 @@ fn render_node_tick(
     let logical_w = (width as f64 / output_scale_val).round();
     let logical_h = (height as f64 / output_scale_val).round();
 
-    // A reconfigured or freshly created output composites its clear colour wherever a client
+    // A reconfigured or freshly created output composites its clear color wherever a client
     // has not yet answered the new size; publishing is held until one covers the output so
-    // that grey never reaches the stream. Compositing continues, so the frame callbacks the
+    // that gray never reaches the stream. Compositing continues, so the frame callbacks the
     // waited-on clients redraw on keep flowing and the hold cannot deadlock on itself. Host
     // capture streams the host compositor's own frames and has no such gap.
     let hold_frame = match node.content_hold_until {
@@ -4010,7 +4010,7 @@ fn configure_windows_for_mode(
         // A parked screen is tagged for this display but composited on none: it
         // holds PARKED_LOGICAL_SIZE until `create_output` gives it one. Resizing it
         // here would double the session's coordinate space onto a screen nobody
-        // watches, which is where a window that centres itself then lands.
+        // watches, which is where a window that centers itself then lands.
         if wayland::frontend::window_meta(window)
             .is_some_and(|meta| meta.parked.load(Ordering::Relaxed))
         {
@@ -8315,7 +8315,7 @@ mod wl_frame_pool_tests {
         let (id, buf) = p.try_begin().expect("buffer");
         assert!(p.try_begin().is_none());
         p.cancel(id, buf);
-        assert!(p.try_begin().is_some(), "cancelled reservation reusable");
+        assert!(p.try_begin().is_some(), "canceled reservation reusable");
     }
 }
 

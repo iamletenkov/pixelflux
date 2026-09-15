@@ -57,7 +57,7 @@ const BITRATE_CEILING_BPS: u32 = 100_000_000;
 /// Holds the live `Encoder`, the fixed dimensions, and the reusable I420 plane buffers
 /// (`y_buf` / `u_buf` / `v_buf`) that each frame's RGB-to-YUV conversion writes into before
 /// hand-off. `threads`, `slices` and `csc_bands` are the parallelism policy fixed at open: a lone
-/// full-frame instance encodes with several threads over four slices and converts colour in four
+/// full-frame instance encodes with several threads over four slices and converts color in four
 /// bands, while a stripe of the striped path is single-threaded and single-slice, its parallelism
 /// coming from the stripes encoding concurrently. `is_cbr` selects the rate-control mode: `true` is
 /// CBR (bitrate-mode RC driving a target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but
@@ -110,7 +110,7 @@ impl Openh264Encoder {
     /// its own CBR budget — the per-stripe share `stripe_rate_control` hands out, since every stripe
     /// runs its own rate control. `fullframe` selects the parallelism policy: a lone full-frame
     /// stripe encodes with `fullframe_threads` threads over four fixed slices (client decoders
-    /// slice-parallelize too) and converts colour in four bands, so a whole frame never serialises
+    /// slice-parallelize too) and converts color in four bands, so a whole frame never serializes
     /// on one core; one stripe of several is single-threaded and single-slice with a one-band
     /// conversion, its parallelism coming from the stripes encoding concurrently.
     ///
@@ -480,7 +480,7 @@ impl Openh264Encoder {
     ///
     /// 1. **Keyframe**: when `force_idr` is set, `force_intra_frame` is called so this frame is
     ///    emitted as an IDR.
-    /// 2. **Colour conversion**: `argb` (with `stride` bytes per row, `height` rows) is converted
+    /// 2. **Color conversion**: `argb` (with `stride` bytes per row, `height` rows) is converted
     ///    to I420 into the reusable Y/U/V plane buffers, across `csc_bands` threads. `rgba_input`
     ///    selects the source byte order — `false` is B,G,R,A (X11 XShm), `true` is R,G,B,A (Wayland
     ///    GL readback).
@@ -609,10 +609,10 @@ mod tests {
         let idr = enc.encode_host_argb(&busy_frame(128, 96, 0), 128 * 4, 0, true, false).expect("encode");
         let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
         assert!(dec.decode(&idr[VIDEO_HEADER_LEN..]).expect("decode"));
-        assert_eq!(dec.colour_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)));
+        assert_eq!(dec.color_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)));
     }
 
-    /// The colour chart, handed to the encoder as host ARGB, decodes back to the colour that was
+    /// The color chart, handed to the encoder as host ARGB, decodes back to the color that was
     /// painted when the BT.709 the stream declares is inverted — the check a client's
     /// presentation path performs on every frame, here with no browser in the way.
     #[test]
@@ -834,7 +834,7 @@ mod tests {
 
     /// Both input byte orders encode valid, wire-headered Annex-B: the Wayland GLES readback
     /// delivers RGBA and X11 delivers BGRA, so `encode_host_argb` is exercised with `rgba_input`
-    /// both true and false (colour correctness is verified end-to-end, not here).
+    /// both true and false (color correctness is verified end-to-end, not here).
     #[test]
     fn rgba_and_bgra_inputs_both_encode() {
         let (w, h, stride) = (128usize, 96usize, 128 * 4);
