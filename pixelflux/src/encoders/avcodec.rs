@@ -183,6 +183,15 @@ struct VaapiDeviceContext {
     _driver_quirks: c_uint,
 }
 
+/// The VA display a derived VA-API device was opened on, or None where the reference, its
+/// device context or the display itself is null.
+unsafe fn va_display(device: *mut ff::AVBufferRef) -> Option<*mut c_void> {
+    let device_ctx = device.as_ref()?.data as *mut ff::AVHWDeviceContext;
+    let hwctx = device_ctx.as_ref()?.hwctx as *mut VaapiDeviceContext;
+    let display = hwctx.as_ref()?.display;
+    (!display.is_null()).then_some(display)
+}
+
 /// `AVVAAPIHWConfig`: the VA configuration a frame-constraints query is scoped to.
 #[repr(C)]
 struct VaapiHwConfig {
@@ -260,8 +269,7 @@ unsafe fn vpp_sw_formats(device: *mut ff::AVBufferRef) -> Option<Vec<ff::AVPixel
         Ok(symbol) => symbol,
         Err(e) => return unverified_pick(&e),
     };
-    let hwctx = (*((*device).data as *mut ff::AVHWDeviceContext)).hwctx as *mut VaapiDeviceContext;
-    let display = (*hwctx).display;
+    let display = va_display(device)?;
     let mut config_id = 0u32;
     let status = create(
         display,
@@ -378,8 +386,7 @@ unsafe fn va_encode_codecs(device: *mut ff::AVBufferRef) -> Result<Vec<Codec>, S
     let max_entrypoints: Symbol<VaMaxNum> = lib.get(b"vaMaxNumEntrypoints\0").map_err(symbol)?;
     let query_entrypoints: Symbol<VaQueryConfigEntrypoints> =
         lib.get(b"vaQueryConfigEntrypoints\0").map_err(symbol)?;
-    let hwctx = (*((*device).data as *mut ff::AVHWDeviceContext)).hwctx as *mut VaapiDeviceContext;
-    let display = (*hwctx).display;
+    let display = va_display(device).ok_or("the VA-API device carries no display")?;
 
     let mut profiles = vec![0 as c_int; max_profiles(display).max(0) as usize];
     let mut listed: c_int = 0;
@@ -854,6 +861,9 @@ impl AvcodecEncoder {
         let session = self.hw.as_mut().unwrap();
         session.filter_graph = ff::avfilter_graph_alloc();
         let graph = session.filter_graph;
+        if graph.is_null() {
+            return Err("Failed to alloc the filter graph".into());
+        }
         let buffersrc = ff::avfilter_get_by_name(c"buffer".as_ptr());
         let buffersink = ff::avfilter_get_by_name(c"buffersink".as_ptr());
         session.buffersrc_ctx = ff::avfilter_graph_alloc_filter(graph, buffersrc, c"in".as_ptr());
@@ -922,20 +932,14 @@ impl AvcodecEncoder {
                 }
                 ff::avfilter_graph_segment_apply(seg, 0, &mut seg_inputs, &mut seg_outputs) >= 0
             }
-            && !seg_inputs.is_null()
-            && !seg_outputs.is_null()
-            && ff::avfilter_link(
-                session.buffersrc_ctx,
-                0,
-                (*seg_inputs).filter_ctx,
-                (*seg_inputs).pad_idx as u32,
-            ) >= 0
-            && ff::avfilter_link(
-                (*seg_outputs).filter_ctx,
-                (*seg_outputs).pad_idx as u32,
-                session.buffersink_ctx,
-                0,
-            ) >= 0;
+            && match (seg_inputs.as_ref(), seg_outputs.as_ref()) {
+                (Some(input), Some(output)) => {
+                    ff::avfilter_link(session.buffersrc_ctx, 0, input.filter_ctx, input.pad_idx as u32) >= 0
+                        && ff::avfilter_link(output.filter_ctx, output.pad_idx as u32, session.buffersink_ctx, 0)
+                            >= 0
+                }
+                _ => false,
+            };
         ff::avfilter_inout_free(&mut seg_inputs);
         ff::avfilter_inout_free(&mut seg_outputs);
         ff::avfilter_graph_segment_free(&mut seg);
@@ -1085,7 +1089,6 @@ impl AvcodecEncoder {
     /// frame in flight, the profile the surface format implies, the lowest fitting level,
     /// and the low-power entry point when the default one refused.
     unsafe fn vaapi_options(&self, opts: &mut *mut ff::AVDictionary, qp: u32) {
-        let ctx = self.encoder_ctx;
         let (w, h, fps) = (self.width as u32, self.height as u32, self.fps as u32);
         if self.cbr_mode {
             dict_set(opts, "rc_mode", "CBR");
@@ -1093,7 +1096,11 @@ impl AvcodecEncoder {
             dict_set(opts, "rc_mode", "CQP");
             match self.codec {
                 Codec::H264 | Codec::H265 => dict_set(opts, "qp", &qp.to_string()),
-                _ => (*ctx).global_quality = qp.max(1) as i32,
+                _ => {
+                    if let Some(ctx) = self.encoder_ctx.as_mut() {
+                        ctx.global_quality = qp.max(1) as i32;
+                    }
+                }
             }
         }
         dict_set(opts, "async_depth", "1");
@@ -1291,8 +1298,11 @@ impl AvcodecEncoder {
         if force_idr && !self.fresh && self.keyframe_by_reopen {
             self.open_codec(self.current_qp)?;
         }
-        (*frame).pts = frame_number as i64;
-        (*frame).pict_type = if force_idr {
+        let Some(picture) = frame.as_mut() else {
+            return Err("No frame to encode".into());
+        };
+        picture.pts = frame_number as i64;
+        picture.pict_type = if force_idr {
             ff::AVPictureType::AV_PICTURE_TYPE_I
         } else {
             ff::AVPictureType::AV_PICTURE_TYPE_NONE
