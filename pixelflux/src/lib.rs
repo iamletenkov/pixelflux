@@ -1376,6 +1376,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
             let force_idr_all = requested_idr
                 || (settings.codec.is_video()
                     && crate::pipeline::periodic_idr_due(&settings, f.frame_id));
+            let encode_start_ns = wayland::host::now_ns();
             out = encoders::software::encode_cpu(
                 &mut stripes,
                 &mut stripes_carrying,
@@ -1389,6 +1390,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 false,
                 force_idr_all,
             );
+            FrameTiming::stamp(&mut out, f.captured_ns, encode_start_ns);
         }
 
         let WlFrame { id, buf, .. } = f;

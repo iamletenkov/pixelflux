@@ -736,14 +736,7 @@ where
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
         let encode_start_ns = crate::wayland::host::now_ns();
         let mut stripes = pl.process(buf, frame.stride);
-        let timing = FrameTiming {
-            capture_ns: frame.captured_ns,
-            encode_start_ns,
-            encode_end_ns: crate::wayland::host::now_ns(),
-        };
-        for stripe in &mut stripes {
-            stripe.timing = timing;
-        }
+        FrameTiming::stamp(&mut stripes, frame.captured_ns, encode_start_ns);
         controls.codec.store(pl.codec().id(), Ordering::Relaxed);
         pool.recycle(frame.idx);
         if !stripes.is_empty() {

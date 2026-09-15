@@ -624,12 +624,28 @@ pub struct EncodedStripe {
 
 /// When a frame was captured and when its encode began and ended, as CLOCK_MONOTONIC
 /// nanoseconds, so a consumer can attribute a frame's age to the host rather than the
-/// network or the decoder; zeros where a path does not stamp them.
+/// network or the decoder. An encoder leaves them zero; the capture that ran it stamps
+/// every stripe of the frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameTiming {
     pub capture_ns: i64,
     pub encode_start_ns: i64,
     pub encode_end_ns: i64,
+}
+
+impl FrameTiming {
+    /// Stamps the stripes of one frame, captured at `capture_ns` and encoded from
+    /// `encode_start_ns` until now.
+    pub fn stamp(stripes: &mut [EncodedStripe], capture_ns: i64, encode_start_ns: i64) {
+        let timing = FrameTiming {
+            capture_ns,
+            encode_start_ns,
+            encode_end_ns: crate::wayland::host::now_ns(),
+        };
+        for stripe in stripes {
+            stripe.timing = timing;
+        }
+    }
 }
 
 /// No stripe is shorter than a macroblock row.
