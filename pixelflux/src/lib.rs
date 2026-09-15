@@ -877,6 +877,17 @@ fn parse_auto_gpu(value: &str) -> Option<Option<String>> {
     }
 }
 
+/// The render node an `auto_gpu` request picks: None where the request is off or matches
+/// no node.
+fn auto_render_node(auto_gpu: &str) -> Option<String> {
+    auto_select_render_node(parse_auto_gpu(auto_gpu)?.as_deref())
+}
+
+/// The index `encode_node_index` counts a render node path by (`/dev/dri/renderD{128 + idx}`).
+fn render_node_index(path: &str) -> Option<i32> {
+    Some(path.strip_prefix("/dev/dri/renderD")?.parse::<i32>().ok()? - 128)
+}
+
 /// Resolve a usable `/dev/dri/renderD*` node, optionally matching a vendor/driver token.
 ///
 /// Cards under `/sys/class/drm` are walked in numeric order, skipping cards with no render node
@@ -1857,10 +1868,9 @@ fn start_capture_on_display(
         .unwrap_or_default();
 
     if state.auto_gpu_selected && settings.encode_node_index < -1
-        && let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD")
-        && let Ok(idx) = idx_str.parse::<i32>() {
-                settings.encode_node_index = idx - 128;
-            }
+        && let Some(idx) = render_node_index(&state.render_node_path) {
+            settings.encode_node_index = idx;
+        }
 
     if settings.codec.is_video() {
         settings.width &= !1;
@@ -6663,15 +6673,11 @@ impl ScreenCapture {
                         .ok()
                 })
                 .unwrap_or_default();
-            if let Some(request) = parse_auto_gpu(&auto_gpu)
-                && let Some(picked) = auto_select_render_node(request.as_deref())
-                && let Some(idx) = picked
-                        .strip_prefix("/dev/dri/renderD")
-                        .and_then(|s| s.parse::<i32>().ok())
-                    {
-                        println!("[x11] AUTO_GPU enabled. Selected: {picked}");
-                        rs.encode_node_index = idx - 128;
-                    }
+            if let Some(picked) = auto_render_node(&auto_gpu)
+                && let Some(idx) = render_node_index(&picked) {
+                    println!("[x11] AUTO_GPU enabled. Selected: {picked}");
+                    rs.encode_node_index = idx;
+                }
         }
 
         println!(
@@ -7646,7 +7652,7 @@ fn probe_wayland_gpu(
 ) -> PyResult<Py<PyAny>> {
     let (node, name, error) = py.detach(|| {
         let node = if render_node.is_empty() {
-            parse_auto_gpu(&auto_gpu).and_then(|token| auto_select_render_node(token.as_deref()))
+            auto_render_node(&auto_gpu)
         } else {
             Some(render_node)
         };
@@ -7684,13 +7690,24 @@ fn probe_wayland_gpu(
 /// name (`"nvenc"` or `"vaapi"`), the hardware half of what `SOFTWARE_ENCODERS` says of the
 /// build: a codec absent from both has no path on this host, one absent from this alone runs
 /// in software whatever `use_cpu` says. Probed once per node and remembered, so a caller
-/// reads it at startup and never pays for it again. `encode_node_index` is the capture
-/// setting of that name; a negative value (no explicit pick) reads as the first node, as a
-/// capture reads it.
+/// reads it at startup and never pays for it again. `encode_node_index` and `auto_gpu` are
+/// the capture settings of those names, resolved as a capture resolves them: an explicit
+/// index reads that node, -1 (software only) serves nothing, and anything lower (no pick)
+/// follows the `auto_gpu` selection, the first node where that picks none.
 #[pyfunction]
-#[pyo3(signature = (encode_node_index = 0))]
-fn hardware_encoders(py: Python<'_>, encode_node_index: i32) -> PyResult<Py<PyAny>> {
-    let served = py.detach(|| encoders::hardware_encoders(encode_node_index));
+#[pyo3(signature = (encode_node_index = -2, auto_gpu = ""))]
+fn hardware_encoders(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> PyResult<Py<PyAny>> {
+    let node = match encode_node_index {
+        -1 => None,
+        index if index < -1 => {
+            Some(auto_render_node(auto_gpu).and_then(|picked| render_node_index(&picked)).unwrap_or(0))
+        }
+        index => Some(index),
+    };
+    let served = match node {
+        Some(node) => py.detach(|| encoders::hardware_encoders(node)),
+        None => Vec::new(),
+    };
     let d = pyo3::types::PyDict::new(py);
     for (codec, backend) in served {
         d.set_item(codec.name(), backend)?;
@@ -7916,6 +7933,26 @@ mod annexb_frame_type_tests {
     #[test]
     fn emulation_prevention_is_stripped_before_parsing() {
         assert_eq!(annexb_frame_type(EPB_INTRA_VCL), 0x02);
+    }
+}
+
+#[cfg(test)]
+mod encode_node_tests {
+    //! How an unset encode node resolves: the index a render node path counts as, and no
+    //! pick at all where auto-GPU selection is off.
+    use super::{auto_render_node, render_node_index};
+
+    #[test]
+    fn render_node_path_counts_from_128() {
+        assert_eq!(render_node_index("/dev/dri/renderD128"), Some(0));
+        assert_eq!(render_node_index("/dev/dri/renderD130"), Some(2));
+        assert_eq!(render_node_index("/dev/dri/card0"), None);
+    }
+
+    #[test]
+    fn auto_gpu_off_picks_nothing() {
+        assert_eq!(auto_render_node("false"), None);
+        assert_eq!(auto_render_node(""), None);
     }
 }
 

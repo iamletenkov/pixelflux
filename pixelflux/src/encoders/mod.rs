@@ -600,3 +600,21 @@ pub fn session_full_range(encoder: Option<&FrameEncoder>, settings: &RustCapture
         None => session_fullcolor(None, settings),
     }
 }
+
+#[cfg(test)]
+mod hardware_encoder_tests {
+    //! The hardware encoder table of a render node, on a host with an engine behind its first
+    //! node. Ignored by default; run with `cargo test gpu_ -- --ignored --test-threads=1`.
+    use super::*;
+
+    /// The first node serves H.264 on the backend its driver selects, every entry names one of
+    /// the two backends, and the second read is the remembered first.
+    #[test]
+    #[ignore]
+    fn gpu_hardware_encoders_serve_h264_once_probed() {
+        let served = hardware_encoders(0);
+        assert!(served.iter().any(|(codec, _)| *codec == Codec::H264), "node 0 serves {served:?}");
+        assert!(served.iter().all(|(_, backend)| matches!(*backend, "nvenc" | "vaapi")));
+        assert_eq!(hardware_encoders(0), served);
+    }
+}
