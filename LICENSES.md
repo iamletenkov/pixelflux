@@ -46,7 +46,7 @@ contains it.
 | libvpx | BSD-3-Clause | permissive | both | linked by libavcodec (`libvpx`, `libvpx-vp9`); bundled into the wheels | software VP8 and VP9 |
 | SVT-AV1 | BSD-3-Clause-Clear (with the Alliance for Open Media patent license) | permissive | both | linked by libavcodec (`libsvtav1`); bundled into the wheels | software AV1 |
 | dav1d | BSD-2-Clause | permissive | both | linked by libavcodec (`libdav1d`); bundled into the wheels | the virtual camera's AV1 decoder |
-| libva, libva-drm, libva-x11 | MIT | permissive | both | linked by libavutil/libavcodec; pixelflux also opens libva at run time (`libloading`) to query the video processor's surface formats; excluded from the wheel (`auditwheel --exclude`), the host's copy is used | VA-API |
+| libva, libva-drm, libva-x11 | MIT | permissive | both | linked by libavutil/libavcodec; pixelflux also opens libva at run time (`libloading`) to query the video processor's surface formats; excluded from the wheel (`auditwheel --exclude`), the host's copy is used. The wheel images build libva 2.20.0 from source for its headers alone, since AV1 encode entered the interface there and the images ship 2.13 | VA-API |
 | libdrm | MIT | permissive | both | linked by libavutil; excluded from the wheel. `drm-sys`/`drm-ffi` only carry bindings and issue the ioctls themselves, no libdrm symbol is linked by pixelflux | DRM/KMS |
 | libgbm (Mesa) | MIT | permissive | both | linked shared library (`gbm-sys`); excluded from the wheel | GPU buffer allocation |
 | libpixman-1 | MIT | permissive | both | linked shared library (`pixman-sys`); excluded from the wheel | software renderer of the compositor |

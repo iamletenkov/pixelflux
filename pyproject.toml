@@ -51,6 +51,9 @@ before-all = """
     # * libx264 and x265, only for the GPL wheel (the default; PIXELFLUX_ENABLE_GPL=0
     #   builds without them: OpenH264, vendored by its crate, is the software
     #   H.264 encoder and kvazaar the software H.265 encoder instead).
+    # * libva, whose headers decide which VA-API encoders FFmpeg compiles at all:
+    #   AV1 encode entered the interface in 2.20, and the images ship older, so
+    #   without this the wheel has every VA-API encoder but that one.
     # * kvazaar, libvpx, SVT-AV1 and dav1d (BSD), the software H.265, VP8/VP9
     #   and AV1 encoders and the AV1 decoder of the virtual camera, all reached
     #   through FFmpeg.
@@ -80,6 +83,20 @@ before-all = """
                 -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_CLI=OFF && \
             cmake --build build -j$(nproc) && \
             cmake --install build)
+    }
+
+    # The wheel never carries libva: auditwheel excludes it so the host's own
+    # copy serves the driver it was built for. This is a build-time dependency
+    # only, for the AV1 encode interface libva 2.20 introduced, which is what
+    # FFmpeg compiles its av1_vaapi encoder against. 2.20.0 is what Ubuntu 24.04
+    # ships, so a wheel built here asks no more of a host than that release.
+    build_libva() {
+        (cd /tmp && \
+            clone_source 2.20.0 libva https://github.com/intel/libva.git && \
+            cd libva && \
+            meson setup build --prefix=/usr/local --libdir=lib --buildtype=release && \
+            ninja -C build && \
+            ninja -C build install)
     }
 
     build_kvazaar() {
@@ -143,7 +160,7 @@ before-all = """
     }
 
     build_codec_libraries() {
-        build_kvazaar && build_libvpx && build_svtav1 && build_dav1d && \
+        build_libva && build_kvazaar && build_libvpx && build_svtav1 && build_dav1d && \
         if [ "${gpl}" = 1 ]; then build_x264 && build_x265; fi
     }
 
@@ -158,7 +175,7 @@ before-all = """
             pixman-devel \
             libX11-devel \
             libXext-devel \
-            libva-devel \
+            libXfixes-devel \
             libdrm-devel \
             libinput-devel \
             libxkbcommon-devel \
@@ -201,7 +218,6 @@ before-all = """
             libx11-dev \
             libxext-dev \
             libxfixes-dev \
-            libva-dev \
             libdrm-dev \
             libinput-dev \
             libxkbcommon-dev \
