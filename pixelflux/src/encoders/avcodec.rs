@@ -1912,10 +1912,10 @@ mod software_tests {
 
     /// A session driven through libavcodec cannot leave a frame out of its predictions, so it
     /// says so instead of pretending: it names no reference on any frame and refuses the
-    /// request, which is what leaves the caller a key frame to code. Some libraries below it
-    /// can -- libvpx takes per-frame reference flags, NVENC and libx264 take an invalidation --
-    /// but libavcodec passes none of that through, so VA-API and the software encoders alike
-    /// are in this class.
+    /// request, which is what leaves the caller a key frame to code. Most libraries below it
+    /// can -- libva builds each picture's reference lists itself, libvpx takes per-frame
+    /// reference flags, libx264 takes an invalidation -- but libavcodec passes none of that
+    /// through, and x265 and SVT-AV1 offer nothing to pass.
     #[test]
     fn a_session_that_cannot_invalidate_names_no_reference() {
         use super::super::{reference::Reference, FrameEncoder};
