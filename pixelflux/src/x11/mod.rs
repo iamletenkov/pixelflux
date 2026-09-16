@@ -11,10 +11,11 @@
 //! protocol socket every tick, so XShm has the server write the pixels straight into memory this
 //! process already has mapped.
 //!
-//! This is the general path, and it works against any X server. On an NVIDIA X server whose
-//! session encodes on NVENC there is a better one: [`nvfbc`] has the driver composite the screen
-//! straight into video memory and registers that buffer with the encoder in place, so no frame is
-//! copied at all. `run_capture` takes it whenever it can serve the session and falls back here
+//! This is the general path, and it works against any X server. Two zero-copy paths come first
+//! where they can serve the session: [`nvfbc`] on an NVIDIA X server has the driver composite the
+//! screen straight into video memory and registers that buffer with NVENC in place, and [`dri3`]
+//! on any server whose screen lives on the GPU has the server blit the root into dmabufs the
+//! hardware encoder reads in place. `run_capture` tries them in that order and falls back here
 //! otherwise.
 //!
 //! `run_capture` splits the work across two threads because grabbing the next frame and encoding
@@ -27,6 +28,7 @@
 //! is handled inside them (e.g. the libx264 open/close lock); each capture owns its own private xcb
 //! connection, so there is no shared X state to serialize here.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::Sender;
@@ -52,6 +54,7 @@ use crate::RustCaptureSettings;
 
 pub mod computer_use;
 pub mod cursor;
+pub mod dri3;
 pub mod nvfbc;
 
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
@@ -357,8 +360,6 @@ fn try_rebuild_channel(
     Ok(())
 }
 
-/// Grab one frame of the capture region into `surface` with a single XShm round-trip.
-///
 /// The X server's report that the root window changed, which lets a capture publish a change as
 /// it lands instead of on the next tick. `None` where the server carries no DAMAGE extension,
 /// leaving the frame timer to pace the capture by itself.
@@ -367,6 +368,9 @@ fn try_rebuild_channel(
 /// is subtracted, which is what [`Self::clear`] does to re-arm the next report.
 struct RootDamage {
     id: Damage,
+    /// A report read off the connection and not yet acted on. Latched here because reading the
+    /// connection is what notices one, and that happens well before the frame it wakes.
+    reported: Cell<bool>,
 }
 
 impl RootDamage {
@@ -374,23 +378,29 @@ impl RootDamage {
         conn.damage_query_version(1, 1).ok()?.reply().ok()?;
         let id = conn.generate_id().ok()?;
         conn.damage_create(id, root, ReportLevel::NON_EMPTY).ok()?.check().ok()?;
-        Some(Self { id })
+        Some(Self { id, reported: Cell::new(false) })
     }
 
-    /// Whether the server has reported a change since the last [`Self::clear`].
+    /// Whether the server has reported a change since the last [`Self::clear`], taking in
+    /// whatever else the connection carries along the way.
     fn reported(&self, conn: &RustConnection) -> bool {
-        let mut changed = false;
         while let Ok(Some(event)) = conn.poll_for_event() {
-            changed |= matches!(event, Event::DamageNotify(_));
+            if matches!(event, Event::DamageNotify(_)) {
+                self.reported.set(true);
+            }
         }
-        changed
+        self.reported.get()
     }
 
-    /// Forget what has been reported and empty the region behind it, so the next report
-    /// describes a change from here on. Called before a grab, which leaves a change racing the
-    /// grab to wake the next frame instead of being cleared along with what the grab captured.
+    /// Empty the region behind a report that has been acted on, so the next change is reported
+    /// in turn; a tick nothing reported leaves the server alone. Called before a grab, which
+    /// leaves a change racing the grab to wake the next frame instead of being cleared along
+    /// with what the grab captured.
     fn clear(&self, conn: &RustConnection) {
-        while matches!(conn.poll_for_event(), Ok(Some(_))) {}
+        if !self.reported(conn) {
+            return;
+        }
+        self.reported.set(false);
         let _ = conn.damage_subtract(self.id, x11rb::NONE, x11rb::NONE);
         let _ = conn.flush();
     }
@@ -871,10 +881,12 @@ where
 ///
 /// [`nvfbc::run_capture`] is tried first: where the NVIDIA driver offers framebuffer capture and
 /// the session encodes on NVENC, the screen is composited into video memory and encoded in place,
-/// so a frame reaches the bitstream without being copied once. It reports that it cannot serve
-/// the session — a codec NVENC has no engine for, software encoding, another vendor's GPU, a
-/// watermark that has to be blended into host pixels, or a driver without NvFBC — and the capture
-/// then runs on the general XShm path below, which every X server supports.
+/// so a frame reaches the bitstream without being copied once. [`dri3::run_capture`] is next: on a
+/// server whose screen lives on the GPU, the server blits the root into dmabufs this process
+/// allocated and the hardware session reads them in place. Each reports that it cannot serve the
+/// session — a codec its engine has no support for, software encoding, a watermark that has to be
+/// blended into host pixels, a server or device that does not qualify — and the capture then runs
+/// on the general XShm path below, which every X server supports.
 ///
 /// Blocking; intended to run on a dedicated thread.
 pub fn run_capture<F>(
@@ -887,6 +899,14 @@ where
     F: FnMut(Vec<EncodedStripe>) + Send + 'static,
 {
     if let Some(result) = nvfbc::run_capture(
+        settings.clone(),
+        controls.clone(),
+        encode_tid_tx.clone(),
+        &mut on_frame,
+    ) {
+        return result;
+    }
+    if let Some(result) = dri3::run_capture(
         settings.clone(),
         controls.clone(),
         encode_tid_tx.clone(),
@@ -1258,6 +1278,70 @@ where
         Err(e) => Err(e),
         Ok(()) if encode_panicked.load(Ordering::Acquire) => Err("encode thread panicked".into()),
         Ok(()) => Ok(()),
+    }
+}
+
+/// Helpers the hardware checks of the zero-copy backends share: a known picture on the root of
+/// `$DISPLAY`, and the color a decoded frame of it must average to.
+#[cfg(test)]
+pub(crate) mod gpu_test_support {
+    use std::time::Duration;
+
+    use crate::encoders::codec::Codec;
+    use crate::webcam::decode::{AvDecoder, Decoder};
+    use crate::RustCaptureSettings;
+
+    /// Full-frame capture settings for `codec` at CRF 25, streaming every frame.
+    pub(crate) fn settings(codec: Codec) -> RustCaptureSettings {
+        RustCaptureSettings {
+            codec,
+            target_fps: 60.0,
+            video_crf: 25,
+            video_streaming_mode: true,
+            ..Default::default()
+        }
+    }
+
+    /// Paint the whole root of `$DISPLAY` one solid color and let the server finish, so the
+    /// next capture has a known picture in it.
+    ///
+    /// The screen saver is turned off first: a test display sees no input, so a server left
+    /// with the default ten-minute blanking timeout hands the capture a black screen and every
+    /// color comparison fails for a reason that has nothing to do with the capture.
+    pub(crate) fn paint_root(rgb: (u8, u8, u8)) -> bool {
+        let _ = std::process::Command::new("xset").args(["s", "off", "s", "noblank"]).output();
+        let _ = std::process::Command::new("xset").arg("s").arg("reset").output();
+        let spec = format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2);
+        let out = std::process::Command::new("xsetroot").args(["-solid", &spec]).output();
+        if !out.map(|o| o.status.success()).unwrap_or(false) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+        true
+    }
+
+    /// Limited-range Y/Cb/Cr of an 8-bit RGB triple, what the chroma convert emits for a
+    /// captured surface.
+    pub(crate) fn painted_ycbcr(rgb: (u8, u8, u8)) -> [f64; 3] {
+        use crate::encoders::chroma_siting::{ycbcr, BT709};
+        ycbcr([rgb.0, rgb.1, rgb.2].map(f64::from), BT709)
+    }
+
+    /// Mean Y/Cb/Cr of a decoded picture.
+    pub(crate) fn decoded_mean(dec: &mut AvDecoder, payload: &[u8]) -> [f64; 3] {
+        assert!(dec.decode(payload).expect("decode"), "no picture from this access unit");
+        let v = dec.frame().expect("decoded frame");
+        let mut acc = [0f64; 3];
+        let mut n = 0f64;
+        for y in 0..v.height {
+            for x in 0..v.width {
+                acc[0] += v.y[y * v.y_stride + x] as f64;
+                acc[1] += v.u[(y / 2) * v.uv_stride + x / 2] as f64;
+                acc[2] += v.v[(y / 2) * v.uv_stride + x / 2] as f64;
+                n += 1.0;
+            }
+        }
+        [acc[0] / n, acc[1] / n, acc[2] / n]
     }
 }
 
