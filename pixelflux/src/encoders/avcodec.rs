@@ -1910,6 +1910,27 @@ mod software_tests {
         }
     }
 
+    /// A session driven through libavcodec cannot leave a frame out of its predictions, so it
+    /// says so instead of pretending: it names no reference on any frame and refuses the
+    /// request, which is what leaves the caller a key frame to code. Some libraries below it
+    /// can -- libvpx takes per-frame reference flags, NVENC and libx264 take an invalidation --
+    /// but libavcodec passes none of that through, so VA-API and the software encoders alike
+    /// are in this class.
+    #[test]
+    fn a_session_that_cannot_invalidate_names_no_reference() {
+        use super::super::{reference::Reference, FrameEncoder};
+        for codec in software_codecs() {
+            let s = settings(codec);
+            let mut enc = FrameEncoder::Avcodec(session(codec, &s, false));
+            for t in 0..4usize {
+                enc.encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0)
+                    .unwrap_or_else(|e| panic!("{codec:?} encode {t}: {e}"));
+                assert_eq!(enc.last_reference(), Reference::Untracked, "{codec:?} frame {t}");
+            }
+            assert!(!enc.invalidate_reference(2), "{codec:?}: the refusal is what asks for the key frame");
+        }
+    }
+
     /// The byte order a session is built for reaches the conversion: a red picture handed as
     /// B,G,R,A and as R,G,B,A decodes to the same red on both.
     #[test]

@@ -1672,6 +1672,10 @@ impl NvencEncoder {
             }
 
             let is_444 = caps.fullcolor;
+            // An AV1 session leaves its reference structure to the driver instead of declaring
+            // maxNumRefFramesInDPB, so there is no window to mirror and no frame to name; the
+            // device's own invalidation, which NVENC offers for AV1 as for the other two, goes
+            // unused and a lost frame costs a key frame.
             let invalidation = codec != Codec::Av1
                 && query_cap(
                     &function_list,
@@ -3577,8 +3581,8 @@ mod gpu_tests {
     /// A frame a client lost is left out of the device's predictions: the next frame predicts
     /// from the newest frame before it and names it, a decoder that never saw the lost frames
     /// decodes it as one that saw everything does, the stream declares the decoded picture
-    /// buffer the level admits and an in-place resize redeclares it. A device that cannot
-    /// invalidate a reference tracks none and says so. Ignored by default.
+    /// buffer the level admits and an in-place resize redeclares it. An AV1 session, and a
+    /// device that cannot invalidate a reference, tracks none and says so. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_predicts_past_a_lost_frame() {
@@ -3594,7 +3598,7 @@ mod gpu_tests {
                 .sum::<f64>()
                 / (a.width * a.height) as f64
         };
-        for codec in [Codec::H264, Codec::H265] {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;
             s.omit_stripe_headers = true;
