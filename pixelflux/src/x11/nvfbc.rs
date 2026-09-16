@@ -723,7 +723,16 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         Err(e) => return declined(&e),
     };
 
-    let mut encoder = match NvencEncoder::new(settings, std::ptr::null()) {
+    // The region is resolved before the encoder is built, because the encoder is built at the
+    // size it will be fed: a session that follows the screen carries no dimensions of its own,
+    // and NVENC opens no buffer at zero.
+    let (region, size) = resolve_region(screen, settings);
+    let request = settings.clone();
+    let mut settings = settings.clone();
+    settings.width = size.w as i32;
+    settings.height = size.h as i32;
+
+    let mut encoder = match NvencEncoder::new(&settings, std::ptr::null()) {
         Ok(enc) => enc,
         Err(e) => return declined(&format!("NVENC {} did not open: {e}", settings.codec.display())),
     };
@@ -732,14 +741,11 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     if !encoder.push_context() {
         return declined("the encoder's CUDA context could not be made current");
     }
-    let (region, size) = resolve_region(screen, settings);
     if let Err(e) = nvfbc.start(region, size, settings.capture_cursor) {
         encoder.pop_context();
         return declined(&e.to_string());
     }
 
-    let request = settings.clone();
-    let mut settings = settings.clone();
     settings.width = nvfbc.size.w as i32;
     settings.height = nvfbc.size.h as i32;
     if (settings.width != encoder.width() as i32 || settings.height != encoder.height() as i32)
@@ -1297,6 +1303,30 @@ mod gpu_tests {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
         Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// A session that follows the screen carries no dimensions of its own, which is how Selkies
+    /// runs a full-screen capture, and the encoder has to be built at the size the capture
+    /// resolves rather than at the zero it was asked with. Ignored by default; run with
+    /// `DISPLAY` on an NVIDIA X server.
+    #[test]
+    #[ignore]
+    fn gpu_nvfbc_opens_a_session_that_follows_the_screen() {
+        let mut s = settings(crate::encoders::codec::Codec::H264);
+        s.width = 0;
+        s.height = 0;
+        s.auto_adjust_screen_capture_size = true;
+        let Some(gpu) = open(&s) else {
+            println!("the NvFBC path declined this host; nothing to open");
+            return;
+        };
+        assert!(
+            gpu.settings.width > 0 && gpu.settings.height > 0,
+            "a session following the screen opened at {}x{}",
+            gpu.settings.width,
+            gpu.settings.height
+        );
+        println!("a session following the screen opened at {}x{}", gpu.settings.width, gpu.settings.height);
     }
 
     /// On a real NVIDIA X server: the driver reports whether it can capture this screen, and at
