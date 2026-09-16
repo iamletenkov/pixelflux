@@ -29,10 +29,10 @@
 //! twice.
 //!
 //! Everything that can be checked is checked before a frame is delivered, and the path is
-//! declined otherwise: a codec no hardware engine serves, software encoding, a watermark (which
-//! is blended into host pixels), a server without DRI3 1.2, Damage or Render, a server drawing
-//! on a device other than the encode node, a buffer the server will not import, or a first frame
-//! the encoder cannot read. The capture then runs the XShm path with nothing half-built.
+//! declined otherwise: a codec no hardware engine serves, software encoding, a server without
+//! DRI3 1.2, Damage or Render, a server drawing on a device other than the encode node, a buffer
+//! the server will not import, or a first frame the encoder cannot read. A watermark is not among
+//! them: it is composited by the server through Render, as the cursor is. The capture then runs the XShm path with nothing half-built.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -84,6 +84,16 @@ struct GpuBuffer {
     picture: render::Picture,
 }
 
+/// An ARGB image the server composites over each frame through Render: the XFixes cursor,
+/// re-uploaded whenever it changes, or the watermark, uploaded once.
+struct Sprite {
+    pixmap: xproto::Pixmap,
+    picture: render::Picture,
+    gc: xproto::Gcontext,
+    width: u16,
+    height: u16,
+}
+
 /// The XFixes cursor image uploaded once per cursor change as an ARGB pixmap the server
 /// composites over each frame.
 struct CursorSprite {
@@ -126,6 +136,10 @@ struct GpuCapture {
     encoder: Option<FrameEncoder>,
     buffers: Vec<GpuBuffer>,
     cursor: Option<CursorSprite>,
+    /// The watermark image and where it sits, and the pixmap the server composites it from.
+    /// Held rather than blended into host pixels, which is what keeps this path zero-copy.
+    overlay: crate::encoders::overlay::OverlayState,
+    watermark: Option<Sprite>,
     x: XScreen,
     gbm: RawGbmDevice<File>,
     _egl: Option<EGLDisplay>,
@@ -282,6 +296,35 @@ impl XScreen {
             .reply()
             .map_err(|e| x_err("blit sync reply", e))?;
         Ok(())
+    }
+
+    /// Hand the server an ARGB image as a pixmap it can composite from. `argb` is one
+    /// premultiplied 0xAARRGGBB word per pixel, which is what Render's OVER expects.
+    fn upload_sprite(&self, argb: &[u32], width: u16, height: u16) -> Result<Sprite, String> {
+        let conn = &self.conn;
+        let pixmap = conn.generate_id().map_err(|e| x_err("sprite pixmap id", e))?;
+        conn.create_pixmap(32, pixmap, self.root, width, height)
+            .map_err(|e| x_err("sprite CreatePixmap", e))?;
+        let gc = conn.generate_id().map_err(|e| x_err("sprite GC id", e))?;
+        conn.create_gc(gc, pixmap, &xproto::CreateGCAux::new().graphics_exposures(0))
+            .map_err(|e| x_err("sprite CreateGC", e))?;
+        let picture = conn.generate_id().map_err(|e| x_err("sprite picture id", e))?;
+        conn.render_create_picture(picture, pixmap, self.argb_format, &render::CreatePictureAux::new())
+            .map_err(|e| x_err("sprite CreatePicture", e))?;
+        let mut data = Vec::with_capacity(argb.len() * 4);
+        for px in argb {
+            let bytes = if self.byte_order == ImageOrder::LSB_FIRST { px.to_le_bytes() } else { px.to_be_bytes() };
+            data.extend_from_slice(&bytes);
+        }
+        conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc, width, height, 0, 0, 0, 32, &data)
+            .map_err(|e| x_err("sprite PutImage", e))?;
+        Ok(Sprite { pixmap, picture, gc, width, height })
+    }
+
+    fn free_sprite(&self, s: &Sprite) {
+        let _ = self.conn.render_free_picture(s.picture);
+        let _ = self.conn.free_gc(s.gc);
+        let _ = self.conn.free_pixmap(s.pixmap);
     }
 
     fn free_buffer(&self, b: &GpuBuffer) {
@@ -462,8 +505,57 @@ impl GpuCapture {
         } else if let Some(c) = self.cursor.take() {
             self.x.free_cursor(&c);
         }
+        self.composite_watermark(idx)?;
         self.x.await_blit(dst)?;
         Ok(idx)
+    }
+
+    /// Draw the watermark over the freshly blitted frame, on the GPU. The image is uploaded
+    /// on its first frame and composited by the server after that, so the CPU never sees the
+    /// pixels it is drawn on; an animated location only moves where it is composited.
+    fn composite_watermark(&mut self, idx: usize) -> Result<(), String> {
+        let Some((pixels, w, h)) = self.overlay.sprite() else {
+            return Ok(());
+        };
+        if self.watermark.is_none() {
+            // `image` decodes to straight alpha and Render's OVER wants it premultiplied.
+            let argb: Vec<u32> = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| {
+                    let a = p[3] as u32;
+                    let pm = |c: u8| (c as u32 * a / 255) & 0xff;
+                    (a << 24) | (pm(p[0]) << 16) | (pm(p[1]) << 8) | pm(p[2])
+                })
+                .collect();
+            self.watermark = Some(self.x.upload_sprite(&argb, w as u16, h as u16)?);
+        }
+        let (fw, fh) = (self.settings.width, self.settings.height);
+        self.overlay.update_position(fw, fh, self.request.watermark_location_enum);
+        let (x, y) = self.overlay.position();
+        let sprite = self.watermark.as_ref().unwrap();
+        if x >= fw || y >= fh || x + sprite.width as i32 <= 0 || y + sprite.height as i32 <= 0 {
+            return Ok(());
+        }
+        self.x
+            .conn
+            .render_composite(
+                render::PictOp::OVER,
+                sprite.picture,
+                x11rb::NONE,
+                self.buffers[idx].picture,
+                0,
+                0,
+                0,
+                0,
+                x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                sprite.width,
+                sprite.height,
+            )
+            .map_err(|e| x_err("watermark Composite", e))?;
+        Ok(())
     }
 
     /// Draw the XFixes cursor over the freshly blitted frame, uploading its image only when the
@@ -540,6 +632,9 @@ impl Drop for GpuCapture {
         if let Some(c) = self.cursor.take() {
             self.x.free_cursor(&c);
         }
+        if let Some(w) = self.watermark.take() {
+            self.x.free_sprite(&w);
+        }
         self.free_buffers();
         let _ = self.x.conn.free_gc(self.x.gc);
         let _ = self.x.conn.flush();
@@ -558,9 +653,6 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     }
     if settings.use_cpu || settings.encode_node_index == -1 {
         return declined("software encoding was requested");
-    }
-    if !settings.watermark_path.is_empty() {
-        return declined("a watermark is composited into the frame");
     }
     let node = settings.encode_node_index.max(0);
     let driver = crate::get_gpu_driver(node);
@@ -598,6 +690,10 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         Some(g) => g,
         None => return declined("the root geometry could not be read"),
     };
+    let mut watermark = crate::encoders::overlay::OverlayState::default();
+    if !settings.watermark_path.is_empty() {
+        watermark.load_watermark(&settings.watermark_path, 1.0);
+    }
     let request = settings.clone();
     let mut live = settings.clone();
     let (w, h) = resolve_dims(geo.width, geo.height, &request);
@@ -608,6 +704,8 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         encoder: None,
         buffers: Vec::new(),
         cursor: None,
+        overlay: watermark,
+        watermark: None,
         cap_x: clamp_offset(request.capture_x, geo.width),
         cap_y: clamp_offset(request.capture_y, geo.height),
         root_w: geo.width,
@@ -915,7 +1013,63 @@ mod gpu_tests {
     use super::*;
     use super::super::gpu_test_support::{decoded_mean, paint_root, painted_ycbcr, settings};
     use crate::encoders::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN};
-    use crate::webcam::decode::{AvDecoder, Codec as DecCodec};
+    use crate::webcam::decode::{AvDecoder, Codec as DecCodec, Decoder};
+
+    /// The watermark is composited by the server, so it reaches the frame without the CPU
+    /// touching a pixel, and a translucent one blends as the readback paths blend it: Render's
+    /// OVER takes premultiplied alpha, and a straight-alpha upload would darken it instead.
+    /// Ignored by default; same server and encoder as the check below.
+    #[test]
+    #[ignore]
+    fn gpu_dri3_composites_a_watermark_without_a_readback() {
+        const SCREEN: (u8, u8, u8) = (0x20, 0x40, 0x80);
+        const MARK: (u8, u8, u8) = (0xff, 0x00, 0x00);
+        const ALPHA: u8 = 128;
+        if !paint_root(SCREEN) {
+            println!("no X root this host can paint (xsetroot, $DISPLAY); nothing to capture");
+            return;
+        }
+        let path = std::env::temp_dir().join("pixelflux-dri3-watermark.png");
+        image::RgbaImage::from_pixel(96, 96, image::Rgba([MARK.0, MARK.1, MARK.2, ALPHA]))
+            .save(&path)
+            .expect("write the watermark");
+        let mut s = settings(crate::encoders::codec::Codec::H264);
+        s.watermark_path = path.to_string_lossy().into_owned();
+        let Some(mut gpu) = open(&s) else {
+            println!("the DRI3 path declined a watermarked session on this host; nothing to capture");
+            return;
+        };
+        let idx = gpu.grab(false).expect("blit and composite");
+        let dmabuf = gpu.buffers[idx].dmabuf.clone();
+        let pkt = gpu.enc().encode_dmabuf(&dmabuf, 0, 25, true).expect("encode in place");
+        let mut dec = AvDecoder::new(DecCodec::H264).expect("avcodec h264");
+        assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
+        let v = dec.frame().expect("decoded frame");
+        // Straight-alpha source over the painted screen, which is what both paths must produce.
+        let blend = |m: u8, bg: u8| {
+            (m as f64 * ALPHA as f64 + bg as f64 * (255.0 - ALPHA as f64)) / 255.0
+        };
+        let want = crate::encoders::chroma_siting::ycbcr(
+            [blend(MARK.0, SCREEN.0), blend(MARK.1, SCREEN.1), blend(MARK.2, SCREEN.2)],
+            crate::encoders::chroma_siting::BT709,
+        );
+        let (mx, my) = (48usize, 48usize);
+        let got = [
+            v.y[my * v.y_stride + mx] as f64,
+            v.u[(my / 2) * v.uv_stride + mx / 2] as f64,
+            v.v[(my / 2) * v.uv_stride + mx / 2] as f64,
+        ];
+        for i in 0..3 {
+            assert!(
+                (got[i] - want[i]).abs() <= 10.0,
+                "watermark plane {i}: captured {:.1}, blended {:.1}",
+                got[i],
+                want[i]
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        println!("the server composited the watermark at ({mx},{my}) to Y/Cb/Cr {got:?}");
+    }
 
     /// On a DRI3 server whose screen lives on the GPU: the server imports the pool, a blit of a
     /// painted root decodes to the painted color, and a repaint reaches the next frame, which it

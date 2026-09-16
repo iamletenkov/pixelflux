@@ -222,6 +222,17 @@ impl OverlayState {
         self.wm_loaded
     }
 
+    /// The loaded image and its size, for a backend that hands it to the GPU once instead of
+    /// blending it into every frame's host pixels. Straight alpha, R,G,B,A per pixel.
+    pub fn sprite(&self) -> Option<(&[u8], u32, u32)> {
+        self.wm_loaded.then_some((self.wm_pixels.as_slice(), self.wm_width, self.wm_height))
+    }
+
+    /// Where [`Self::update_position`] last put the image's top-left corner in the frame.
+    pub fn position(&self) -> (i32, i32) {
+        (self.wm_pos_x, self.wm_pos_y)
+    }
+
     /// True when the watermark moves and must be re-rendered every frame.
     pub fn is_animated(&self) -> bool {
         self.is_animated
