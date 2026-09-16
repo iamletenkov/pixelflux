@@ -255,28 +255,45 @@ impl Vendor {
     /// Load both vendor libraries, plain name first so the loader's own search applies, then the
     /// L4T directory for images that do not put it on the default path.
     unsafe fn load() -> Result<Self, String> {
+        // Every call below is unsafe on its own terms (a `dlopen`, a symbol read, a transmute to
+        // a function pointer), so they are written as unsafe operations rather than inherited
+        // from the signature: that is what the 2024 edition asks for, and it marks which lines
+        // are trusting the vendor's ABI.
         let open_lib = |name: &str| -> Result<Library, String> {
-            Library::new(name)
-                .or_else(|_| Library::new(format!("/usr/lib/aarch64-linux-gnu/tegra/{name}")))
-                .map_err(|e| format!("{name} is not loadable: {e}"))
+            unsafe {
+                Library::new(name)
+                    .or_else(|_| Library::new(format!("/usr/lib/aarch64-linux-gnu/tegra/{name}")))
+            }
+            .map_err(|e| format!("{name} is not loadable: {e}"))
         };
         let v4l2 = open_lib("libnvv4l2.so")?;
         let nvbuf = open_lib("libnvbuf_utils.so")?;
         let sym = |lib: &Library, name: &[u8]| -> Result<*const c_void, String> {
-            let s: Symbol<*const c_void> = lib
-                .get(name)
+            let s: Symbol<*const c_void> = unsafe { lib.get(name) }
                 .map_err(|e| format!("{} is missing: {e}", String::from_utf8_lossy(name)))?;
             Ok(*s)
         };
+        let (open, ioctl, close) = (
+            sym(&v4l2, b"v4l2_open\0")?,
+            sym(&v4l2, b"v4l2_ioctl\0")?,
+            sym(&v4l2, b"v4l2_close\0")?,
+        );
+        let (create, raw2buf, transform, sync, destroy) = (
+            sym(&nvbuf, b"NvBufferCreateEx\0")?,
+            sym(&nvbuf, b"Raw2NvBuffer\0")?,
+            sym(&nvbuf, b"NvBufferTransform\0")?,
+            sym(&nvbuf, b"NvBufferMemSyncForDevice\0")?,
+            sym(&nvbuf, b"NvBufferDestroy\0")?,
+        );
         Ok(Self {
-            open: std::mem::transmute(sym(&v4l2, b"v4l2_open\0")?),
-            ioctl: std::mem::transmute(sym(&v4l2, b"v4l2_ioctl\0")?),
-            close: std::mem::transmute(sym(&v4l2, b"v4l2_close\0")?),
-            create: std::mem::transmute(sym(&nvbuf, b"NvBufferCreateEx\0")?),
-            raw2buf: std::mem::transmute(sym(&nvbuf, b"Raw2NvBuffer\0")?),
-            transform: std::mem::transmute(sym(&nvbuf, b"NvBufferTransform\0")?),
-            sync: std::mem::transmute(sym(&nvbuf, b"NvBufferMemSyncForDevice\0")?),
-            destroy: std::mem::transmute(sym(&nvbuf, b"NvBufferDestroy\0")?),
+            open: unsafe { std::mem::transmute(open) },
+            ioctl: unsafe { std::mem::transmute(ioctl) },
+            close: unsafe { std::mem::transmute(close) },
+            create: unsafe { std::mem::transmute(create) },
+            raw2buf: unsafe { std::mem::transmute(raw2buf) },
+            transform: unsafe { std::mem::transmute(transform) },
+            sync: unsafe { std::mem::transmute(sync) },
+            destroy: unsafe { std::mem::transmute(destroy) },
             _v4l2: v4l2,
             _nvbuf: nvbuf,
         })

@@ -14,7 +14,10 @@ pub mod avcodec;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
 /// Tegra hardware H.264 through the vendor V4L2 encoder, loaded at runtime: the only path to a
-/// Jetson's encoder, which carries no `libnvidia-encode` and no render node driver.
+/// Jetson's encoder, which carries no `libnvidia-encode` and no render node driver. Built for
+/// `aarch64` alone — the vendor libraries and the encoder behind them exist on no other
+/// architecture, so an x86_64 build carries none of this.
+#[cfg(target_arch = "aarch64")]
 pub mod tegra;
 /// NVIDIA NVENC hardware H.264 / HEVC / AV1 encoder loaded via runtime `libcuda` /
 /// `libnvidia-encode`.
@@ -75,6 +78,7 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     if let Some(served) = probed.get(&node) {
         return served.clone();
     }
+    #[cfg(target_arch = "aarch64")]
     if tegra::available() {
         let served: HardwareEncoders = vec![(Codec::H264, "tegra")];
         println!("[pixelflux] Render node {node} encodes H.264 on tegra (vendor V4L2).");
@@ -263,6 +267,7 @@ pub enum FrameEncoder {
     Nvenc(NvencEncoder),
     Avcodec(AvcodecEncoder),
     /// Tegra's encoder, reached through the vendor V4L2 library.
+    #[cfg(target_arch = "aarch64")]
     Tegra(tegra::TegraEncoder),
 }
 
@@ -272,6 +277,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.codec(),
             FrameEncoder::Avcodec(enc) => enc.codec(),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.codec(),
         }
     }
@@ -281,6 +287,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(_) => true,
             FrameEncoder::Avcodec(enc) => enc.backend() == Backend::Vaapi,
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => true,
         }
     }
@@ -291,6 +298,7 @@ impl FrameEncoder {
             FrameEncoder::Nvenc(_) => "NVENC",
             FrameEncoder::Avcodec(enc) if enc.backend() == Backend::Vaapi => "VAAPI",
             FrameEncoder::Avcodec(enc) => enc.library(),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => "TEGRA",
         }
     }
@@ -300,6 +308,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.is_fullcolor(),
             FrameEncoder::Avcodec(enc) => enc.is_fullcolor(),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.is_fullcolor(),
         }
     }
@@ -309,6 +318,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(_) => false,
             FrameEncoder::Avcodec(enc) => enc.is_full_range(),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => false,
         }
     }
@@ -322,6 +332,7 @@ impl FrameEncoder {
                 Ok(())
             }
             FrameEncoder::Avcodec(enc) => enc.reconfigure_rate(settings),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.reconfigure_rate(settings),
         }
     }
@@ -340,6 +351,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.encode_cpu_packed(pixels, stride, rgba, frame_number, qp, force_idr),
             FrameEncoder::Avcodec(enc) => enc.encode_host(pixels, stride, frame_number, qp, force_idr),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
         }
     }
@@ -349,6 +361,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_reference(),
             FrameEncoder::Avcodec(_) => reference::Reference::Untracked,
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => reference::Reference::Untracked,
         }
     }
@@ -360,6 +373,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.invalidate_reference(frame_id),
             FrameEncoder::Avcodec(_) => false,
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => false,
         }
     }
@@ -375,6 +389,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.encode(dmabuf, frame_number, qp, force_idr),
             FrameEncoder::Avcodec(enc) => enc.encode_dmabuf(dmabuf, frame_number, qp, force_idr),
+            #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => Err("the Tegra session takes host frames".into()),
         }
     }
@@ -425,6 +440,7 @@ pub fn select_frame_encoder(
         return None;
     }
     let software_forced = settings.use_cpu || settings.encode_node_index == -1;
+    #[cfg(target_arch = "aarch64")]
     if let (false, Codec::H264, FrameSource::Host { rgba }) = (software_forced, codec, source) {
         // Tegra publishes no render node driver to probe and carries no libnvidia-encode, so the
         // vendor library is the only way to its encoder and this step comes before both.
