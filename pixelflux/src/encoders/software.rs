@@ -1234,6 +1234,12 @@ pub fn invalidate_reference(stripes: &mut [StripeState], frame_id: u16) -> bool 
             }
             forgotten
         } else {
+            // OpenH264's long-term references are the only lever here, and they cannot be
+            // steered from the encoder side: the recovery request does code a delta instead
+            // of a key frame, but it predicts from whichever long-term reference the encoder
+            // marked, and the frame number of that marking reaches the application only
+            // through OpenH264's own decoder. A browser never reports it, so the delta would
+            // name a frame the client may not hold.
             let _ = (stripes, frame_id);
             false
         }

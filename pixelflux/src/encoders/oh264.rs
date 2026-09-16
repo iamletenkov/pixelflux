@@ -1086,3 +1086,4 @@ mod rebuild_cost {
         assert!(init_ms < 250.0, "OpenH264 init unexpectedly slow: {init_ms}ms");
     }
 }
+
