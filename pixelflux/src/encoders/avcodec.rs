@@ -1730,6 +1730,7 @@ mod tests {
         };
         let mut measured = 0;
         for backend in [Backend::Software, Backend::Vaapi] {
+            let mut on_this_backend = 0;
             for codec in Codec::VIDEO {
                 let mut enc = match AvcodecEncoder::new(&settings, codec, backend, Input::Host { rgba: false }) {
                     Ok(enc) => enc,
@@ -1738,16 +1739,36 @@ mod tests {
                 let out = enc.encode_host(&bgra, N * 4, 0, 20, true).expect("encode");
                 let mut dec = AvDecoder::new(codec).expect("decoder");
                 assert!(dec.decode(&out[VIDEO_HEADER_LEN..]).unwrap_or(false), "{backend:?} {codec:?}");
-                let k = if declared_colorspace(codec) == ff::AVColorSpace::AVCOL_SPC_BT709 {
-                    chroma_siting::BT709
+                let declared = declared_colorspace(codec) == ff::AVColorSpace::AVCOL_SPC_BT709;
+                let (k, other, other_name) = if declared {
+                    (chroma_siting::BT709, chroma_siting::BT601, "BT.601")
                 } else {
-                    chroma_siting::BT601
+                    (chroma_siting::BT601, chroma_siting::BT709, "BT.709")
                 };
-                let worst = chroma_siting::chart_error(&dec.frame().expect("frame"), k);
-                println!("[chart] {backend:?} {codec:?}: worst |dRGB| {worst:.1}");
-                assert!(worst <= 12.0, "{backend:?} {codec:?} paints {worst:.1} off the chart");
+                let frame = dec.frame().expect("frame");
+                let worst = chroma_siting::chart_error(&frame, k);
+                // Inverting with the other matrix too, because a session that converts with one
+                // and declares the other is the failure this chart exists to catch, and the
+                // error under each names which half is wrong instead of only that one is.
+                let under_other = chroma_siting::chart_error(&frame, other);
+                println!(
+                    "[chart] {backend:?} {codec:?}: worst |dRGB| {worst:.1} against the declared matrix, \
+                     {under_other:.1} against {other_name}"
+                );
+                assert!(
+                    worst <= 12.0,
+                    "{backend:?} {codec:?} paints {worst:.1} off the chart against the matrix it \
+                     declares, and {under_other:.1} against {other_name}: {}",
+                    if under_other < worst {
+                        "it converted with that one and declared the other"
+                    } else {
+                        "neither matrix explains it"
+                    }
+                );
                 measured += 1;
+                on_this_backend += 1;
             }
+            println!("[chart] {backend:?}: {on_this_backend} of {} codecs measured", Codec::VIDEO.len());
         }
         assert!(measured > 0, "no session opened to measure");
     }
