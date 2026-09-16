@@ -1353,9 +1353,17 @@ impl AvcodecEncoder {
     }
 
     /// Push a frame through the filter graph and encode whatever comes out of the sink.
+    /// Feed the input frame through the convert and encode what comes out. The frame is
+    /// tagged as the full-range sRGB picture it is, BT.709 primaries and transfer, before it
+    /// goes in: `scale_vaapi` derives the input color standard from those tags alone (an RGB
+    /// surface's matrix is fixed), hands the driver none for an untagged frame, and Intel's
+    /// iHD then converts with BT.601 while the stream declares BT.709.
     unsafe fn encode_through_graph(&mut self, frame_number: u64, force_idr: bool) -> Result<Vec<u8>, String> {
         let session = self.hw.as_ref().unwrap();
         let (src, sink, filtered) = (session.buffersrc_ctx, session.buffersink_ctx, session.filtered_frame);
+        (*self.frame).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*self.frame).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        (*self.frame).color_range = ff::AVColorRange::AVCOL_RANGE_JPEG;
         if ff::av_buffersrc_add_frame(src, self.frame) < 0 {
             ff::av_frame_unref(self.frame);
             return Err("Failed to feed filter graph".into());
