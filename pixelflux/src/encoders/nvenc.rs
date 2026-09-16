@@ -3577,8 +3577,8 @@ mod gpu_tests {
     /// A frame a client lost is left out of the device's predictions: the next frame predicts
     /// from the newest frame before it and names it, a decoder that never saw the lost frames
     /// decodes it as one that saw everything does, the stream declares the decoded picture
-    /// buffer the level admits and an in-place resize redeclares it. An AV1 session, and a
-    /// device that cannot invalidate a reference, tracks none and says so. Ignored by default.
+    /// buffer the level admits and an in-place resize redeclares it. A device that cannot
+    /// invalidate a reference tracks none and says so. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_predicts_past_a_lost_frame() {
