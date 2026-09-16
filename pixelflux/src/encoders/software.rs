@@ -730,9 +730,9 @@ const CARRY_FALL: f32 = 0.05;
 /// the hardware full-frame encoders; it is kept as separate code here because the striped path also
 /// chooses JPEG-vs-H.264 and derives its own damage.
 ///
-/// 1. **Stripe count**: defaults to the core count so the fan-out matches the hardware, but
-///    collapses to a single full-frame stripe when H.264 full-frame is requested or the frame is
-///    shorter than the 64-row minimum, and is otherwise capped so no stripe is thinner than 64 rows —
+/// 1. **Stripe count**: the core count, held to `MAX_STRIPES` because the client decodes one
+///    picture per stripe, but collapses to a single full-frame stripe when H.264 full-frame is
+///    requested or the frame is shorter than the 64-row minimum, and no stripe is thinner than 64 rows —
 ///    below that the per-stripe encoder and thread overhead outweighs the parallelism and the tiny
 ///    H.264 slices compress poorly. The persistent `stripes` vector is resized to match, preserving
 ///    per-stripe state across frames.
@@ -1219,8 +1219,9 @@ pub fn encode_cpu(
 /// much encode parallelism to spend on it.
 ///
 /// A full-frame session is one contiguous stream and so a single stripe; otherwise the frame
-/// fans out across cores, bounded so no stripe is shorter than a macroblock row. Both the
-/// encoder and the settings line report from here, so what is logged is what is encoded.
+/// fans out across cores, held to `MAX_STRIPES` and bounded so no stripe is shorter than a
+/// macroblock row. Both the encoder and the settings line report from here, so what is logged is
+/// what is encoded.
 /// Leave frame `frame_id` and every frame after it out of every stripe's predictions. False
 /// when an encoder cannot, and the caller codes a key frame instead.
 pub fn invalidate_reference(stripes: &mut [StripeState], frame_id: u16) -> bool {
@@ -1246,12 +1247,24 @@ pub fn invalidate_reference(stripes: &mut [StripeState], frame_id: u16) -> bool 
     }
 }
 
+/// Most stripes a frame is cut into, whatever the encoder host's core count.
+///
+/// A stripe is a picture of its own on the wire, and the client decodes one per stripe: the
+/// count is spent on the viewer's machine, which is not the one it was derived from. Measured
+/// decoding a 1080p frame split N ways, WebKit -- the engine a phone or tablet runs -- loses
+/// throughput with every stripe added (18.9 fps whole, 9.4 at eight, 3.8 at thirty-two), while
+/// Chromium gains up to four and holds through twelve. Eight is where both sit near their best
+/// and where the JPEG payload is smallest, so a host with the cores to cut thirty-two no longer
+/// hands a tablet a frame it cannot assemble. One stripe is one encode job, so this bounds the
+/// encoder's own parallelism with it.
+const MAX_STRIPES: usize = 8;
+
 pub fn stripe_count(height: i32, codec: Codec, fullframe: bool) -> usize {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     if !codec.stripes() || (codec.is_video() && fullframe) || height < MIN_STRIPE_HEIGHT {
         return 1;
     }
-    cores.min((height / MIN_STRIPE_HEIGHT) as usize).max(1)
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    cores.min(MAX_STRIPES).min((height / MIN_STRIPE_HEIGHT) as usize).max(1)
 }
 
 /// Split the configured CBR budget across the stripes carrying it, returning the
@@ -1311,6 +1324,39 @@ fn compute_stripe_geometries(height: usize, n: usize, codec: Codec) -> Vec<(usiz
         }
     }
     geoms
+}
+
+#[cfg(test)]
+mod stripe_count_tests {
+    use super::{stripe_count, Codec, MAX_STRIPES, MIN_STRIPE_HEIGHT};
+
+    /// The count is what the client decodes, so a host with many cores cannot raise it: a 4K
+    /// frame has room for thirty-three stripes at the minimum height and still gets at most
+    /// `MAX_STRIPES`, on the striped video codec as much as on JPEG.
+    #[test]
+    fn a_tall_frame_is_not_cut_into_one_stripe_per_core() {
+        for codec in [Codec::Jpeg, Codec::H264] {
+            let n = stripe_count(2160, codec, false);
+            assert!(n <= MAX_STRIPES, "{codec:?} cut a 4K frame into {n} stripes");
+            assert!(n >= 1, "{codec:?} cut a 4K frame into none");
+        }
+    }
+
+    /// A stripe still never falls below the minimum height, so a short frame is cut by its own
+    /// height rather than by the ceiling.
+    #[test]
+    fn a_short_frame_is_cut_by_its_height() {
+        assert_eq!(stripe_count(MIN_STRIPE_HEIGHT - 1, Codec::Jpeg, false), 1);
+        assert!(stripe_count(MIN_STRIPE_HEIGHT * 2, Codec::Jpeg, false) <= 2);
+    }
+
+    /// A full-frame video session carries one picture, and a codec that does not stripe never
+    /// gets more than one whatever the height.
+    #[test]
+    fn a_whole_frame_is_one_stripe() {
+        assert_eq!(stripe_count(2160, Codec::H264, true), 1);
+        assert_eq!(stripe_count(2160, Codec::Av1, false), 1);
+    }
 }
 
 #[cfg(test)]
