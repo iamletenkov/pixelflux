@@ -70,7 +70,7 @@ every other codec streams whole frames. Every session that can name what a frame
 does (`encoders/reference.rs`, `StripeFrame.reference_frame_id`), and `invalidate_reference`
 leaves a frame a consumer lost out of the predictions so recovery costs no keyframe: NVENC where
 the device reports reference-picture invalidation, libx264 always, and the stream declares the
-decoded picture buffer the level admits. A session that cannot refuses, and the caller forces an
+decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that cannot refuses, and the caller forces an
 IDR instead. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (NVENC on the NVIDIA driver, VA-API otherwise, then the codec's software
 encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback. `encoders/nvenc.rs`

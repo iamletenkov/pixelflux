@@ -40,7 +40,7 @@ use super::codec::{
     av1_level, h264_dpb_frames, h264_level, h265_dpb_frames, h265_level, h265_tier, push_video_header,
     Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN,
 };
-use super::reference::{Invalidation, Reference, ReferenceWindow};
+use super::reference::{Invalidation, Reference, ReferenceWindow, REFERENCE_FRAMES};
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
@@ -1672,12 +1672,7 @@ impl NvencEncoder {
             }
 
             let is_444 = caps.fullcolor;
-            // An AV1 session leaves its reference structure to the driver instead of declaring
-            // maxNumRefFramesInDPB, so there is no window to mirror and no frame to name; the
-            // device's own invalidation, which NVENC offers for AV1 as for the other two, goes
-            // unused and a lost frame costs a key frame.
-            let invalidation = codec != Codec::Av1
-                && query_cap(
+            let invalidation = query_cap(
                     &function_list,
                     encoder_session,
                     codec_guid,
@@ -1756,7 +1751,7 @@ impl NvencEncoder {
             );
             let dpb = match codec {
                 Codec::H265 => h265_dpb_frames(level, width, height),
-                Codec::Av1 => 1,
+                Codec::Av1 => REFERENCE_FRAMES,
                 _ => h264_dpb_frames(level, width, height),
             };
             Self::configure_codec(&mut config, codec, is_444, level, dpb, &tuning);
@@ -2030,6 +2025,7 @@ impl NvencEncoder {
                     c.set_chromaFormatIDC(1);
                     c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
                     c.outputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.maxNumRefFramesInDPB = dpb;
                     c.set_repeatSeqHdr(1);
                     c.set_outputAnnexBFormat(0);
                     c.set_enableBitstreamPadding(0);
@@ -2093,7 +2089,7 @@ impl NvencEncoder {
         let level = self.level_for(width, height, fps);
         match self.codec {
             Codec::H265 => h265_dpb_frames(level, width, height),
-            Codec::Av1 => 1,
+            Codec::Av1 => REFERENCE_FRAMES,
             _ => h264_dpb_frames(level, width, height),
         }
     }
@@ -3586,7 +3582,7 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn gpu_predicts_past_a_lost_frame() {
-        use crate::encoders::reference::{Reference, REFERENCE_FRAMES};
+        use crate::encoders::reference::Reference;
         use crate::encoders::sps::h264_max_num_ref_frames;
         use crate::webcam::decode::{AvDecoder, Decoder as _};
         let (w, h) = (1280usize, 720usize);
