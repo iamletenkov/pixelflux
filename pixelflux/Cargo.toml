@@ -69,8 +69,22 @@ reis = "0.7"
 path = "nvcodec-sys"
 features = ["cuda"]
 
+[dependencies.gstreamer]
+version = "0.23"
+optional = true
+
+[dependencies.gstreamer-app]
+version = "0.23"
+optional = true
+
+[dependencies.gstreamer-video]
+version = "0.23"
+optional = true
+
 [features]
-default = ["gpl"]
+# Tegra (Jetson) hardware H.264 through the vendor GStreamer elements.
+tegra = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+default = ["gpl", "tegra"]
 ## GPL-licensed components: libx264 (GPL-2.0+) as the software H.264 encoder. Wins over
 ## `openh264` whenever both are enabled.
 gpl = ["dep:x264-sys"]

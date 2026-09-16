@@ -13,6 +13,10 @@
 pub mod avcodec;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
+/// Tegra hardware H.264 through the vendor GStreamer elements, the only path to the encoder
+/// of a Jetson: L4T carries no `libnvidia-encode` and publishes no render node driver.
+#[cfg(feature = "tegra")]
+pub mod tegra;
 /// NVIDIA NVENC hardware H.264 / HEVC / AV1 encoder loaded via runtime `libcuda` /
 /// `libnvidia-encode`.
 pub mod nvenc;
@@ -57,7 +61,7 @@ pub struct SoftwareEncoder {
 pub type HardwareEncoders = Vec<(Codec, &'static str)>;
 
 /// The hardware backend that serves each video codec on an encode node, as the name a
-/// session logs it in lower case (`"nvenc"` or `"vaapi"`), probed once per node and
+/// session logs it in lower case (`"nvenc"`, `"vaapi"` or `"tegra"`), probed once per node and
 /// remembered for the life of the process: the ladder picks the backend by the node's
 /// driver exactly as `select_frame_encoder` does, and that backend lists the codecs its
 /// device has an engine for (`nvenc::probe_codecs`, `avcodec::probe_codecs`). A node whose
@@ -71,6 +75,13 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     let mut probed = PROBED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     if let Some(served) = probed.get(&node) {
         return served.clone();
+    }
+    #[cfg(feature = "tegra")]
+    if tegra::available() {
+        let served: HardwareEncoders = vec![(Codec::H264, "tegra")];
+        println!("[pixelflux] Render node {node} encodes H.264 on tegra (nvv4l2h264enc).");
+        probed.insert(node, served.clone());
+        return served;
     }
     let driver = crate::get_gpu_driver(node);
     let (backend, codecs) = if crate::driver_selects_nvenc(&driver) {
@@ -253,6 +264,9 @@ mod tests {
 pub enum FrameEncoder {
     Nvenc(NvencEncoder),
     Avcodec(AvcodecEncoder),
+    /// Tegra's encoder, reachable only through the vendor GStreamer elements.
+    #[cfg(feature = "tegra")]
+    Tegra(tegra::TegraEncoder),
 }
 
 impl FrameEncoder {
@@ -261,6 +275,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.codec(),
             FrameEncoder::Avcodec(enc) => enc.codec(),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(enc) => enc.codec(),
         }
     }
 
@@ -269,6 +285,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(_) => true,
             FrameEncoder::Avcodec(enc) => enc.backend() == Backend::Vaapi,
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(_) => true,
         }
     }
 
@@ -278,6 +296,8 @@ impl FrameEncoder {
             FrameEncoder::Nvenc(_) => "NVENC",
             FrameEncoder::Avcodec(enc) if enc.backend() == Backend::Vaapi => "VAAPI",
             FrameEncoder::Avcodec(enc) => enc.library(),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(_) => "TEGRA",
         }
     }
 
@@ -286,6 +306,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.is_fullcolor(),
             FrameEncoder::Avcodec(enc) => enc.is_fullcolor(),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(enc) => enc.is_fullcolor(),
         }
     }
 
@@ -294,6 +316,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(_) => false,
             FrameEncoder::Avcodec(enc) => enc.is_full_range(),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(_) => false,
         }
     }
 
@@ -306,6 +330,8 @@ impl FrameEncoder {
                 Ok(())
             }
             FrameEncoder::Avcodec(enc) => enc.reconfigure_rate(settings),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(enc) => enc.reconfigure_rate(settings),
         }
     }
 
@@ -323,6 +349,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.encode_cpu_packed(pixels, stride, rgba, frame_number, qp, force_idr),
             FrameEncoder::Avcodec(enc) => enc.encode_host(pixels, stride, frame_number, qp, force_idr),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
         }
     }
 
@@ -331,6 +359,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_reference(),
             FrameEncoder::Avcodec(_) => reference::Reference::Untracked,
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(_) => reference::Reference::Untracked,
         }
     }
 
@@ -341,6 +371,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.invalidate_reference(frame_id),
             FrameEncoder::Avcodec(_) => false,
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(_) => false,
         }
     }
 
@@ -355,6 +387,8 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.encode(dmabuf, frame_number, qp, force_idr),
             FrameEncoder::Avcodec(enc) => enc.encode_dmabuf(dmabuf, frame_number, qp, force_idr),
+            #[cfg(feature = "tegra")]
+            FrameEncoder::Tegra(_) => Err("the Tegra session takes host frames".into()),
         }
     }
 }
@@ -391,6 +425,22 @@ pub fn select_frame_encoder(
         return None;
     }
     let software_forced = settings.use_cpu || settings.encode_node_index == -1;
+    #[cfg(feature = "tegra")]
+    if let (false, Codec::H264, FrameSource::Host { rgba }) = (software_forced, codec, source) {
+        // Tegra publishes no render node driver to probe and carries no libnvidia-encode, so the
+        // vendor elements are the only way to its encoder and this step comes before both.
+        if tegra::available() {
+            drop(prior);
+            match tegra::TegraEncoder::new(settings, rgba) {
+                Ok(enc) => {
+                    println!("[{tag}] Tegra H.264 encoder initialized (nvvidconv, nvv4l2h264enc).");
+                    return Some(FrameEncoder::Tegra(enc));
+                }
+                Err(e) => eprintln!("[{tag}] Failed to init the Tegra encoder: {e}"),
+            }
+            return None;
+        }
+    }
     if !software_forced {
         let node = settings.encode_node_index.max(0);
         let driver = crate::get_gpu_driver(node);
