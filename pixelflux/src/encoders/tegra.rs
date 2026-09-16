@@ -80,6 +80,19 @@ const NVBUF_COLOR_ABGR32: i32 = 17;
 const NVBUF_COLOR_XRGB32: i32 = 18;
 const NVBUF_COLOR_NV12: i32 = 5;
 const NVBUF_TAG_NONE: i32 = 0;
+// The same ideas in the newer API, with the numbers read off the shipped headers rather than
+// guessed (`nvbufsurface.h`, `nvbufsurftransform.h`, L4T R36.4.3).
+const NVBUF_MEM_SURFACE_ARRAY: i32 = 4;
+const NVBUF_SURF_COLOR_BGRX: i32 = 24;
+const NVBUF_SURF_COLOR_RGBA: i32 = 19;
+const NVBUF_SURF_COLOR_NV12: i32 = 6;
+const NVBUF_SURF_TAG_VIDEO_ENC: i32 = 4608;
+const NVBUF_SURF_TAG_NONE: i32 = 0;
+const NVBUF_SURF_MAP_READ_WRITE: c_uint = 2;
+const NVBUF_SURF_TRANSFORM_FILTER: u32 = 4;
+const NVBUF_SURF_INTER_DEFAULT: i32 = 6;
+const NVBUF_SURF_COMPUTE_VIC: i32 = 2;
+const NVBUF_SURF_TRANSFORM_SUCCESS: c_int = 0;
 const NVBUF_TAG_VIDEO_ENC: i32 = 4608;
 const NVBUF_TRANSFORM_FILTER: u32 = 4;
 const NVBUF_FILTER_SMART: u32 = 4;
@@ -202,6 +215,112 @@ struct NvBufferCreateParams {
     nvbuf_tag: i32,
 }
 
+/// `NvBufSurfaceCreateParams` (32 bytes). `isContiguous` is a C `bool`, hence the padding.
+#[repr(C)]
+#[derive(Default)]
+struct NvSurfCreateParams {
+    gpu_id: u32,
+    width: u32,
+    height: u32,
+    size: u32,
+    is_contiguous: u8,
+    _pad: [u8; 3],
+    color_format: i32,
+    layout: i32,
+    mem_type: i32,
+}
+
+/// `NvBufSurfaceAllocateParams` (80 bytes): the create params plus the allocation tag, which is
+/// what marks a surface as the video encoder's.
+#[repr(C)]
+struct NvSurfAllocateParams {
+    params: NvSurfCreateParams,
+    displayscanformat: i32,
+    chroma_subsampling: i32,
+    memtag: i32,
+    disable_pitch_padding: u8,
+    _pad0: [u8; 3],
+    reserved_param: u32,
+    _pad1: [u8; 4],
+    reserved: [*mut c_void; 3],
+}
+
+/// `NvBufSurface` (64 bytes). Only `surface_list` and `num_filled` are touched.
+#[repr(C)]
+struct NvSurf {
+    gpu_id: u32,
+    batch_size: u32,
+    num_filled: u32,
+    is_contiguous: u8,
+    _pad0: [u8; 3],
+    mem_type: i32,
+    _pad1: [u8; 4],
+    surface_list: *mut NvSurfParams,
+    reserved: [*mut c_void; 4],
+}
+
+/// `NvBufSurfaceParams` (384 bytes). Three fields are read: the pitch, the DMABUF descriptor the
+/// encoder is fed, and the mapped address of plane 0. The rest is laid out only so the offsets of
+/// those three land where the driver put them.
+#[repr(C)]
+struct NvSurfParams {
+    width: u32,
+    height: u32,
+    pitch: u32,
+    color_format: i32,
+    layout: i32,
+    _pad0: [u8; 4],
+    buffer_desc: u64,
+    data_size: u32,
+    _pad1: [u8; 4],
+    data_ptr: *mut c_void,
+    _plane_params: [u8; 232],
+    mapped_addr: [*mut c_void; 4],
+    _mapped_tail: [u8; 40],
+    paramex: *mut c_void,
+    _reserved: [*mut c_void; 3],
+}
+
+/// `NvBufSurfTransformParams` (32 bytes).
+#[repr(C)]
+struct NvSurfTransformParams {
+    transform_flag: u32,
+    transform_flip: i32,
+    transform_filter: i32,
+    _pad: [u8; 4],
+    src_rect: *mut c_void,
+    dst_rect: *mut c_void,
+}
+
+/// `NvBufSurfTransformConfigParams` (16 bytes): which engine converts. Left at the default the
+/// conversion ran somewhere that cost 4.9 ms a frame at 1080p on an Orin; pinned to the VIC it is
+/// the same 4.9 ms, and on the GPU 0.9 ms — but the GPU on a robot is busy with the work the
+/// robot exists for, so the VIC is what this asks for.
+#[repr(C)]
+struct NvSurfConfigParams {
+    compute_mode: i32,
+    gpu_id: i32,
+    cuda_stream: *mut c_void,
+}
+
+impl Default for NvSurfAllocateParams {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl Default for NvSurfTransformParams {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl Default for NvSurfConfigParams {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// The surface format that matches the host frame's byte order. Checked on hardware by encoding
 /// a frame of pure red and decoding it back: B,G,R,A bytes come out right as `XRGB32`, and the
 /// mirrored R,G,B,A order as `ABGR32`, whatever the names suggest.
@@ -220,6 +339,12 @@ fn abi_matches() -> Result<(), String> {
         ("v4l2_ext_control", size_of::<ExtControl>(), 20),
         ("v4l2_ext_controls", size_of::<ExtControls>(), 32),
         ("NvBufferCreateParams", size_of::<NvBufferCreateParams>(), 28),
+        ("NvBufSurfaceCreateParams", size_of::<NvSurfCreateParams>(), 32),
+        ("NvBufSurfaceAllocateParams", size_of::<NvSurfAllocateParams>(), 80),
+        ("NvBufSurface", size_of::<NvSurf>(), 64),
+        ("NvBufSurfaceParams", size_of::<NvSurfParams>(), 384),
+        ("NvBufSurfTransformParams", size_of::<NvSurfTransformParams>(), 32),
+        ("NvBufSurfTransformConfigParams", size_of::<NvSurfConfigParams>(), 16),
     ];
     for (name, got, want) in expected {
         if got != want {
@@ -237,23 +362,62 @@ type NvRaw2Buf = unsafe extern "C" fn(*const u8, c_uint, c_int, c_int, c_int) ->
 type NvTransform = unsafe extern "C" fn(c_int, c_int, *mut c_void) -> c_int;
 type NvSync = unsafe extern "C" fn(c_int, c_uint, *mut *mut c_void) -> c_int;
 type NvDestroy = unsafe extern "C" fn(c_int) -> c_int;
+type NvSurfAlloc = unsafe extern "C" fn(*mut *mut NvSurf, u32, *mut NvSurfAllocateParams) -> c_int;
+type NvSurfDestroy = unsafe extern "C" fn(*mut NvSurf) -> c_int;
+type NvSurfMap = unsafe extern "C" fn(*mut NvSurf, c_int, c_int, c_uint) -> c_int;
+type NvSurfUnMap = unsafe extern "C" fn(*mut NvSurf, c_int, c_int) -> c_int;
+type NvSurfSync = unsafe extern "C" fn(*mut NvSurf, c_int, c_int) -> c_int;
+type NvSurfTransform =
+    unsafe extern "C" fn(*mut NvSurf, *mut NvSurf, *mut NvSurfTransformParams) -> c_int;
+type NvSurfSetSession = unsafe extern "C" fn(*mut NvSurfConfigParams) -> c_int;
 
-pub struct Vendor {
-    _v4l2: Library,
-    _nvbuf: Library,
-    open: V4l2Open,
-    ioctl: V4l2Ioctl,
-    close: V4l2Close,
+/// The surface half of the vendor stack, which is where the two JetPack generations differ.
+///
+/// JetPack 4 ships `libnvbuf_utils.so`. JetPack 5 deprecated it in favour of `NvBufSurface`, and
+/// JetPack 6 removed it: on an AGX Orin at L4T R36.4.3 there is no `libnvbuf_utils.so` at all,
+/// only `libnvbufsurface.so` and `libnvbufsurftransform.so`. The encoder half is identical on
+/// both — the same `libnvv4l2.so` and the same ioctls — so only this part is chosen at load time.
+pub enum Surfaces {
+    /// `nvbuf_utils`, JetPack 4.
+    Utils(UtilsApi),
+    /// `NvBufSurface`, JetPack 5 and 6.
+    Surface(SurfaceApi),
+}
+
+pub struct UtilsApi {
+    _lib: Library,
     create: NvCreate,
     raw2buf: NvRaw2Buf,
     transform: NvTransform,
+    #[allow(dead_code)]
     sync: NvSync,
     destroy: NvDestroy,
 }
 
+pub struct SurfaceApi {
+    _surface: Library,
+    _transform: Library,
+    alloc: NvSurfAlloc,
+    destroy: NvSurfDestroy,
+    map: NvSurfMap,
+    unmap: NvSurfUnMap,
+    sync: NvSurfSync,
+    transform: NvSurfTransform,
+    set_session: NvSurfSetSession,
+}
+
+pub struct Vendor {
+    _v4l2: Library,
+    open: V4l2Open,
+    ioctl: V4l2Ioctl,
+    close: V4l2Close,
+    surfaces: Surfaces,
+}
+
 impl Vendor {
-    /// Load both vendor libraries, plain name first so the loader's own search applies, then the
-    /// L4T directory for images that do not put it on the default path.
+    /// Load the vendor libraries, plain name first so the loader's own search applies, then the
+    /// L4T directory for images that do not put it on the default path. The encoder library is
+    /// required; of the two surface libraries, whichever this JetPack carries is taken.
     unsafe fn load() -> Result<Self, String> {
         // Every call below is unsafe on its own terms (a `dlopen`, a symbol read, a transmute to
         // a function pointer), so they are written as unsafe operations rather than inherited
@@ -267,7 +431,6 @@ impl Vendor {
             .map_err(|e| format!("{name} is not loadable: {e}"))
         };
         let v4l2 = open_lib("libnvv4l2.so")?;
-        let nvbuf = open_lib("libnvbuf_utils.so")?;
         let sym = |lib: &Library, name: &[u8]| -> Result<*const c_void, String> {
             let s: Symbol<*const c_void> = unsafe { lib.get(name) }
                 .map_err(|e| format!("{} is missing: {e}", String::from_utf8_lossy(name)))?;
@@ -278,24 +441,61 @@ impl Vendor {
             sym(&v4l2, b"v4l2_ioctl\0")?,
             sym(&v4l2, b"v4l2_close\0")?,
         );
-        let (create, raw2buf, transform, sync, destroy) = (
-            sym(&nvbuf, b"NvBufferCreateEx\0")?,
-            sym(&nvbuf, b"Raw2NvBuffer\0")?,
-            sym(&nvbuf, b"NvBufferTransform\0")?,
-            sym(&nvbuf, b"NvBufferMemSyncForDevice\0")?,
-            sym(&nvbuf, b"NvBufferDestroy\0")?,
-        );
+        // The older library is tried first, because a JetPack 5 image can carry both and its
+        // `nvbuf_utils` is the one this backend has the most hours on.
+        let surfaces = match open_lib("libnvbuf_utils.so") {
+            Ok(nvbuf) => {
+                let (create, raw2buf, transform, sync, destroy) = (
+                    sym(&nvbuf, b"NvBufferCreateEx\0")?,
+                    sym(&nvbuf, b"Raw2NvBuffer\0")?,
+                    sym(&nvbuf, b"NvBufferTransform\0")?,
+                    sym(&nvbuf, b"NvBufferMemSyncForDevice\0")?,
+                    sym(&nvbuf, b"NvBufferDestroy\0")?,
+                );
+                Surfaces::Utils(UtilsApi {
+                    create: unsafe { std::mem::transmute(create) },
+                    raw2buf: unsafe { std::mem::transmute(raw2buf) },
+                    transform: unsafe { std::mem::transmute(transform) },
+                    sync: unsafe { std::mem::transmute(sync) },
+                    destroy: unsafe { std::mem::transmute(destroy) },
+                    _lib: nvbuf,
+                })
+            }
+            Err(utils_error) => {
+                let surface = open_lib("libnvbufsurface.so").map_err(|e| {
+                    format!("neither surface API is loadable: {utils_error}; {e}")
+                })?;
+                let xform = open_lib("libnvbufsurftransform.so")?;
+                let (alloc, destroy, map, unmap, sync) = (
+                    sym(&surface, b"NvBufSurfaceAllocate\0")?,
+                    sym(&surface, b"NvBufSurfaceDestroy\0")?,
+                    sym(&surface, b"NvBufSurfaceMap\0")?,
+                    sym(&surface, b"NvBufSurfaceUnMap\0")?,
+                    sym(&surface, b"NvBufSurfaceSyncForDevice\0")?,
+                );
+                let (transform, set_session) = (
+                    sym(&xform, b"NvBufSurfTransform\0")?,
+                    sym(&xform, b"NvBufSurfTransformSetSessionParams\0")?,
+                );
+                Surfaces::Surface(SurfaceApi {
+                    alloc: unsafe { std::mem::transmute(alloc) },
+                    destroy: unsafe { std::mem::transmute(destroy) },
+                    map: unsafe { std::mem::transmute(map) },
+                    unmap: unsafe { std::mem::transmute(unmap) },
+                    sync: unsafe { std::mem::transmute(sync) },
+                    transform: unsafe { std::mem::transmute(transform) },
+                    set_session: unsafe { std::mem::transmute(set_session) },
+                    _surface: surface,
+                    _transform: xform,
+                })
+            }
+        };
         Ok(Self {
             open: unsafe { std::mem::transmute(open) },
             ioctl: unsafe { std::mem::transmute(ioctl) },
             close: unsafe { std::mem::transmute(close) },
-            create: unsafe { std::mem::transmute(create) },
-            raw2buf: unsafe { std::mem::transmute(raw2buf) },
-            transform: unsafe { std::mem::transmute(transform) },
-            sync: unsafe { std::mem::transmute(sync) },
-            destroy: unsafe { std::mem::transmute(destroy) },
+            surfaces,
             _v4l2: v4l2,
-            _nvbuf: nvbuf,
         })
     }
 }
@@ -342,6 +542,14 @@ pub struct TegraEncoder {
     row_bytes: usize,
     staging_fd: c_int,
     nv12_fd: [c_int; OUTPUT_BUFFERS],
+    /// Filled on the `NvBufSurface` path only: that API takes surfaces where the older one takes
+    /// descriptors, and the DMABUF the encoder is fed is the surface's own `bufferDesc`. The
+    /// staging plane is mapped once for the life of the session, because there is no
+    /// `Raw2NvBuffer` to copy a host frame in.
+    staging_surf: *mut NvSurf,
+    nv12_surf: [*mut NvSurf; OUTPUT_BUFFERS],
+    staging_map: *mut u8,
+    staging_pitch: usize,
     capture: [(*mut c_void, usize); CAPTURE_BUFFERS],
     queued: usize,
     scratch: Vec<u8>,
@@ -383,6 +591,10 @@ impl TegraEncoder {
             row_bytes: width as usize * 4,
             staging_fd: -1,
             nv12_fd: [-1; OUTPUT_BUFFERS],
+            staging_surf: ptr::null_mut(),
+            nv12_surf: [ptr::null_mut(); OUTPUT_BUFFERS],
+            staging_map: ptr::null_mut(),
+            staging_pitch: 0,
             capture: [(ptr::null_mut(), 0); CAPTURE_BUFFERS],
             queued: 0,
             scratch: Vec::new(),
@@ -401,6 +613,180 @@ impl TegraEncoder {
             return Err(format!("{what} failed: {}", std::io::Error::last_os_error()));
         }
         Ok(())
+    }
+
+    /// Allocate the two kinds of surface this path needs: one pitch-linear surface in the host
+    /// frame's byte order, and one block-linear NV12 surface per queued encoder buffer.
+    ///
+    /// Both vendor APIs are asked for the same thing and both hand back a DMABUF descriptor —
+    /// `NvBufferCreateEx` directly, `NvBufSurfaceAllocate` as the surface's `bufferDesc`, which is
+    /// what the vendor's own C++ wrapper returns as its `fd`. On the newer API the staging plane
+    /// is also mapped here and kept mapped: it has no `Raw2NvBuffer`, so the rows are written by
+    /// this session.
+    fn allocate_surfaces(&mut self, rgba: bool) -> Result<(), String> {
+        match &self.vendor.surfaces {
+            Surfaces::Utils(api) => {
+                let mut staging = NvBufferCreateParams {
+                    width: self.width,
+                    height: self.height,
+                    payload_type: NVBUF_PAYLOAD_SURF_ARRAY,
+                    memsize: 0,
+                    layout: NVBUF_LAYOUT_PITCH,
+                    color_format: staging_format(rgba),
+                    nvbuf_tag: NVBUF_TAG_NONE,
+                };
+                if unsafe { (api.create)(&mut self.staging_fd, &staging) } < 0 {
+                    return Err("NvBufferCreateEx for the staging surface failed".into());
+                }
+                staging.layout = NVBUF_LAYOUT_BLOCK_LINEAR;
+                staging.color_format = NVBUF_COLOR_NV12;
+                staging.nvbuf_tag = NVBUF_TAG_VIDEO_ENC;
+                for slot in 0..OUTPUT_BUFFERS {
+                    if unsafe { (api.create)(&mut self.nv12_fd[slot], &staging) } < 0 {
+                        return Err("NvBufferCreateEx for an NV12 surface failed".into());
+                    }
+                }
+                Ok(())
+            }
+            Surfaces::Surface(api) => {
+                // The conversion is pinned to the VIC block. Left at the default it cost 4.9 ms a
+                // frame at 1080p on an AGX Orin; the same conversion on the GPU takes 0.9 ms, and
+                // that is not this session's GPU to spend.
+                let mut cfg = NvSurfConfigParams { compute_mode: NVBUF_SURF_COMPUTE_VIC, ..Default::default() };
+                if unsafe { (api.set_session)(&mut cfg) } != NVBUF_SURF_TRANSFORM_SUCCESS {
+                    eprintln!("[pixelflux] Tegra: the transform session would not take the VIC; using its default engine.");
+                }
+
+                let mut params = NvSurfAllocateParams::default();
+                params.params.width = self.width as u32;
+                params.params.height = self.height as u32;
+                params.params.layout = NVBUF_LAYOUT_PITCH;
+                params.params.color_format =
+                    if rgba { NVBUF_SURF_COLOR_RGBA } else { NVBUF_SURF_COLOR_BGRX };
+                params.params.mem_type = NVBUF_MEM_SURFACE_ARRAY;
+                params.memtag = NVBUF_SURF_TAG_NONE;
+                if unsafe { (api.alloc)(&mut self.staging_surf, 1, &mut params) } < 0
+                    || self.staging_surf.is_null()
+                {
+                    return Err("NvBufSurfaceAllocate for the staging surface failed".into());
+                }
+                // `numFilled` is what the transform reads to know the batch carries a frame.
+                let staging = unsafe { &mut *self.staging_surf };
+                staging.num_filled = 1;
+                let plane = unsafe { &*staging.surface_list };
+                self.staging_fd = plane.buffer_desc as c_int;
+                self.staging_pitch = plane.pitch as usize;
+                if self.staging_pitch < self.row_bytes || plane.height != self.height as u32 {
+                    return Err(format!(
+                        "staging surface reports pitch {} height {} for {}x{}",
+                        self.staging_pitch, plane.height, self.width, self.height
+                    ));
+                }
+                if unsafe { (api.map)(self.staging_surf, 0, 0, NVBUF_SURF_MAP_READ_WRITE) } < 0 {
+                    return Err("NvBufSurfaceMap of the staging surface failed".into());
+                }
+                let mapped = unsafe { (*staging.surface_list).mapped_addr[0] };
+                if mapped.is_null() {
+                    return Err("the staging surface mapped to a null address".into());
+                }
+                self.staging_map = mapped as *mut u8;
+
+                params.params.layout = NVBUF_LAYOUT_BLOCK_LINEAR;
+                params.params.color_format = NVBUF_SURF_COLOR_NV12;
+                params.memtag = NVBUF_SURF_TAG_VIDEO_ENC;
+                for slot in 0..OUTPUT_BUFFERS {
+                    if unsafe { (api.alloc)(&mut self.nv12_surf[slot], 1, &mut params) } < 0
+                        || self.nv12_surf[slot].is_null()
+                    {
+                        return Err("NvBufSurfaceAllocate for an NV12 surface failed".into());
+                    }
+                    let surf = unsafe { &mut *self.nv12_surf[slot] };
+                    surf.num_filled = 1;
+                    self.nv12_fd[slot] = unsafe { (*surf.surface_list).buffer_desc } as c_int;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Put one host frame into the staging surface.
+    fn fill_staging(&mut self, pixels: &[u8], stride: usize) -> Result<(), String> {
+        let height = self.height as usize;
+        match &self.vendor.surfaces {
+            Surfaces::Utils(api) => {
+                // Raw2NvBuffer takes tight rows, so a padded frame is packed once into scratch.
+                let source = if stride == self.row_bytes {
+                    pixels
+                } else {
+                    self.scratch.resize(self.row_bytes * height, 0);
+                    for row in 0..height {
+                        let from = row * stride;
+                        self.scratch[row * self.row_bytes..(row + 1) * self.row_bytes]
+                            .copy_from_slice(&pixels[from..from + self.row_bytes]);
+                    }
+                    &self.scratch
+                };
+                if unsafe {
+                    (api.raw2buf)(source.as_ptr(), 0, self.width, self.height, self.staging_fd)
+                } < 0
+                {
+                    return Err("Raw2NvBuffer failed".into());
+                }
+                Ok(())
+            }
+            Surfaces::Surface(api) => {
+                // The rows go straight to their place in the mapped plane, so a padded input
+                // costs nothing extra here, and the plane is synced for the device once.
+                for row in 0..height {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            pixels.as_ptr().add(row * stride),
+                            self.staging_map.add(row * self.staging_pitch),
+                            self.row_bytes,
+                        );
+                    }
+                }
+                if unsafe { (api.sync)(self.staging_surf, 0, 0) } < 0 {
+                    return Err("NvBufSurfaceSyncForDevice failed".into());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Convert the staging surface into the NV12 surface of one output slot, on the VIC.
+    fn convert_to_nv12(&mut self, slot: usize) -> Result<(), String> {
+        match &self.vendor.surfaces {
+            Surfaces::Utils(api) => {
+                let mut params = [0u8; 56];
+                params[0..4].copy_from_slice(&NVBUF_TRANSFORM_FILTER.to_ne_bytes());
+                params[8..12].copy_from_slice(&NVBUF_FILTER_SMART.to_ne_bytes());
+                if unsafe {
+                    (api.transform)(
+                        self.staging_fd,
+                        self.nv12_fd[slot],
+                        params.as_mut_ptr() as *mut c_void,
+                    )
+                } < 0
+                {
+                    return Err("NvBufferTransform failed".into());
+                }
+                Ok(())
+            }
+            Surfaces::Surface(api) => {
+                let mut params = NvSurfTransformParams {
+                    transform_flag: NVBUF_SURF_TRANSFORM_FILTER,
+                    transform_filter: NVBUF_SURF_INTER_DEFAULT,
+                    ..Default::default()
+                };
+                if unsafe { (api.transform)(self.staging_surf, self.nv12_surf[slot], &mut params) }
+                    != NVBUF_SURF_TRANSFORM_SUCCESS
+                {
+                    return Err("NvBufSurfTransform failed".into());
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Set one encoder control. `VIRTUALBUFFER_SIZE` is compound: the driver reads the value
@@ -479,26 +865,7 @@ impl TegraEncoder {
         };
         self.ioctl(VIDIOC_REQBUFS, &mut request, "REQBUFS output")?;
 
-        let mut staging = NvBufferCreateParams {
-            width: self.width,
-            height: self.height,
-            payload_type: NVBUF_PAYLOAD_SURF_ARRAY,
-            memsize: 0,
-            layout: NVBUF_LAYOUT_PITCH,
-            color_format: staging_format(rgba),
-            nvbuf_tag: NVBUF_TAG_NONE,
-        };
-        if unsafe { (self.vendor.create)(&mut self.staging_fd, &staging) } < 0 {
-            return Err("NvBufferCreateEx for the staging surface failed".into());
-        }
-        staging.layout = NVBUF_LAYOUT_BLOCK_LINEAR;
-        staging.color_format = NVBUF_COLOR_NV12;
-        staging.nvbuf_tag = NVBUF_TAG_VIDEO_ENC;
-        for slot in 0..OUTPUT_BUFFERS {
-            if unsafe { (self.vendor.create)(&mut self.nv12_fd[slot], &staging) } < 0 {
-                return Err("NvBufferCreateEx for an NV12 surface failed".into());
-            }
-        }
+        self.allocate_surfaces(rgba)?;
 
         let mut request = RequestBuffers {
             count: CAPTURE_BUFFERS as u32,
@@ -609,43 +976,14 @@ impl TegraEncoder {
         if stride < self.row_bytes || pixels.len() < needed {
             return Err("input buffer too small".into());
         }
-        // Raw2NvBuffer takes tight rows, so a padded frame is packed once into scratch.
-        let source = if stride == self.row_bytes {
-            pixels
-        } else {
-            self.scratch.resize(self.row_bytes * height, 0);
-            for row in 0..height {
-                let from = row * stride;
-                self.scratch[row * self.row_bytes..(row + 1) * self.row_bytes]
-                    .copy_from_slice(&pixels[from..from + self.row_bytes]);
-            }
-            &self.scratch
-        };
-        if unsafe {
-            (self.vendor.raw2buf)(source.as_ptr(), 0, self.width, self.height, self.staging_fd)
-        } < 0
-        {
-            return Err("Raw2NvBuffer failed".into());
-        }
+        self.fill_staging(pixels, stride)?;
 
         let slot = if self.queued < OUTPUT_BUFFERS {
             self.queued
         } else {
             self.reclaim_output()?
         };
-        let mut params = [0u8; 56];
-        params[0..4].copy_from_slice(&NVBUF_TRANSFORM_FILTER.to_ne_bytes());
-        params[8..12].copy_from_slice(&NVBUF_FILTER_SMART.to_ne_bytes());
-        if unsafe {
-            (self.vendor.transform)(
-                self.staging_fd,
-                self.nv12_fd[slot],
-                params.as_mut_ptr() as *mut c_void,
-            )
-        } < 0
-        {
-            return Err("NvBufferTransform failed".into());
-        }
+        self.convert_to_nv12(slot)?;
 
         if force_idr {
             self.set_control(CID_FORCE_IDR_FRAME, 1, "force IDR")?;
@@ -765,13 +1103,30 @@ impl Drop for TegraEncoder {
         }
         unsafe {
             (self.vendor.close)(self.fd);
-            for fd in self.nv12_fd {
-                if fd >= 0 {
-                    (self.vendor.destroy)(fd);
+            match &self.vendor.surfaces {
+                Surfaces::Utils(api) => {
+                    for fd in self.nv12_fd {
+                        if fd >= 0 {
+                            (api.destroy)(fd);
+                        }
+                    }
+                    if self.staging_fd >= 0 {
+                        (api.destroy)(self.staging_fd);
+                    }
                 }
-            }
-            if self.staging_fd >= 0 {
-                (self.vendor.destroy)(self.staging_fd);
+                Surfaces::Surface(api) => {
+                    if !self.staging_surf.is_null() {
+                        if !self.staging_map.is_null() {
+                            (api.unmap)(self.staging_surf, 0, 0);
+                        }
+                        (api.destroy)(self.staging_surf);
+                    }
+                    for surf in self.nv12_surf {
+                        if !surf.is_null() {
+                            (api.destroy)(surf);
+                        }
+                    }
+                }
             }
         }
     }
