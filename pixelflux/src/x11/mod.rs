@@ -28,16 +28,21 @@
 //! connection, so there is no shared X state to serialize here.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::protocol::damage::{ConnectionExt as DamageExt, Damage, ReportLevel};
 use x11rb::protocol::shm::ConnectionExt as ShmExt;
 use x11rb::protocol::xfixes::ConnectionExt as XfixesExt;
-use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, ImageFormat};
+use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, ImageFormat, Window};
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
+
+use crate::pace::{FramePace, TickTrigger};
 
 use crate::encoders::overlay::blend_pixel_premultiplied;
 use crate::encoders::software::{EncodedStripe, FrameTiming};
@@ -354,6 +359,95 @@ fn try_rebuild_channel(
 
 /// Grab one frame of the capture region into `surface` with a single XShm round-trip.
 ///
+/// The X server's report that the root window changed, which lets a capture publish a change as
+/// it lands instead of on the next tick. `None` where the server carries no DAMAGE extension,
+/// leaving the frame timer to pace the capture by itself.
+///
+/// Reporting is one notification per non-empty region: the server stays quiet until the region
+/// is subtracted, which is what [`Self::clear`] does to re-arm the next report.
+struct RootDamage {
+    id: Damage,
+}
+
+impl RootDamage {
+    fn create(conn: &RustConnection, root: Window) -> Option<Self> {
+        conn.damage_query_version(1, 1).ok()?.reply().ok()?;
+        let id = conn.generate_id().ok()?;
+        conn.damage_create(id, root, ReportLevel::NON_EMPTY).ok()?.check().ok()?;
+        Some(Self { id })
+    }
+
+    /// Whether the server has reported a change since the last [`Self::clear`].
+    fn reported(&self, conn: &RustConnection) -> bool {
+        let mut changed = false;
+        while let Ok(Some(event)) = conn.poll_for_event() {
+            changed |= matches!(event, Event::DamageNotify(_));
+        }
+        changed
+    }
+
+    /// Forget what has been reported and empty the region behind it, so the next report
+    /// describes a change from here on. Called before a grab, which leaves a change racing the
+    /// grab to wake the next frame instead of being cleared along with what the grab captured.
+    fn clear(&self, conn: &RustConnection) {
+        while matches!(conn.poll_for_event(), Ok(Some(_))) {}
+        let _ = conn.damage_subtract(self.id, x11rb::NONE, x11rb::NONE);
+        let _ = conn.flush();
+    }
+}
+
+/// Wait for the connection to carry something, for at most `timeout`.
+fn readable(conn: &RustConnection, timeout: Duration) -> bool {
+    let mut poll = libc::pollfd {
+        fd: conn.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let deadline = libc::timespec {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_nsec: timeout.subsec_nanos() as libc::c_long,
+    };
+    unsafe { libc::ppoll(&mut poll, 1, &deadline, std::ptr::null()) > 0 }
+}
+
+/// Block until the capture is due a frame and say what asked for it: a change the server
+/// reported, brought forward by as much as the pacing budget allows, or the frame timer.
+///
+/// Without DAMAGE the wait is the timer's alone, which is the cadence a capture keeps when
+/// nothing else can say the screen moved.
+fn wait_for_frame(
+    conn: &RustConnection,
+    damage: Option<&RootDamage>,
+    pace: &FramePace,
+    period: Duration,
+) -> TickTrigger {
+    let now = Instant::now();
+    let due = pace.next_due(period, now);
+    let sleep_until = |t: Instant| {
+        if let Some(wait) = t.checked_duration_since(Instant::now()) {
+            thread::sleep(wait);
+        }
+    };
+    let Some(damage) = damage else {
+        sleep_until(due);
+        return TickTrigger::Timer;
+    };
+    // Nothing may be published before the budget allows it, so the report of a change that
+    // lands earlier is left queued until then rather than read and cleared.
+    sleep_until(pace.pull_at(period, now).min(due));
+    loop {
+        if damage.reported(conn) {
+            return TickTrigger::Damage;
+        }
+        let Some(wait) = due.checked_duration_since(Instant::now()) else {
+            return TickTrigger::Timer;
+        };
+        if !readable(conn, wait) {
+            return TickTrigger::Timer;
+        }
+    }
+}
+
 /// One `shm_get_image` request is atomic — the server never interleaves another client
 /// inside it — so the grab is a coherent snapshot of whatever the screen held at that
 /// instant. Every grabbed frame is published; whether any of it changed is decided
@@ -822,8 +916,11 @@ where
 /// 2. **Encode thread**: spawned with a raised scheduling priority; it reports its thread id back
 ///    through `encode_tid_tx` so the caller can detect a re-entrant stop issued from inside the
 ///    delivery callback.
-/// 3. **Capture loop** (until `stop`): fps is re-read each iteration for live pacing — sleep to the
-///    next frame deadline, or `yield_now` when already behind instead of busy-spinning.
+/// 3. **Capture loop** (until `stop`): fps is re-read each iteration for live pacing. The wait
+///    runs to the frame deadline, but a region the X server reports damaged ends it early once
+///    the shared pacing budget allows (`crate::pace`), so a screen that changes mid-period is
+///    published then rather than on the next tick. A server without DAMAGE keeps the deadline
+///    alone.
 ///    - **Live region change** (`region_dirty`): re-target the grab origin immediately (an x/y pan
 ///      needs no surface work); a size change reuses the drain/recreate path below.
 ///    - **Auto-adjust**: on a root geometry change, drain in-flight frames then recreate the surfaces
@@ -865,6 +962,7 @@ where
         .map_err(|e| format!("xfixes_query_version: {e}"))?
         .reply()
         .map_err(|e| format!("XFixes unavailable: {e}"))?;
+    let mut damage = RootDamage::create(&conn, root);
 
     let geo = conn
         .get_geometry(root)
@@ -923,7 +1021,7 @@ where
         }
     });
 
-    let mut next_frame = Instant::now();
+    let mut pace = FramePace::default();
     // Frames between root-geometry polls (auto-adjust); ~0.5s at 60fps.
     const GEOMETRY_POLL_FRAMES: i32 = 30;
     let mut geometry_check = 0i32;
@@ -933,17 +1031,11 @@ where
         while !controls.stop.load(Ordering::Relaxed) {
             let fps = (controls.fps_milli.load(Ordering::Relaxed).max(1) as f64) / 1000.0;
             let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1.0));
-            let now = Instant::now();
-            if now < next_frame {
-                std::thread::sleep(next_frame - now);
-            } else {
-                std::thread::yield_now();
+            if pace.next_due(frame_dur, Instant::now()) <= Instant::now() {
+                thread::yield_now();
             }
-            next_frame += frame_dur;
-            let now = Instant::now();
-            if next_frame < now {
-                next_frame = now;
-            }
+            let trigger = wait_for_frame(&conn, damage.as_ref(), &pace, frame_dur);
+            pace.ticked(trigger, frame_dur, Instant::now(), false);
             if controls.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1035,6 +1127,9 @@ where
                 Some(i) => i,
                 None => break,
             };
+            if let Some(d) = damage.as_ref() {
+                d.clear(&conn);
+            }
             let grab_result = {
                 let surface = &mut surfaces[idx];
                 grab_frame(&conn, root, surface, cap_x, cap_y, cap_w, cap_h)
@@ -1065,7 +1160,12 @@ where
                             &mut root_w, &mut root_h,
                             POOL_N, &pool, &mut surfaces, &controls.stop,
                         ) {
-                            Ok(()) => { recovered = true; break; }
+                            Ok(()) => {
+                                // The reported region belonged to the server that went away.
+                                damage = RootDamage::create(&conn, root);
+                                recovered = true;
+                                break;
+                            }
                             Err(re) => {
                                 eprintln!("[pixelflux x11] reconnect attempt failed: {re}");
                             }
@@ -1394,5 +1494,59 @@ mod cursor_tests {
         overlay_cursor(&mut frame, stride, 4, 4, 2, 2, &pixels, ox, oy);
         assert_eq!(frame[0], 255);
         assert!(frame[4..].iter().all(|&b| b == 0), "no writes outside (0,0)");
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    //! Needs an X server of its own, quiet enough that nothing else repaints it:
+    //! `DISPLAY=:N cargo test x11_damage -- --ignored --nocapture`.
+
+    use super::*;
+    use x11rb::protocol::xproto::{CreateGCAux, Rectangle};
+
+    const PERIOD: Duration = Duration::from_millis(400);
+
+    fn repaint(color: u32) {
+        let (conn, screen) = x11rb::connect(None).expect("connect");
+        let root = conn.setup().roots[screen].root;
+        let gc = conn.generate_id().expect("id");
+        conn.create_gc(gc, root, &CreateGCAux::new().foreground(color)).expect("gc");
+        conn.poly_fill_rectangle(root, gc, &[Rectangle { x: 0, y: 0, width: 64, height: 64 }])
+            .expect("fill");
+        conn.flush().expect("flush");
+    }
+
+    /// A screen that changes mid-period publishes the change then, while a screen that does not
+    /// keeps the cadence: the latency of a change is its own, not the frame rate's.
+    #[test]
+    #[ignore]
+    fn x11_damage_publishes_a_change_before_the_next_tick() {
+        let (conn, screen) = x11rb::connect(None).expect("connect");
+        let root = conn.setup().roots[screen].root;
+        let damage = RootDamage::create(&conn, root).expect("the server carries DAMAGE");
+        let mut pace = FramePace::default();
+
+        pace.ticked(TickTrigger::Timer, PERIOD, Instant::now(), false);
+        damage.clear(&conn);
+        let start = Instant::now();
+        let quiet = wait_for_frame(&conn, Some(&damage), &pace, PERIOD);
+        let waited = start.elapsed();
+        assert_eq!(quiet, TickTrigger::Timer, "a quiet screen is the timer's to pace");
+        assert!(waited >= PERIOD.mul_f64(0.9), "the timer's own tick came after {waited:?}");
+
+        pace.ticked(TickTrigger::Timer, PERIOD, Instant::now(), false);
+        damage.clear(&conn);
+        let painter = thread::spawn(|| {
+            thread::sleep(PERIOD.mul_f64(0.6));
+            repaint(0x0020_4060);
+        });
+        let start = Instant::now();
+        let pulled = wait_for_frame(&conn, Some(&damage), &pace, PERIOD);
+        let waited = start.elapsed();
+        painter.join().expect("painter");
+        assert_eq!(pulled, TickTrigger::Damage, "the repaint is what asked for the frame");
+        assert!(waited < PERIOD.mul_f64(0.9), "the repaint was published after {waited:?}");
+        println!("repaint at 0.6 of a period published after {:.0}ms", waited.as_secs_f64() * 1000.0);
     }
 }

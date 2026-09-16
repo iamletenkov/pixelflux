@@ -148,6 +148,9 @@ pub mod recorder;
 pub mod computer_use;
 /// Kernel uinput devices, the first rung of host-capture input injection.
 pub mod uinput;
+/// When a capture is due a frame, shared by the X11 and Wayland backends.
+pub mod pace;
+
 /// Frame-processing policy shared by the X11 and Wayland backends.
 pub mod pipeline;
 /// Run-time libpipewire binding and SPA pod encoding shared by the webcam sink and host capture.
@@ -199,7 +202,8 @@ use encoders::{Codec, FrameEncoder, FrameSource};
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 
 use wayland::cursor::{Cursor, CursorJob};
-use wayland::frontend::{AppState, ClientState, FocusTarget, FramePace, TickTrigger, next_serial, wayland_time, wayland_utime};
+use pace::{FramePace, TickTrigger};
+use wayland::frontend::{AppState, ClientState, FocusTarget, next_serial, wayland_time, wayland_utime};
 
 smithay::backend::renderer::element::render_elements! {
     pub CompositionElements<R, E> where R: ImportAll + ImportMem;

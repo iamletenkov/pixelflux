@@ -140,8 +140,13 @@ registered with NVENC in place, which is zero-copy and the lower-latency path, a
 XShm path otherwise. NvFBC is declined -- with one line saying why -- for a codec NVENC has no
 engine for, software encoding, a non-NVIDIA encode node, a watermark, or a driver without it.
 There is no setting either way: the driver's own answer decides, and a host without NvFBC pays
-about 7 ms once per capture start to find that out. The NvFBC structures are hand-written FFI checked
-against the SDK by the layout and version assertions in that module, and `libnvidia-fbc.so.1` is
+about 7 ms once per capture start to find that out.
+Both backends publish a change as it lands rather than on the next tick: NvFBC because the
+driver generates a frame on damage and the grab waits for it, XShm because the X server's
+DAMAGE reports end the wait early. How far either may come early is the frame pacing the
+Wayland backend also keeps (`pace.rs`), so the rate stays the configured one. The NvFBC
+structures are hand-written FFI checked against the SDK by the layout and version assertions
+in that module, and `libnvidia-fbc.so.1` is
 loaded at run time like NVENC's library. The hardware checks are `#[ignore]`d
 (`cargo test gpu_nvfbc -- --ignored --nocapture --test-threads=1` with `DISPLAY` on an NVIDIA X
 server). They capture and paint the root of whatever `DISPLAY` names, so on a host where that is a
