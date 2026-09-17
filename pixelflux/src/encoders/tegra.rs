@@ -52,6 +52,7 @@ const VIDIOC_EXPBUF: u64 = 0xc040_5610;
 const VIDIOC_DQBUF: u64 = 0xc058_5611;
 const VIDIOC_STREAMON: u64 = 0x4004_5612;
 const VIDIOC_STREAMOFF: u64 = 0x4004_5613;
+const VIDIOC_S_PARM: u64 = 0xc0cc_5616;
 const VIDIOC_S_EXT_CTRLS: u64 = 0xc020_5648;
 
 const CID_BITRATE: u32 = 0x0099_09cf;
@@ -171,6 +172,25 @@ struct Buffer {
     reserved2: u32,
     reserved: u32,
     _tail: u32,
+}
+
+/// `v4l2_streamparm` (204 bytes). Only the output plane's `timeperframe` is written; the rest is
+/// laid out so that field lands where the driver reads it.
+#[repr(C)]
+struct StreamParm {
+    type_: u32,
+    capability: u32,
+    output_mode: u32,
+    numerator: u32,
+    denominator: u32,
+    _tail: [u8; 184],
+}
+
+/// Zeroed by hand: the tail is longer than the arrays `Default` is implemented for.
+impl Default for StreamParm {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 #[repr(C)]
@@ -334,6 +354,7 @@ fn abi_matches() -> Result<(), String> {
         ("v4l2_buffer", size_of::<Buffer>(), 88),
         ("v4l2_plane", size_of::<Plane>(), 64),
         ("v4l2_exportbuffer", size_of::<ExportBuffer>(), 64),
+        ("v4l2_streamparm", size_of::<StreamParm>(), 204),
         ("v4l2_ext_control", size_of::<ExtControl>(), 20),
         ("v4l2_ext_controls", size_of::<ExtControls>(), 32),
         ("NvBufferCreateParams", size_of::<NvBufferCreateParams>(), 28),
@@ -581,6 +602,7 @@ pub struct TegraEncoder {
     scratch: Vec<u8>,
     omit_headers: bool,
     bitrate_bps: u32,
+    fps: f64,
 }
 
 impl TegraEncoder {
@@ -631,6 +653,7 @@ impl TegraEncoder {
             scratch: Vec::new(),
             omit_headers: settings.omit_stripe_headers,
             bitrate_bps,
+            fps,
         };
         if let Err(e) = me.setup(settings, fps, bitrate_bps, rgba) {
             return Err(format!("{opened}: {e}"));
@@ -836,6 +859,24 @@ impl TegraEncoder {
         }
     }
 
+    /// Tell the encoder the frame rate it encodes at.
+    ///
+    /// Without it the driver rate-controls against its own default rate, so every number derived
+    /// from the real one — the CBR bit budget above all — is spent against the wrong rate.
+    /// `timeperframe` is a period, hence `1000 / (fps * 1000)`, which keeps a fractional rate
+    /// like 29.97 exact instead of rounding it into the denominator.
+    fn set_frame_rate(&mut self, fps: f64) -> Result<(), String> {
+        let mut parm = StreamParm {
+            type_: V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            numerator: 1000,
+            denominator: (fps.max(1.0) * 1000.0).round() as u32,
+            ..Default::default()
+        };
+        self.ioctl(VIDIOC_S_PARM, &mut parm, "S_PARM output")?;
+        self.fps = fps;
+        Ok(())
+    }
+
     /// Set one encoder control. `VIRTUALBUFFER_SIZE` is compound: the driver reads the value
     /// through a pointer in the same union, and passing it inline makes it read whatever address
     /// the number happens to name, which silently wrecks the rest of the configuration.
@@ -887,6 +928,7 @@ impl TegraEncoder {
         let mut output_format =
             self.format(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_PIX_FMT_NV12M, 2, 0);
         self.ioctl(VIDIOC_S_FMT, &mut output_format, "S_FMT output")?;
+        self.set_frame_rate(fps)?;
 
         // No infinite GOP here either: a session that asks for none gets ten seconds, long enough
         // not to spend bitrate on key frames and short enough to bound recovery when one is lost.
@@ -1000,6 +1042,12 @@ impl TegraEncoder {
     /// the same change through the vendor GStreamer element, which the driver accepts and ignores.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
         let wanted = (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000);
+        let fps = settings.target_fps.max(1.0);
+        // A changed frame rate goes to the driver too: leaving it behind would budget the new
+        // bitrate against the old rate.
+        if (fps - self.fps).abs() > 0.01 {
+            self.set_frame_rate(fps)?;
+        }
         if wanted == self.bitrate_bps {
             return Ok(());
         }
