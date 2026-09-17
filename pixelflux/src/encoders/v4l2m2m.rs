@@ -454,7 +454,8 @@ fn known_conversion(driver: &str) -> Option<ColorSignal> {
 
 /// What the session has learned about the colour its device produces.
 enum Color {
-    /// No access unit has come back yet.
+    /// No access unit has come back yet, and nothing is on record for this device either, so
+    /// what the stream will say is not known until one arrives.
     Unknown,
     /// The device declares its own colour, whatever it is, and the stream is left alone.
     Declared(ColorSignal),
@@ -497,6 +498,8 @@ pub struct V4l2M2mEncoder {
     /// A sequence parameter set arrives with every key frame and is identical each time, so it is
     /// written once and matched by bytes after that.
     written_sps: Option<(Vec<u8>, Vec<u8>)>,
+    /// Whether the first access unit has settled what the stream says.
+    decided: bool,
 }
 
 unsafe impl Send for V4l2M2mEncoder {}
@@ -531,9 +534,16 @@ impl V4l2M2mEncoder {
             bitrate_bps: (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000),
             fps: settings.target_fps.max(1.0),
             omit_headers: settings.omit_stripe_headers,
-            color: Color::Unknown,
+            // A device on record is described from the start rather than from its first access
+            // unit: the session line is printed before a frame exists, and a line saying limited
+            // range while the stream will say full is a line that misleads whoever reads it.
+            color: match known_conversion(&info.driver) {
+                Some(signal) => Color::Writing(signal),
+                None => Color::Unknown,
+            },
             fallback: known_conversion(&info.driver),
             written_sps: None,
+            decided: false,
         };
         match encoder.setup(settings, rgba) {
             Ok(()) => Ok(encoder),
@@ -751,7 +761,8 @@ impl V4l2M2mEncoder {
         if sets.is_empty() {
             return None;
         }
-        if matches!(self.color, Color::Unknown) {
+        if !self.decided {
+            self.decided = true;
             let (start, end) = sets[0];
             self.color = match sps::read_color(&unit[start..end]) {
                 Some(signal) => {
