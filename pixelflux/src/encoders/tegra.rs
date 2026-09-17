@@ -345,6 +345,14 @@ fn staging_format(rgba: bool) -> i32 {
     if rgba { NVBUF_COLOR_ABGR32 } else { NVBUF_COLOR_XRGB32 }
 }
 
+/// What a caller reads off a surface's first plane: the DMABUF the encoder is fed, and the
+/// pitch and height to check the allocation against what was asked for.
+struct SurfacePlane {
+    desc: u64,
+    pitch: usize,
+    height: u32,
+}
+
 /// The sizes this interface is laid out for — the V4L2 half as the ioctl numbers above encode
 /// them, the vendor half as its headers declare — against what this build lays out.
 fn abi_matches() -> Result<(), String> {
@@ -676,23 +684,30 @@ impl TegraEncoder {
         api: &SurfaceApi,
         params: &mut NvSurfAllocateParams,
         what: &str,
-    ) -> Result<(*mut NvSurf, *mut NvSurfParams), String> {
+    ) -> Result<(*mut NvSurf, SurfacePlane), String> {
         let mut surf: *mut NvSurf = ptr::null_mut();
         if unsafe { (api.alloc)(&mut surf, 1, params) } < 0 {
             return Err(format!("NvBufSurfaceAllocate for {what} failed"));
         }
-        if surf.is_null() {
+        let Some(batch) = (unsafe { surf.as_mut() }) else {
             return Err(format!("NvBufSurfaceAllocate for {what} returned no surface"));
-        }
+        };
         // `numFilled` is what the transform reads to know the batch carries a frame.
-        let batch = unsafe { &mut *surf };
         batch.num_filled = 1;
-        let plane = batch.surface_list;
-        if plane.is_null() {
+        let Some(plane) = (unsafe { batch.surface_list.as_ref() }) else {
             unsafe { (api.destroy)(surf) };
             return Err(format!("{what} came back carrying no plane"));
-        }
-        Ok((surf, plane))
+        };
+        Ok((surf, SurfacePlane { desc: plane.buffer_desc, pitch: plane.pitch as usize, height: plane.height }))
+    }
+
+    /// Where the staging plane is mapped, or `None` if the batch, its plane or the mapping is
+    /// absent. Read after `NvBufSurfaceMap`, which is what fills it in.
+    fn mapped_plane(surf: *mut NvSurf) -> Option<*mut c_void> {
+        let batch = unsafe { surf.as_ref() }?;
+        let plane = unsafe { batch.surface_list.as_ref() }?;
+        let mapped = plane.mapped_addr[0];
+        (!mapped.is_null()).then_some(mapped)
     }
 
     /// Allocate the two kinds of surface this path needs: one pitch-linear surface in the host
@@ -747,23 +762,19 @@ impl TegraEncoder {
                 params.memtag = NVBUF_SURF_TAG_NONE;
                 let (surf, plane) = Self::allocate_surface(api, &mut params, "the staging surface")?;
                 self.staging_surf = surf;
-                let (desc, pitch, height) =
-                    unsafe { ((*plane).buffer_desc, (*plane).pitch as usize, (*plane).height) };
-                self.staging_fd = desc as c_int;
-                self.staging_pitch = pitch;
-                if pitch < self.row_bytes || height != self.height as u32 {
+                self.staging_fd = plane.desc as c_int;
+                self.staging_pitch = plane.pitch;
+                if plane.pitch < self.row_bytes || plane.height != self.height as u32 {
                     return Err(format!(
-                        "staging surface reports pitch {pitch} height {height} for {}x{}",
-                        self.width, self.height
+                        "staging surface reports pitch {} height {} for {}x{}",
+                        plane.pitch, plane.height, self.width, self.height
                     ));
                 }
                 if unsafe { (api.map)(surf, 0, 0, NVBUF_SURF_MAP_READ_WRITE) } < 0 {
                     return Err("NvBufSurfaceMap of the staging surface failed".into());
                 }
-                let mapped = unsafe { (*plane).mapped_addr[0] };
-                if mapped.is_null() {
-                    return Err("the staging surface mapped to a null address".into());
-                }
+                let mapped = Self::mapped_plane(surf)
+                    .ok_or("the staging surface mapped to a null address")?;
                 self.staging_map = mapped as *mut u8;
 
                 params.params.layout = NVBUF_LAYOUT_BLOCK_LINEAR;
@@ -772,7 +783,7 @@ impl TegraEncoder {
                 for slot in 0..OUTPUT_BUFFERS {
                     let (surf, plane) = Self::allocate_surface(api, &mut params, "an NV12 surface")?;
                     self.nv12_surf[slot] = surf;
-                    self.nv12_fd[slot] = unsafe { (*plane).buffer_desc } as c_int;
+                    self.nv12_fd[slot] = plane.desc as c_int;
                 }
                 Ok(())
             }
