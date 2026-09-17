@@ -669,7 +669,7 @@ fn nvidia_driven_x_server() -> Result<bool, String> {
 
 /// Why the NvFBC path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
-    println!("[x11] GPU capture (NvFBC) unavailable: {reason}. Capturing through XShm.");
+    println!("[X11] Zero-copy capture (NvFBC) unavailable: {reason}.");
     None
 }
 
@@ -756,9 +756,10 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         return declined(&format!("NVENC could not follow the captured size: {e}"));
     }
     println!(
-        "[x11] GPU capture (NvFBC) active: {}x{} composited into video memory and encoded in place.",
+        "[X11] Zero-copy capture (NvFBC): {}x{} composited into video memory, encoded in place on NVENC.",
         settings.width, settings.height
     );
+    crate::log_stream_settings_of("X11", &settings, 1, Some(("NVENC", true)), encoder.is_fullcolor());
     Some(GpuCapture { nvfbc, encoder, settings, request, screen })
 }
 
@@ -911,10 +912,10 @@ where
                 }
                 let (region, size) = resolve_region(gpu.screen, &gpu.request);
                 let rebuilt = if recovery == Recovery::Handle {
-                    eprintln!("[x11] NvFBC lost the X server ({e}); rebuilding the client handle.");
+                    eprintln!("[X11] NvFBC lost the X server ({e}); rebuilding the client handle.");
                     rebuild_handle(&mut gpu, region, size, want_cursor)
                 } else {
-                    eprintln!("[x11] NvFBC grab failed ({e}); rebuilding the capture session.");
+                    eprintln!("[X11] NvFBC grab failed ({e}); rebuilding the capture session.");
                     restart_session(&mut gpu, region, size, want_cursor).map_err(|e| e.to_string())
                 };
                 if let Err(e) = rebuilt {
@@ -989,7 +990,7 @@ where
                     // Its own count: a grab that keeps succeeding must not clear it.
                     encode_errors += 1;
                     if encode_errors % crate::HW_ERROR_RECOVERY_THRESHOLD == 1 {
-                        eprintln!("[x11] NVENC encode error on the zero-copy path: {e}");
+                        eprintln!("[X11] NVENC encode error on the zero-copy path: {e}");
                     }
                     if encode_errors >= crate::HW_ERROR_RECOVERY_THRESHOLD {
                         return Some(Err("NVENC failed repeatedly on the zero-copy path".to_string()));
@@ -1004,16 +1005,14 @@ where
 
         let elapsed = last_log.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
-            if gpu.settings.debug_logging {
-                println!(
-                    "[x11] NvFBC {}x{} Encoder: NVENC EncFPS: {:.2} NewFrames/s: {:.2} Direct: {}",
-                    gpu.settings.width,
-                    gpu.settings.height,
-                    sent_frames as f64 / elapsed,
-                    new_frames as f64 / elapsed,
-                    direct_frames > 0
-                );
-            }
+            crate::log::debug!(
+                "[X11] NvFBC {}x{} Encoder: NVENC EncFPS: {:.2} NewFrames/s: {:.2} Direct: {}",
+                gpu.settings.width,
+                gpu.settings.height,
+                sent_frames as f64 / elapsed,
+                new_frames as f64 / elapsed,
+                direct_frames > 0
+            );
             sent_frames = 0;
             new_frames = 0;
             direct_frames = 0;

@@ -97,7 +97,7 @@ pub fn acquire(size_cap: i32) {
                 monitor_thread(tstop, twin);
             }) {
             Ok(join) => slot.monitor = Some(Monitor { stop, wake_win, done_rx, join }),
-            Err(e) => eprintln!("[x11] cursor monitor spawn failed: {e}"),
+            Err(e) => eprintln!("[X11] cursor monitor spawn failed: {e}"),
         }
     }
 }
@@ -130,7 +130,7 @@ pub fn release(py: Python<'_>) {
             wake(&m.wake_win);
             match m.done_rx.recv_timeout(std::time::Duration::from_secs(2)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    eprintln!("[x11] cursor monitor did not stop in time; detaching");
+                    eprintln!("[X11] cursor monitor did not stop in time; detaching");
                 }
                 _ => {
                     let _ = m.join.join();
@@ -191,7 +191,7 @@ fn wake(wake_win: &AtomicU32) {
             Err(e) => last_err = format!("send_event: {e}"),
         }
     }
-    eprintln!("[x11] cursor monitor wake failed: {last_err}");
+    eprintln!("[X11] cursor monitor wake failed: {last_err}");
 }
 
 /// The last payload handed to Python, retained so a replay (late callback registration)
@@ -203,13 +203,13 @@ fn monitor_thread(stop: Arc<AtomicBool>, wake_win: Arc<AtomicU32>) {
     let (conn, screen_num) = match x11rb::connect(None) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[x11] cursor monitor: connect failed: {e}");
+            eprintln!("[X11] cursor monitor: connect failed: {e}");
             return;
         }
     };
     let root = conn.setup().roots[screen_num].root;
     if let Err(e) = setup(&conn, root, &wake_win) {
-        eprintln!("[x11] cursor monitor unavailable: {e}");
+        eprintln!("[X11] cursor monitor unavailable: {e}");
         return;
     }
     if stop.load(Ordering::SeqCst) {
@@ -233,7 +233,7 @@ fn monitor_thread(stop: Arc<AtomicBool>, wake_win: Arc<AtomicU32>) {
         let event = match conn.wait_for_event() {
             Ok(ev) => ev,
             Err(e) => {
-                eprintln!("[x11] cursor monitor: connection lost: {e}");
+                eprintln!("[X11] cursor monitor: connection lost: {e}");
                 return;
             }
         };

@@ -137,6 +137,8 @@ use smithay::{
 
 /// Encoder backends and the codec identities, wire framing and rate-control policy they share.
 pub mod encoders;
+/// The debug switch behind every backend's tagged line.
+pub mod log;
 
 /// Headless Wayland compositor and cursor rendering.
 pub mod wayland;
@@ -514,7 +516,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
         watermark_location_enum: settings.getattr("watermark_location_enum")?.extract()?,
         encode_node_index: settings.getattr("encode_node_index")?.extract()?,
         use_cpu: settings.getattr("use_cpu")?.extract()?,
-        debug_logging: settings.getattr("debug_logging")?.extract()?,
+        debug_logging: {
+            let on: bool = settings.getattr("debug_logging")?.extract()?;
+            crate::log::set_debug(on);
+            on
+        },
         auto_adjust_screen_capture_size: settings
             .getattr("auto_adjust_screen_capture_size")
             .ok()
@@ -1242,7 +1248,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
         build_readback_encoders(&mut settings, cfg.try_gpu, cfg.use_gpu, cfg.prior.or(inherited));
     if cfg.try_gpu && video_encoder.is_none() {
         println!(
-            "[Wayland] Decision: No GPU Encoder available -> Using CPU Software Encoding ({}).",
+            "[Wayland] Readback encode: no hardware encoder opened; encoding in software ({}).",
             encoders::software_library(settings.codec)
         );
     }
@@ -1250,7 +1256,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
     cfg.stats.n_stripes.store(n_stripes as u32, Ordering::Relaxed);
     *cfg.stats.desc.lock().unwrap() = encoder_desc(&settings, video_encoder.as_ref(), false);
     set_wayland_active_codec(cfg.display_id, Some(settings.codec));
-    log_stream_settings(&settings, n_stripes, video_encoder.as_ref());
+    log_stream_settings("Wayland", &settings, n_stripes, video_encoder.as_ref());
 
     let width = settings.width;
     let height = settings.height;
@@ -1281,7 +1287,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 // The failed re-open left no codec context: the next encode fails, and a
                 // full streak makes that failure run the recovery ladder at once instead
                 // of after a window of dead frames.
-                eprintln!("[wl-encode] rate reconfigure failed: {e}");
+                eprintln!("[Wayland] rate reconfigure failed: {e}");
                 hw_error_streak = HW_ERROR_RECOVERY_THRESHOLD - 1;
             }
         }
@@ -1352,7 +1358,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                         // One line per recovery window: a session failing at frame rate would
                         // otherwise write a line per frame for the life of the capture.
                         if hw_error_streak.is_multiple_of(HW_ERROR_RECOVERY_THRESHOLD) {
-                            eprintln!("[wl-encode] HW encode error: {e}");
+                            eprintln!("[Wayland] HW encode error: {e}");
                         }
                         hw_error_streak = hw_error_streak.saturating_add(1);
                         if hw_error_streak >= HW_ERROR_RECOVERY_THRESHOLD {
@@ -1364,10 +1370,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                             hw_error_streak = 0;
                             let try_gpu = !hw_rebuilt;
                             if try_gpu {
-                                eprintln!("[wl-encode] rebuilding readback HW encoder after repeated encode errors.");
+                                eprintln!("[Wayland] rebuilding readback HW encoder after repeated encode errors.");
                             } else {
                                 eprintln!(
-                                    "[wl-encode] readback HW encoder unrecoverable; demoting to software encoding ({}).",
+                                    "[Wayland] readback HW encoder unrecoverable; demoting to software encoding ({}).",
                                     encoders::software_library(Codec::H264)
                                 );
                             }
@@ -1384,7 +1390,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                             *cfg.stats.desc.lock().unwrap() =
                                 encoder_desc(&settings, video_encoder.as_ref(), false);
                             set_wayland_active_codec(cfg.display_id, Some(settings.codec));
-                            log_stream_settings(&settings, n, video_encoder.as_ref());
+                            log_stream_settings("Wayland", &settings, n, video_encoder.as_ref());
                         }
                     }
                 }
@@ -1431,13 +1437,11 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
             let _ = cfg.deliver_tx.send(out);
         }
     }
-    if settings.debug_logging {
-        println!(
-            "[Wayland] Encode thread exiting (hw={}, stripes={}).",
-            video_encoder.is_some(),
-            stripes.len()
-        );
-    }
+    crate::log::debug!(
+        "[Wayland] Encode thread exiting (hw={}, stripes={}).",
+        video_encoder.is_some(),
+        stripes.len()
+    );
     video_encoder
 }
 
@@ -1490,14 +1494,31 @@ fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool)
 }
 
 /// One-shot "Stream settings active" line, printed by the thread that owns the encoders
-/// once the selection is final (calloop for zero-copy, encode thread for readback).
-fn log_stream_settings(
+/// once the selection is final (calloop for zero-copy, encode thread for readback, the
+/// X11 zero-copy backends at their start), tagged for the backend that prints it.
+pub(crate) fn log_stream_settings(
+    tag: &str,
     settings: &RustCaptureSettings,
     n_stripes: usize,
     video_encoder: Option<&FrameEncoder>,
 ) {
+    let backend = video_encoder.map(|enc| (enc.backend_name(), enc.is_hardware()));
+    let fullcolor = encoders::session_fullcolor(video_encoder, settings);
+    log_stream_settings_of(tag, settings, n_stripes, backend, fullcolor);
+}
+
+/// The "Stream settings active" line for a backend named outright, `(name, hardware)`, where
+/// the session is not a `FrameEncoder` (NvFBC's own NVENC session); `None` is the striped
+/// software path.
+pub(crate) fn log_stream_settings_of(
+    tag: &str,
+    settings: &RustCaptureSettings,
+    n_stripes: usize,
+    backend: Option<(&str, bool)>,
+    fullcolor: bool,
+) {
     let mut log_msg = format!(
-        "Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
+        "[{tag}] Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
         settings.width, settings.height, settings.target_fps, n_stripes
     );
 
@@ -1510,13 +1531,13 @@ fn log_stream_settings(
             ));
         }
     } else {
-        let encoder_type = match video_encoder {
-            Some(enc) => enc.backend_name(),
+        let encoder_type = match backend {
+            Some((name, _)) => name,
             None => encoders::software_library(Codec::H264),
         };
         log_msg.push_str(&format!(" | Mode: {} ({})", settings.codec.display(), encoder_type));
 
-        if video_encoder.is_some() || settings.video_fullframe {
+        if backend.is_some() || settings.video_fullframe {
             log_msg.push_str(" FullFrame");
         } else {
             log_msg.push_str(" Striped");
@@ -1542,10 +1563,9 @@ fn log_stream_settings(
             ));
         }
 
-        let is_actually_444 = encoders::session_fullcolor(video_encoder, settings);
         log_msg.push_str(&format!(
             " | Colorspace: {}",
-            encoders::colorspace_desc(is_actually_444, video_encoder.is_none_or(|e| !e.is_hardware()))
+            encoders::colorspace_desc(fullcolor, backend.is_none_or(|(_, hardware)| !hardware))
         ));
     }
 
@@ -1631,7 +1651,7 @@ fn reap_dead_host(state: &mut AppState) {
 fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
     let Some(idx) = state.node_idx_for_id(display_id) else { return };
     if let Some(mut cap) = state.output_nodes[idx].capture.take() {
-        println!("[Wayland] Capture loop stopped (display {display_id}).");
+        crate::log::debug!("[Wayland] Capture loop stopped (display {display_id}).");
         cap.video_encoder = None;
         let (join, encode_join) = teardown_capture(&mut cap);
         state.deliver_reaper.extend(join);
@@ -2144,7 +2164,7 @@ fn start_capture_on_display(
                                 * 4
                         ];
                         node.target_seeded = false;
-                        println!(
+                        crate::log::debug!(
                             "[Wayland] View {display_id} render target resized to {}x{}.",
                             settings.width, settings.height
                         );
@@ -2204,13 +2224,33 @@ fn start_capture_on_display(
     }
     drop(prior_zero_copy);
 
-    if different_gpu {
-        println!("[Wayland] Decision: Rendering and Encoding GPUs differ -> Forcing Readback (CPU path for pixels).");
-    }
-    if video_encoder.is_none() {
-        println!("[Wayland] Decision: Readback path (encode thread) active.");
-    } else if !different_gpu {
-        println!("[Wayland] Decision: Zero-Copy path active.");
+    let rendered = if state.use_gpu {
+        format!("rendered on {}", state.render_node_path)
+    } else {
+        "rendered in software (Pixman)".to_string()
+    };
+    match video_encoder.as_ref() {
+        Some(enc) => println!(
+            "[Wayland] Zero-copy capture: output {display_id} {}x{} {rendered}, encoded in place on {}.",
+            settings.width, settings.height, enc.backend_name()
+        ),
+        None => {
+            let why = if different_gpu {
+                "the encode node is another GPU"
+            } else if !settings.codec.is_video() {
+                "JPEG encodes on the CPU"
+            } else if use_cpu_explicit {
+                "software encoding selected"
+            } else if !state.use_gpu {
+                "no GPU renderer"
+            } else {
+                "no zero-copy encoder on the render node"
+            };
+            println!(
+                "[Wayland] Readback capture: output {display_id} {}x{} {rendered}, read back for the encode thread ({why}).",
+                settings.width, settings.height
+            );
+        }
     }
 
     // Point this display's host capture thread at the size the encoder was just
@@ -2318,7 +2358,7 @@ fn start_capture_on_display(
                                     s.stripe_height, s.frame_id, s.timing, s.reference,
                                 )) {
                                     Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
-                                    Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
+                                    Err(e) => eprintln!("[Wayland] frame alloc error: {e:?}"),
                                 }
                             }
                         });
@@ -2348,7 +2388,7 @@ fn start_capture_on_display(
         *cap.encode_stats.desc.lock().unwrap() =
             encoder_desc(&settings, cap.video_encoder.as_ref(), true);
         set_wayland_active_codec(display_id, Some(settings.codec));
-        log_stream_settings(&settings, 1, cap.video_encoder.as_ref());
+        log_stream_settings("Wayland", &settings, 1, cap.video_encoder.as_ref());
     }
     // A zero-copy start has no successor encode thread to inherit the outgoing readback
     // session, so the outgoing thread is reaped instead.
@@ -3533,7 +3573,7 @@ fn render_node_tick(
                             }
                         }
                     } else if let Err(e) = result {
-                        eprintln!("HW Encode Error: {}", e);
+                        eprintln!("[Wayland] HW encode error: {e}");
                         cap.hw_error_streak = cap.hw_error_streak.saturating_add(1);
                         if cap.hw_error_streak == HW_ERROR_RECOVERY_THRESHOLD {
                             // The zero-copy session persistently fails after having
@@ -3825,7 +3865,7 @@ fn create_output_on(
         });
     if let Some(window) = adopt {
         state.place_window_on_output(&window, id);
-        println!(
+        crate::log::debug!(
             "[Wayland] Output {id}: adopted waiting window {}.",
             wayland::frontend::window_meta(&window).map(|m| m.id).unwrap_or(0)
         );
@@ -4409,13 +4449,13 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 
     let mut gpu_success = false;
     if use_gpu {
-        println!("[Wayland] Initializing GL Renderer using device: {}", dri_node);
+        println!("[Wayland] Renderer: GL on {dri_node}.");
         let init_res: Result<(), String> = (|| {
             let device_path = std::path::Path::new(&dri_node);
             let (gbm_allocator, mut renderer) = gpu_render_init(device_path)?;
 
             if let Err(e) = renderer.bind_wl_display(&dh) {
-                println!("[Wayland] Warning: Failed to bind EGL to Wayland Display (Optional): {:?}", e);
+                crate::log::debug!("[Wayland] EGL did not bind to the Wayland display (optional): {:?}", e);
             }
 
             let formats = Bind::<Dmabuf>::supported_formats(&renderer)
@@ -4447,7 +4487,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         match init_res {
             Ok(_) => gpu_success = true,
             Err(e) => {
-                println!("[Wayland] GPU Initialization failed: {}. Falling back to Software Renderer (Pixman).", e);
+                eprintln!("[Wayland] GPU renderer failed to initialize ({e}); rendering in software (Pixman).");
                 use_gpu = false;
             }
         }
@@ -4455,7 +4495,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 
     if !gpu_success {
         if dri_node.is_empty() {
-            println!("[Wayland] No render node. Initializing Software Renderer (Pixman).");
+            println!("[Wayland] Renderer: software (Pixman), no render node.");
         }
         pixman_renderer = Some(PixmanRenderer::new().expect("Failed to init PixmanRenderer"));
         use_gpu = false;
@@ -5445,7 +5485,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     let Some(cap) = node.capture.as_ref() else { continue };
                     let frames = cap.encode_stats.frames.swap(0, Ordering::Relaxed);
                     let stripes = cap.encode_stats.stripes.swap(0, Ordering::Relaxed);
-                    if cap.settings.debug_logging {
+                    if crate::log::debug_enabled() {
                         let actual_fps = frames as f64 / elapsed;
                         let stripes_per_sec = stripes as f64 / elapsed;
                         let mode_str = cap.encode_stats.desc.lock().unwrap().clone();
@@ -6383,7 +6423,7 @@ pub(crate) fn join_within(handle: thread::JoinHandle<()>, what: &str) {
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
             eprintln!(
-                "[x11] the {what} thread did not end within {} s; it is left behind",
+                "[X11] the {what} thread did not end within {} s; it is left behind",
                 STOP_JOIN_TIMEOUT.as_secs()
             );
             return;
@@ -6445,7 +6485,8 @@ pub(crate) fn boost_thread_priority(nice: libc::c_int) {
         });
     if let Err(why) = granted {
         REFUSED.call_once(|| {
-            eprintln!("[pixelflux] Thread priority {nice} refused, and rtkit does not grant it: {why}");
+            eprintln!("[pixelflux] Thread priority {nice} refused and rtkit does not grant it; capture threads run at normal priority.");
+            crate::log::debug!("[pixelflux] rtkit: {why}");
         });
     }
 }
@@ -6498,7 +6539,7 @@ fn ensure_wayland_backend(
             && let Some(request) = parse_auto_gpu(&auto_gpu) {
                 match auto_select_render_node(request.as_deref()) {
                     Some(picked) => {
-                        println!("[Wayland] AUTO_GPU enabled. Selected: {}", picked);
+                        println!("[Wayland] AUTO_GPU selected {picked}.");
                         node = Some(picked);
                         auto_gpu_selected = true;
                     }
@@ -6787,13 +6828,13 @@ impl ScreenCapture {
                 .unwrap_or_default();
             if let Some(picked) = auto_render_node(&auto_gpu)
                 && let Some(idx) = render_node_index(&picked) {
-                    println!("[x11] AUTO_GPU enabled. Selected: {picked}");
+                    println!("[X11] AUTO_GPU selected {picked}.");
                     rs.encode_node_index = idx;
                 }
         }
 
         println!(
-            "[x11] Configuring Output: {}x{} @ {:.2} FPS (Encode Node: {})",
+            "[X11] Configuring Output: {}x{} @ {:.2} FPS (Encode Node: {})",
             rs.width, rs.height, rs.target_fps, rs.encode_node_index
         );
 
@@ -6837,7 +6878,7 @@ impl ScreenCapture {
                                     e.print(py);
                                 }
                             }
-                            Err(e) => eprintln!("[x11] frame alloc error: {e:?}"),
+                            Err(e) => eprintln!("[X11] frame alloc error: {e:?}"),
                         }
                     }
                 });
@@ -6860,7 +6901,7 @@ impl ScreenCapture {
             c3.stop.store(true, Ordering::Release);
             if let Err(e) = res {
                 let msg = e.to_string();
-                eprintln!("[x11] capture error: {msg}");
+                eprintln!("[X11] capture error: {msg}");
                 if let Ok(mut g) = err_slot2.lock() {
                     *g = Some(msg);
                 }

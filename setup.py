@@ -59,7 +59,10 @@ setup(
             binding=Binding.PyO3,
             debug=False,
             strip=Strip.All,
-            args=([] if _enable_gpl else ["--no-default-features", "--features", "openh264"]),
+            # `--locked`: a wheel carries the crate versions Cargo.lock names, and a
+            # manifest that has outrun the lock fails the build rather than silently
+            # resolving past it.
+            args=["--locked", *([] if _enable_gpl else ["--no-default-features", "--features", "openh264"])],
         )
     ],
 

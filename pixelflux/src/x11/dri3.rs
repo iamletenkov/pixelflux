@@ -170,7 +170,7 @@ fn prune_modifier(modifiers: &mut Vec<u64>, chosen: u64) {
 
 /// Why the DRI3 path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
-    println!("[x11] GPU capture (DRI3) unavailable: {reason}. Capturing through XShm.");
+    println!("[X11] Zero-copy capture (DRI3) unavailable: {reason}; capturing through XShm.");
     None
 }
 
@@ -361,9 +361,7 @@ impl GpuCapture {
             let bo = match bo {
                 Ok(bo) => bo,
                 Err(e) if !self.x.modifiers.is_empty() => {
-                    if self.settings.debug_logging {
-                        println!("[x11] DRI3 capture: allocation with the server's modifiers failed ({e:?}); trying without");
-                    }
+                    crate::log::debug!("[X11] DRI3 capture: allocation with the server's modifiers failed ({e:?}); trying without");
                     self.x.modifiers.clear();
                     continue;
                 }
@@ -379,12 +377,10 @@ impl GpuCapture {
                     bo.plane_count()
                 ));
             }
-            if self.settings.debug_logging {
-                println!(
-                    "[x11] DRI3 capture: modifier {chosen:#x} lays the buffer out in {} planes; trying another",
-                    bo.plane_count()
-                );
-            }
+            crate::log::debug!(
+                "[X11] DRI3 capture: modifier {chosen:#x} lays the buffer out in {} planes; trying another",
+                bo.plane_count()
+            );
             drop(bo);
             prune_modifier(&mut self.x.modifiers, chosen);
         }
@@ -455,9 +451,7 @@ impl GpuCapture {
             None => Err("no session to reconfigure".to_string()),
         };
         if let Err(e) = in_place {
-            if self.settings.debug_logging {
-                println!("[x11] DRI3 capture: {e}");
-            }
+            crate::log::debug!("[X11] DRI3 capture: {e}");
             self.rebuild_encoder()?;
         }
         Ok(())
@@ -478,7 +472,7 @@ impl GpuCapture {
         drop(self.encoder.take());
         let source = FrameSource::Dmabuf { egl_display: self.egl_display };
         let mut settings = self.settings.clone();
-        match encoders::select_frame_encoder(&mut settings, source, None, "x11") {
+        match encoders::select_frame_encoder(&mut settings, source, None, "X11") {
             Some(enc) if enc.is_hardware() => {
                 self.encoder = Some(enc);
                 self.settings = settings;
@@ -722,20 +716,21 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         return declined(&e);
     }
     let mut live = gpu.settings.clone();
-    gpu.encoder = match encoders::select_frame_encoder(&mut live, FrameSource::Dmabuf { egl_display }, None, "x11") {
+    gpu.encoder = match encoders::select_frame_encoder(&mut live, FrameSource::Dmabuf { egl_display }, None, "X11") {
         Some(enc) if enc.is_hardware() => Some(enc),
         Some(_) => return declined("the session encodes in software"),
         None => return declined("no hardware encoder opened for this session"),
     };
     gpu.settings = live;
     println!(
-        "[x11] GPU capture (DRI3) active: {}x{} blitted by the X server into {} GPU buffers on {} and encoded in place on {}.",
+        "[X11] Zero-copy capture (DRI3): {}x{} blitted by the X server into {} GPU buffers on {}, encoded in place on {}.",
         gpu.settings.width,
         gpu.settings.height,
         POOL_N,
         gpu.x.device,
         gpu.backend()
     );
+    crate::log_stream_settings("X11", &gpu.settings, 1, gpu.encoder.as_ref());
     Some(gpu)
 }
 
@@ -813,7 +808,7 @@ where
             gpu.settings.target_fps = fps;
             let live = gpu.settings.clone();
             if let Err(e) = gpu.enc().reconfigure_rate(&live) {
-                eprintln!("[x11] DRI3 capture: rate reconfigure failed ({e}); rebuilding the encoder.");
+                eprintln!("[X11] DRI3 capture: rate reconfigure failed ({e}); rebuilding the encoder.");
                 if let Err(e) = gpu.rebuild_encoder() {
                     return Some(Err(format!("DRI3 capture ended: {e}")));
                 }
@@ -934,13 +929,13 @@ where
                     }
                     encode_errors += 1;
                     if encode_errors % crate::HW_ERROR_RECOVERY_THRESHOLD == 1 {
-                        eprintln!("[x11] hardware encode error on the DRI3 path: {e}");
+                        eprintln!("[X11] hardware encode error on the DRI3 path: {e}");
                     }
                     if encode_errors >= crate::HW_ERROR_RECOVERY_THRESHOLD {
                         if encoder_rebuilt {
                             return Some(Err("the encoder failed repeatedly on the DRI3 path".to_string()));
                         }
-                        eprintln!("[x11] rebuilding the encoder after repeated errors on the DRI3 path.");
+                        eprintln!("[X11] rebuilding the encoder after repeated errors on the DRI3 path.");
                         if let Err(e) = gpu.rebuild_encoder() {
                             return Some(Err(format!("DRI3 capture ended: {e}")));
                         }
@@ -961,16 +956,14 @@ where
 
         let elapsed = last_log.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
-            if gpu.settings.debug_logging {
-                println!(
-                    "[x11] DRI3 {}x{} Encoder: {} EncFPS: {:.2} Damaged/s: {:.2}",
-                    gpu.settings.width,
-                    gpu.settings.height,
-                    gpu.backend(),
-                    sent_frames as f64 / elapsed,
-                    damaged_frames as f64 / elapsed
-                );
-            }
+            crate::log::debug!(
+                "[X11] DRI3 {}x{} Encoder: {} EncFPS: {:.2} Damaged/s: {:.2}",
+                gpu.settings.width,
+                gpu.settings.height,
+                gpu.backend(),
+                sent_frames as f64 / elapsed,
+                damaged_frames as f64 / elapsed
+            );
             sent_frames = 0;
             damaged_frames = 0;
             last_log = Instant::now();

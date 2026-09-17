@@ -32,7 +32,7 @@ jobs:
       - name: cargo-deny, PIXELFLUX_ENABLE_GPL=0 build
         # deny.toml resolves the non-GPL feature set: permissive licenses only,
         # x264-sys banned.
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: pixelflux/Cargo.toml
           arguments: --exclude-dev
@@ -42,7 +42,7 @@ jobs:
       - name: cargo-deny, default (GPL) build
         # Same allow list plus the x264-sys exception; the ban is the non-GPL
         # gate and is not run here.
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: pixelflux/Cargo.toml
           arguments: --exclude-dev --features gpl
@@ -52,7 +52,7 @@ jobs:
       - name: cargo-deny advisories, default (GPL) build
         # Network step: fetches the RustSec database and enforces the
         # [advisories] policy in deny.toml (documented transitive ignores).
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: pixelflux/Cargo.toml
           arguments: --exclude-dev --features gpl

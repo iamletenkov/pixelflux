@@ -359,6 +359,19 @@ impl FrameEncoder {
     }
 }
 
+/// The chroma sampling of a session as the logs name it.
+pub fn chroma_name(fullcolor: bool) -> &'static str {
+    if fullcolor { "4:4:4" } else { "4:2:0" }
+}
+
+/// The kernel driver's name out of the sysfs link `get_gpu_driver` read, `unknown` without one.
+pub fn driver_name(driver: &str) -> &str {
+    match driver.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name,
+        _ => "unknown",
+    }
+}
+
 /// How a session's frames arrive: Wayland dmabufs (with the EGL display NVENC imports them
 /// through), or packed host pixels in R,G,B,A (`rgba`) or B,G,R,A byte order.
 #[derive(Clone, Copy)]
@@ -394,13 +407,13 @@ pub fn select_frame_encoder(
     if !software_forced {
         let node = settings.encode_node_index.max(0);
         let driver = crate::get_gpu_driver(node);
-        println!("[{tag}] Encode Node Index: {node} | Driver: {driver}");
+        crate::log::debug!("[{tag}] Encode node {node}, driver {driver}.");
         if crate::driver_selects_nvenc(&driver) {
             if let Some(FrameEncoder::Nvenc(mut enc)) = prior {
                 match enc.reconfigure_resolution(settings) {
                     Ok(resized) => {
                         if resized {
-                            println!("[{tag}] NVENC session reconfigured in place.");
+                            crate::log::debug!("[{tag}] NVENC session reconfigured in place.");
                         }
                         return Some(FrameEncoder::Nvenc(enc));
                     }
@@ -413,7 +426,13 @@ pub fn select_frame_encoder(
             };
             match NvencEncoder::new(settings, egl_display) {
                 Ok(enc) => {
-                    println!("[{tag}] NVENC {} encoder initialized.", codec.display());
+                    println!(
+                        "[{tag}] Encoder: NVENC {} {} on {} (render node {node}, {} driver).",
+                        codec.display(),
+                        chroma_name(enc.is_fullcolor()),
+                        enc.device_name(),
+                        driver_name(&driver)
+                    );
                     return Some(FrameEncoder::Nvenc(enc));
                 }
                 Err(e) => eprintln!("[{tag}] Failed to init NVENC {}: {e}", codec.display()),
@@ -426,10 +445,11 @@ pub fn select_frame_encoder(
             match AvcodecEncoder::new(settings, codec, Backend::Vaapi, input) {
                 Ok(enc) => {
                     println!(
-                        "[{tag}] VAAPI {} encoder initialized ({} on {} surfaces).",
+                        "[{tag}] Encoder: VAAPI {} {} on {} surfaces (render node {node}, {} driver).",
                         codec.display(),
-                        if enc.is_fullcolor() { "4:4:4" } else { "4:2:0" },
-                        enc.sw_format_name()
+                        chroma_name(enc.is_fullcolor()),
+                        enc.sw_format_name(),
+                        driver_name(&driver)
                     );
                     return Some(FrameEncoder::Avcodec(enc));
                 }
@@ -437,18 +457,18 @@ pub fn select_frame_encoder(
             }
         }
     } else {
-        println!("[{tag}] Software encoding selected (use_cpu=true or encode_node_index=-1).");
+        crate::log::debug!("[{tag}] Software encoding selected (use_cpu or encode_node_index -1).");
     }
     let FrameSource::Host { rgba } = source else {
         return None;
     };
     if codec == Codec::H264 {
-        println!("[{tag}] Software H.264 ({}).", software_library(Codec::H264));
+        println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(Codec::H264));
         return None;
     }
     match AvcodecEncoder::new(settings, codec, Backend::Software, Input::Host { rgba }) {
         Ok(enc) => {
-            println!("[{tag}] Software {} ({}).", codec.display(), enc.library());
+            println!("[{tag}] Encoder: software {} ({}).", codec.display(), enc.library());
             Some(FrameEncoder::Avcodec(enc))
         }
         Err(e) => {

@@ -789,7 +789,7 @@ where
                 pipeline = Some(X11Pipeline::new(psettings.clone()));
                 if let Some(pl) = &pipeline {
                     let mut log_msg = format!(
-                        "[x11] Stream settings active -> Res: {}x{} | FPS: {:.1} | Encoder: {}",
+                        "[X11] Stream settings active -> Res: {}x{} | FPS: {:.1} | Encoder: {}",
                         psettings.width, psettings.height, psettings.target_fps, pl.encoder_name()
                     );
                     if !pl.codec().is_video() {
@@ -862,14 +862,11 @@ where
         let now = Instant::now();
         let elapsed = now.duration_since(last_log_time).as_secs_f64();
         if elapsed >= 1.0 {
-            if settings.debug_logging {
-                let actual_fps = frame_count as f64 / elapsed;
-                let stripes_per_sec = stripe_count as f64 / elapsed;
-                println!(
-                    "[x11] Res: {}x{} Encoder: {} EncFPS: {:.2} EncStripes/s: {:.2}",
-                    psettings.width, psettings.height, pl.encoder_name(), actual_fps, stripes_per_sec
-                );
-            }
+            crate::log::debug!(
+                "[X11] Res: {}x{} Encoder: {} EncFPS: {:.2} EncStripes/s: {:.2}",
+                psettings.width, psettings.height, pl.encoder_name(),
+                frame_count as f64 / elapsed, stripe_count as f64 / elapsed
+            );
             frame_count = 0;
             stripe_count = 0;
             last_log_time = now;
@@ -1034,7 +1031,7 @@ where
             encode_loop(&enc_pool, &enc_controls, &enc_settings, &mut on_frame);
         }));
         if result.is_err() {
-            eprintln!("[pixelflux x11] encode thread panicked; shutting the pool to fail the capture");
+            eprintln!("[X11] encode thread panicked; shutting the pool to fail the capture");
             guard_panicked.store(true, Ordering::Release);
             guard_pool.shutdown();
             guard_controls.stop.store(true, Ordering::Relaxed);
@@ -1187,7 +1184,7 @@ where
                                 break;
                             }
                             Err(re) => {
-                                eprintln!("[pixelflux x11] reconnect attempt failed: {re}");
+                                eprintln!("[X11] reconnect attempt failed: {re}");
                             }
                         }
                     }

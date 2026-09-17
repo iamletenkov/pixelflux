@@ -181,4 +181,17 @@ Licensing is part of the build matrix: `LICENSES.md` inventories every crate and
 native code has to be described in the script's `NATIVE` table and in `LICENSES.md` before the check passes.
 Copyleft stays confined to the `gpl` feature.
 
+Logging follows one rule on every backend, because the combined selkies log is what a remote user pastes
+back: a plain `println!` tagged `[X11]`, `[Wayland]`, `[HostCapture]` or `[pixelflux]` for what an operator
+reads (the encoder chosen and the GPU it runs on, the zero-copy or readback decision and why, each fallback,
+the `Stream settings active` line that names the mode), `eprintln!` for warnings and errors, and
+`crate::log::debug!` (`src/log.rs`) for everything behind those lines — device enumeration, each dmabuf
+import, the per-second rate counters, an in-place reconfigure — which prints only while the switch a
+capture's `debug_logging` sets is on (or `PIXELFLUX_DEBUG=1`). A line says what was decided, not which
+function ran, names the output and the size it acts on, and appears once per decision, never per frame or
+per buffer; the `[X11]` and `[Wayland]` lines of the same decision read the same apart from the tag, and the
+one `Stream settings active` builder (`log_stream_settings`) serves every path. The strings selkies' suites
+wait on (`Stream settings active`, `Socket listening on:`, `Configuring Output`, `[Wayland] Output`) are
+contracts; a change to one changes the test with it.
+
 Update this file when certain details change.

@@ -421,7 +421,7 @@ fn nvenc_negotiate(lib: &NvencLibrary) {
                 && probe.nvEncEncodePicture.is_some()
                 && probe.nvEncLockBitstream.is_some()
             {
-                eprintln!("[pixelflux] NVENC API version negotiated: {}.{}", maj, min);
+                crate::log::debug!("[pixelflux] NVENC API version negotiated: {}.{}", maj, min);
                 return (maj, min);
             }
         }
@@ -1116,6 +1116,8 @@ pub struct NvencEncoder {
     encoder_session: *mut c_void,
     cuda_context: CUcontext,
     cuda_device: CUdevice,
+    /// The GPU's marketing name, for the one line that says which device encodes.
+    device_name: String,
     egl_display: EGLDisplay,
     codec: Codec,
     fullcolor: bool,
@@ -1410,15 +1412,21 @@ impl NvencEncoder {
         if (cuda.cuDeviceGetCount)(&mut count) != CUresult::CUDA_SUCCESS {
             return;
         }
-        println!("[NVENC] Found {} CUDA devices:", count);
+        crate::log::debug!("[NVENC] Found {} CUDA devices:", count);
         for i in 0..count {
             let mut dev = 0;
             (cuda.cuDeviceGet)(&mut dev, i);
-            let mut name_buf = [0 as c_char; 256];
-            (cuda.cuDeviceGetName)(name_buf.as_mut_ptr(), 256, dev);
-            let name = CStr::from_ptr(name_buf.as_ptr()).to_string_lossy();
-            println!("[NVENC]   Device {}: {}", i, name);
+            crate::log::debug!("[NVENC]   Device {}: {}", i, Self::device_name_of(cuda, dev));
         }
+    }
+
+    /// The name CUDA gives a device, or a placeholder when it will not say.
+    unsafe fn device_name_of(cuda: &CudaFunctions, dev: CUdevice) -> String {
+        let mut name_buf = [0 as c_char; 256];
+        if (cuda.cuDeviceGetName)(name_buf.as_mut_ptr(), 256, dev) != CUresult::CUDA_SUCCESS {
+            return format!("CUDA device {dev}");
+        }
+        CStr::from_ptr(name_buf.as_ptr()).to_string_lossy().into_owned()
     }
 
     /// The PCI bus ID of the GPU behind `/dev/dri/renderD<128+index>`, read from the sysfs
@@ -1500,7 +1508,7 @@ impl NvencEncoder {
         let codec = settings.codec;
         let codec_guid = codec_guid(codec)
             .ok_or_else(|| format!("NVENC has no {} encoder", codec.display()))?;
-        println!("[NVENC] Initializing {}...", codec.display());
+        crate::log::debug!("[NVENC] Initializing {}...", codec.display());
 
         let egl = Arc::new(Self::load_egl()?);
         let cuda = Arc::new(Self::load_cuda()?);
@@ -1533,7 +1541,7 @@ impl NvencEncoder {
             if let Some(pci_bus_id) = Self::get_pci_bus_id(settings.encode_node_index.max(0)) {
                 let c_pci_bus_id = CString::new(pci_bus_id.clone()).unwrap();
                 if (cuda.cuDeviceGetByPCIBusId)(&mut cu_device, c_pci_bus_id.as_ptr()) == CUresult::CUDA_SUCCESS {
-                    println!("[NVENC] Bound to CUDA device via PCI Bus ID: {}", pci_bus_id);
+                    crate::log::debug!("[NVENC] Bound to CUDA device via PCI Bus ID: {}", pci_bus_id);
                     device_found = true;
                 }
             }
@@ -1544,6 +1552,7 @@ impl NvencEncoder {
                     return Err("Failed to get default CUDA device".into());
                 }
             }
+            let device_name = Self::device_name_of(&cuda, cu_device);
 
             // One primary context per device, shared and refcounted across every session on that
             // device, rather than a fresh 100-300 MiB context each: a second display or a rebuild
@@ -1897,7 +1906,7 @@ impl NvencEncoder {
             } else {
                 ChromaConvert::new(&cuda, &function_list, encoder_session, width, height)
             };
-            println!(
+            crate::log::debug!(
                 "[NVENC] {} initialized (4:4:4 mode: {}, chroma convert: {}).",
                 codec.display(),
                 is_444,
@@ -1908,6 +1917,7 @@ impl NvencEncoder {
                 encoder_session,
                 cuda_context: cu_context,
                 cuda_device: cu_device,
+                device_name,
                 egl_display: egl_display as EGLDisplay,
                 codec,
                 fullcolor: is_444,
@@ -2115,6 +2125,11 @@ impl NvencEncoder {
     }
 
     /// The codec the session emits.
+    /// The name CUDA gives the GPU this session encodes on.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     pub fn codec(&self) -> Codec {
         self.codec
     }
@@ -2749,7 +2764,7 @@ impl NvencEncoder {
                     }
                     _ => DmaBufInput::Copy,
                 };
-                println!(
+                crate::log::debug!(
                     "[NVENC] dmabuf imported as a {} frame ({} planes, {}x{}, pitch {}, {} channels of element format {}): {}.",
                     match egl_frame.frame_type {
                         CU_EGL_FRAME_TYPE_PITCH => "pitch-linear",

@@ -177,7 +177,7 @@ impl X11Pipeline {
     /// selects, then the codec's software encoder, or the striped software path for JPEG and
     /// H.264. A codec no backend serves demotes the pipeline to H.264.
     pub fn new(mut settings: RustCaptureSettings) -> Self {
-        let hw = encoders::select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "x11");
+        let hw = encoders::select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "X11");
         Self {
             settings,
             stripes: Vec::new(),
@@ -203,7 +203,7 @@ impl X11Pipeline {
         self.hw_error_streak = 0;
         if self.hw_rebuilt {
             eprintln!(
-                "[x11] HW encoder unrecoverable; demoting to software encoding ({}).",
+                "[X11] HW encoder unrecoverable; demoting to software encoding ({}).",
                 crate::encoders::software_library(Codec::H264)
             );
             // The broken session is released before its replacement is built: these failures
@@ -211,11 +211,11 @@ impl X11Pipeline {
             // the replacement fail too.
             self.hw = None;
             self.settings.use_cpu = true;
-            self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "x11");
+            self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "X11");
         } else {
-            eprintln!("[x11] rebuilding HW encoder after repeated encode errors.");
+            eprintln!("[X11] rebuilding HW encoder after repeated encode errors.");
             self.hw = None;
-            self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "x11");
+            self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "X11");
             self.hw_rebuilt = true;
         }
         self.hw_state = StripeState::default();
@@ -290,7 +290,7 @@ impl X11Pipeline {
         match &mut self.hw {
             Some(FrameEncoder::Nvenc(enc)) => {
                 if let Err(e) = enc.reconfigure_resolution(settings) {
-                    eprintln!("[x11] NVENC in-place resize unavailable ({e}); rebuilding");
+                    eprintln!("[X11] NVENC in-place resize unavailable ({e}); rebuilding");
                     return false;
                 }
             }
@@ -321,7 +321,7 @@ impl X11Pipeline {
         {
             // The failed re-open left the session without a codec context, so it goes
             // through the rebuild-or-demote ladder instead of being encoded into.
-            eprintln!("[x11] rate reconfigure failed: {e}");
+            eprintln!("[X11] rate reconfigure failed: {e}");
             self.recover_hw();
         }
     }
@@ -391,7 +391,7 @@ impl X11Pipeline {
                         // One line per recovery window: a session failing at frame rate would
                         // otherwise write a line per frame for the life of the capture.
                         if self.hw_error_streak.is_multiple_of(crate::HW_ERROR_RECOVERY_THRESHOLD) {
-                            eprintln!("[x11] HW encode error: {e}");
+                            eprintln!("[X11] HW encode error: {e}");
                         }
                         self.hw_error_streak = self.hw_error_streak.saturating_add(1);
                         if self.hw_error_streak >= crate::HW_ERROR_RECOVERY_THRESHOLD {
