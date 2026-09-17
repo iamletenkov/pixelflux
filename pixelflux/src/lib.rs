@@ -152,6 +152,8 @@ pub mod computer_use;
 pub mod uinput;
 /// When a capture is due a frame, shared by the X11 and Wayland backends.
 pub mod pace;
+/// What each capture streams and how it got there, as values a caller reads.
+pub mod report;
 
 /// Frame-processing policy shared by the X11 and Wayland backends.
 pub mod pipeline;
@@ -1188,6 +1190,7 @@ struct WlEncodeConfig {
     deliver_tx: std::sync::mpsc::SyncSender<Vec<EncodedStripe>>,
     controls: Arc<WlEncodeControls>,
     stats: Arc<WlEncodeStats>,
+    report: Arc<report::StreamReport>,
 }
 
 /// Build the readback-mode frame encoder on the thread that will own and drive it: the shared
@@ -1242,6 +1245,7 @@ fn build_readback_encoders(
 /// when the new settings stay compatible (a plain `StopCapture` just drops it).
 fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameEncoder> {
     crate::boost_thread_priority(-10);
+    let _report = report::enter(&cfg.report);
     let mut settings = cfg.settings;
     let inherited = cfg.predecessor.and_then(|h| h.join().ok().flatten());
     let mut video_encoder =
@@ -1383,6 +1387,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                             drop(video_encoder.take());
                             video_encoder =
                                 build_readback_encoders(&mut settings, try_gpu, cfg.use_gpu, None);
+                            if !try_gpu {
+                                report::encoder_reason("the hardware encoder failed repeatedly and was given up");
+                            }
                             hw_rebuilt = try_gpu && video_encoder.is_some();
                             cfg.controls.force_idr.store(true, Ordering::Relaxed);
                             let n = wayland_stripe_count(&settings, video_encoder.is_some());
@@ -1519,6 +1526,7 @@ pub(crate) fn log_stream_settings_of(
     fullcolor: bool,
     full_range: bool,
 ) {
+    report::stream(settings, n_stripes, backend, fullcolor);
     let mut log_msg = format!(
         "[{tag}] Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
         settings.width, settings.height, settings.target_fps, n_stripes
@@ -1662,6 +1670,7 @@ fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
     wayland_alive().lock().unwrap().remove(&display_id);
     set_wayland_capture_err(display_id, None);
     set_wayland_active_codec(display_id, None);
+    report::wayland_reports().lock().unwrap().remove(&display_id);
     if let Some(p) = state.host_layout_pending.remove(&display_id) {
         answer_geometry_waiters(state, display_id, p.geometry_waiters);
     }
@@ -1858,6 +1867,7 @@ fn bootstrap_readback_pool(
         deliver_tx,
         controls: cap.encode_controls.clone(),
         stats: cap.encode_stats.clone(),
+        report: cap.report.clone(),
     };
     let pool2 = pool.clone();
     cap.encode_join = Some(
@@ -1911,6 +1921,9 @@ fn start_capture_on_display(
         );
         return;
     };
+    let stream_report = report::StreamReport::new("wayland");
+    report::wayland_reports().lock().unwrap().insert(display_id, stream_report.clone());
+    let _report = report::enter(&stream_report);
     let mut node = state.output_nodes.remove(node_idx);
     // Geometry readers parked behind a layout request this start supersedes: they ride
     // on to this start's request, or answer at its end if no host is involved.
@@ -2232,10 +2245,13 @@ fn start_capture_on_display(
         "rendered in software (Pixman)".to_string()
     };
     match video_encoder.as_ref() {
-        Some(enc) => println!(
-            "[Wayland] Zero-copy capture: output {display_id} {}x{} {rendered}, encoded in place on {}.",
-            settings.width, settings.height, enc.backend_name()
-        ),
+        Some(enc) => {
+            report::capture("dmabuf", true);
+            println!(
+                "[Wayland] Zero-copy capture: output {display_id} {}x{} {rendered}, encoded in place on {}.",
+                settings.width, settings.height, enc.backend_name()
+            );
+        }
         None => {
             let why = if different_gpu {
                 "the encode node is another GPU"
@@ -2248,6 +2264,8 @@ fn start_capture_on_display(
             } else {
                 "no zero-copy encoder on the render node"
             };
+            report::capture("readback", false);
+            report::capture_reason(why);
             println!(
                 "[Wayland] Readback capture: output {display_id} {}x{} {rendered}, read back for the encode thread ({why}).",
                 settings.width, settings.height
@@ -2319,6 +2337,7 @@ fn start_capture_on_display(
         encode_join: None,
         encode_controls: Arc::new(WlEncodeControls::new()),
         encode_stats: Arc::new(WlEncodeStats::new()),
+        report: stream_report.clone(),
         pool_last_render: Vec::new(),
         render_seq: 0,
         pool_content_gen: Vec::new(),
@@ -2353,6 +2372,7 @@ fn start_capture_on_display(
                     while let Ok(stripes) = rx.recv() {
                         if thread_discard.load(Ordering::Relaxed)
                             || PY_SHUTDOWN.load(Ordering::Relaxed) { continue; }
+                        stream_report.tally(&stripes);
                         Python::attach(|py| {
                             for s in stripes {
                                 match Py::new(py, StripeFrame::new_owned_meta(
@@ -3085,6 +3105,9 @@ fn render_node_tick(
                     eprintln!(
                         "[HostCapture] host delivers software frames; demoting the zero-copy encoder to readback encode."
                     );
+                    let _report = report::enter(&cap.report);
+                    report::capture("readback", false);
+                    report::capture_reason("the host compositor delivers software frames only");
                     cap.video_encoder = None;
                     let s = &cap.settings;
                     let try_gpu = s.codec.is_video()
@@ -3578,6 +3601,7 @@ fn render_node_tick(
                         eprintln!("[Wayland] HW encode error: {e}");
                         cap.hw_error_streak = cap.hw_error_streak.saturating_add(1);
                         if cap.hw_error_streak == HW_ERROR_RECOVERY_THRESHOLD {
+                            let _report = report::enter(&cap.report);
                             // The zero-copy session persistently fails after having
                             // worked (driver hiccup, CUDA pressure from a co-tenant):
                             // rebuild the session once, else demote to the readback
@@ -3604,6 +3628,8 @@ fn render_node_tick(
                                 }
                                 None => {
                                     eprintln!("[Wayland] zero-copy HW encoder unrecoverable; demoting to readback encode.");
+                                    report::capture("readback", false);
+                                    report::capture_reason("the zero-copy encoder failed repeatedly and was given up");
                                     cap.video_encoder = None;
                                     cap.hw_rebuilt = false;
                                     // Mirror the startup intent: readback still
@@ -4334,6 +4360,23 @@ fn gl_renderer_name(renderer: &mut GlesRenderer) -> String {
         .unwrap_or_default()
 }
 
+/// The name the GL driver gives the GPU behind render node `node_index`, asked once per node
+/// and remembered: what a VA-API session, which names no device, is reported to run on.
+/// Empty where no GL context comes up on the node.
+fn node_gpu_name(node_index: i32) -> String {
+    static NAMES: OnceLock<Mutex<std::collections::HashMap<i32, String>>> = OnceLock::new();
+    let mut names = NAMES.get_or_init(Default::default).lock().unwrap();
+    names
+        .entry(node_index)
+        .or_insert_with(|| {
+            let path = format!("/dev/dri/renderD{}", 128 + node_index);
+            gpu_render_init(std::path::Path::new(&path))
+                .map(|(_gbm, mut renderer)| gl_renderer_name(&mut renderer))
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 /// A GPU is exposed to this container or machine.
 ///
 /// Only device nodes count. `/sys/class/drm` is the host's and lists cards a container may
@@ -4487,9 +4530,23 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         })();
 
         match init_res {
-            Ok(_) => gpu_success = true,
+            Ok(_) => {
+                gpu_success = true;
+                report::set_renderer(report::Renderer {
+                    kind: "gl",
+                    node: dri_node.clone(),
+                    gpu: gles_renderer.as_mut().map(gl_renderer_name).unwrap_or_default(),
+                    reason: String::new(),
+                });
+            }
             Err(e) => {
                 eprintln!("[Wayland] GPU renderer failed to initialize ({e}); rendering in software (Pixman).");
+                report::set_renderer(report::Renderer {
+                    kind: "pixman",
+                    node: String::new(),
+                    gpu: String::new(),
+                    reason: format!("the GPU renderer did not initialize on {dri_node}: {e}"),
+                });
                 use_gpu = false;
             }
         }
@@ -4498,6 +4555,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     if !gpu_success {
         if dri_node.is_empty() {
             println!("[Wayland] Renderer: software (Pixman), no render node.");
+            report::set_renderer(report::Renderer {
+                kind: "pixman",
+                node: String::new(),
+                gpu: String::new(),
+                reason: "no render node".to_string(),
+            });
         }
         pixman_renderer = Some(PixmanRenderer::new().expect("Failed to init PixmanRenderer"));
         use_gpu = false;
@@ -6723,6 +6786,18 @@ impl ScreenCapture {
     }
 }
 
+impl ScreenCapture {
+    /// The report of the capture this handle runs, whichever backend it is on.
+    fn report(&self) -> Option<Arc<report::StreamReport>> {
+        let st = self.inner.lock().unwrap();
+        match st.backend {
+            1 => st.controls.as_ref().map(|c| c.report.clone()),
+            2 => report::wayland_reports().lock().unwrap().get(&st.wl_display).cloned(),
+            _ => None,
+        }
+    }
+}
+
 #[pymethods]
 impl ScreenCapture {
     #[new]
@@ -6888,7 +6963,9 @@ impl ScreenCapture {
         });
         let deliver_thread_id = deliver_handle.thread().id();
 
+        let report = controls.report.clone();
         let on_frame = move |frame: Vec<EncodedStripe>| {
+            report.tally(&frame);
             // Blocks only when the single slot is still occupied (consumer more
             // than one frame behind); a dropped receiver (stop) discards.
             let _ = deliver_tx.send(frame);
@@ -6971,6 +7048,71 @@ impl ScreenCapture {
             _ => u32::MAX,
         };
         Ok(Codec::from_id(id).map(|c| c.name().to_string()))
+    }
+
+    /// What this capture streams and how it got there, or None before a start and after a
+    /// stop: `backend` (`x11`, `wayland`), `capture` (the path: `NvFBC`, `DRI3`, `XShm`,
+    /// `dmabuf`, `readback`), `zero_copy` and the `capture_reason` a faster path was declined
+    /// for, `encoder` (`NVENC`, `VAAPI`, or the software library), `hardware` and the
+    /// `encoder_reason` it is not, `codec`, `fullcolor`, `striped`, and for a hardware session
+    /// its `gpu`, kernel `driver` and `encode_node`. A Wayland capture adds how its compositor
+    /// renders: `renderer` (`gl`, `pixman`), `render_node`, `render_gpu`, `renderer_reason`.
+    /// The first read of a VA-API session brings a GL context up once to name its GPU, so a
+    /// caller with an event loop reads this off it.
+    fn stream_info(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let Some(report) = self.report() else { return Ok(None) };
+        let (info, renderer) = py.detach(|| {
+            let mut info = report.info();
+            let renderer = (info.backend == "wayland").then(report::renderer);
+            if info.hardware && info.gpu.is_empty() {
+                info.gpu = match &renderer {
+                    Some(r) if render_node_index(&r.node) == Some(info.encode_node) => r.gpu.clone(),
+                    _ => node_gpu_name(info.encode_node),
+                };
+            }
+            (info, renderer)
+        });
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("backend", info.backend)?;
+        d.set_item("capture", info.capture)?;
+        d.set_item("zero_copy", info.zero_copy)?;
+        d.set_item("capture_reason", &info.capture_reason)?;
+        d.set_item("encoder", &info.encoder)?;
+        d.set_item("hardware", info.hardware)?;
+        d.set_item("encoder_reason", &info.encoder_reason)?;
+        d.set_item("codec", info.codec)?;
+        d.set_item("fullcolor", info.fullcolor)?;
+        d.set_item("striped", info.stripes > 1)?;
+        d.set_item("gpu", &info.gpu)?;
+        d.set_item("driver", &info.driver)?;
+        let encode_node = if info.hardware {
+            format!("/dev/dri/renderD{}", 128 + info.encode_node)
+        } else {
+            String::new()
+        };
+        d.set_item("encode_node", encode_node)?;
+        if let Some(r) = renderer {
+            d.set_item("renderer", r.kind)?;
+            d.set_item("render_node", &r.node)?;
+            d.set_item("render_gpu", &r.gpu)?;
+            d.set_item("renderer_reason", &r.reason)?;
+        }
+        Ok(Some(d.into_any().unbind()))
+    }
+
+    /// Cumulative counters of this capture since it started, or None without one: `frames`
+    /// and `bytes` delivered, and the nanoseconds those frames spent encoding (`encode_ns`)
+    /// and from capture to the end of the encode (`pipeline_ns`). A caller differences two
+    /// reads; a restart begins again from zero.
+    fn stream_stats(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let Some(report) = self.report() else { return Ok(None) };
+        let totals = report.totals();
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("frames", totals.frames)?;
+        d.set_item("bytes", totals.bytes)?;
+        d.set_item("encode_ns", totals.encode_ns)?;
+        d.set_item("pipeline_ns", totals.pipeline_ns)?;
+        Ok(Some(d.into_any().unbind()))
     }
 
     fn stop_capture(&self, py: Python<'_>) -> PyResult<()> {

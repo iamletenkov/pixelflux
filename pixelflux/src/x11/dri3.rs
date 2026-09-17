@@ -171,6 +171,7 @@ fn prune_modifier(modifiers: &mut Vec<u64>, chosen: u64) {
 /// Why the DRI3 path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
     println!("[X11] Zero-copy capture (DRI3) unavailable: {reason}; capturing through XShm.");
+    crate::report::capture_declined("DRI3", reason);
     None
 }
 
@@ -738,6 +739,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         gpu.x.device,
         gpu.backend()
     );
+    crate::report::capture("DRI3", true);
     crate::log_stream_settings("X11", &gpu.settings, 1, gpu.encoder.as_ref());
     Some(gpu)
 }

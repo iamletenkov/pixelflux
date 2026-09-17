@@ -236,6 +236,8 @@ pub struct WlCapture {
     pub encode_join: Option<std::thread::JoinHandle<Option<FrameEncoder>>>,
     pub encode_controls: Arc<crate::WlEncodeControls>,
     pub encode_stats: Arc<crate::WlEncodeStats>,
+    /// What this capture streams and how, for `ScreenCapture::stream_info`.
+    pub report: Arc<crate::report::StreamReport>,
     pub pool_last_render: Vec<u64>,
     pub render_seq: u64,
     pub pool_content_gen: Vec<u64>,

@@ -99,6 +99,8 @@ pub struct Controls {
     pub codec: AtomicU32,
     pub region_dirty: AtomicBool,
     pub region: Mutex<(i32, i32, i32, i32)>,
+    /// What this capture streams and how, for `ScreenCapture::stream_info`.
+    pub report: Arc<crate::report::StreamReport>,
 }
 
 impl Controls {
@@ -120,6 +122,7 @@ impl Controls {
             codec: AtomicU32::new(u32::MAX),
             region_dirty: AtomicBool::new(false),
             region: Mutex::new((s.capture_x, s.capture_y, s.width, s.height)),
+            report: crate::report::StreamReport::new("x11"),
         }
     }
 }
@@ -754,6 +757,7 @@ fn encode_loop<F>(pool: &FramePool, controls: &Controls, settings: &RustCaptureS
 where
     F: FnMut(Vec<EncodedStripe>),
 {
+    let _report = crate::report::enter(&controls.report);
     let mut psettings = settings.clone();
     let recording_sink = RecordingSink::try_bind(&settings.recording_socket, settings.target_fps);
     if recording_sink.is_some() {
@@ -895,6 +899,7 @@ pub fn run_capture<F>(
 where
     F: FnMut(Vec<EncodedStripe>) + Send + 'static,
 {
+    let _report = crate::report::enter(&controls.report);
     if let Some(result) = nvfbc::run_capture(
         settings.clone(),
         controls.clone(),
@@ -911,6 +916,7 @@ where
     ) {
         return result;
     }
+    crate::report::capture("XShm", false);
     run_shm_capture(settings, controls, encode_tid_tx, on_frame)
 }
 

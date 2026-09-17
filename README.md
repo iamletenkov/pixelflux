@@ -343,6 +343,33 @@ def my_callback(frame):
 
 See `example/screen_to_browser.py` for a complete queue-based usage.
 
+### What a Capture Runs On
+
+Which path a capture took is decided by the hardware, the driver and the display server rather
+than by a setting, so the capture says what it settled on instead of leaving it in the log.
+`capture.stream_info()` returns a dict, `None` before a start and after a stop:
+
+| Key | Meaning |
+| --- | --- |
+| `backend` | `x11` or `wayland` |
+| `capture`, `zero_copy` | the capture path (`NvFBC`, `DRI3`, `XShm`, `dmabuf`, `readback`) and whether frames reach the encoder without a copy |
+| `capture_reason` | why a zero-copy path was declined, each declined path named (`NvFBC: ...; DRI3: ...`); empty where there is nothing to explain |
+| `encoder`, `hardware` | `NVENC`, `VAAPI` or the software library, and whether it runs on a GPU |
+| `encoder_reason` | why the session does not encode in hardware: the refusal the hardware session answered with, software encoding being selected, or a session given up after repeated errors |
+| `codec`, `fullcolor`, `striped` | what the stream is, after any demotion |
+| `gpu`, `driver`, `encode_node` | the device a hardware session encodes on |
+| `renderer`, `render_node`, `render_gpu`, `renderer_reason` | Wayland only: `gl` or `pixman`, the node and GPU the compositor renders on, and why it renders in software |
+
+The description follows the capture: a session that demotes itself mid-stream (zero-copy to
+readback, hardware to software) changes what the next call returns. NVENC names its own device;
+for a VA-API session the first call brings a GL context up once on the encode node to name the
+GPU, so a caller with an event loop makes the call off it.
+
+`capture.stream_stats()` returns cumulative counters since the start (`frames`, `bytes`,
+`encode_ns`, `pipeline_ns` from capture to the end of the encode), which a caller differences
+into a rate. They are relaxed atomics tallied once per delivered frame and read only on the
+call, so a capture nobody inspects pays nothing for them.
+
 ## Zero-Copy Pipeline (Wayland)
 
 The Wayland backend implements a **Zero-Copy** architecture for hardware encoding.
@@ -710,6 +737,9 @@ session settled on rather than what was asked for.
     *   **On-demand keyframes:** `request_idr_frame()` forces an IDR for reconnecting clients.
     *   **Reference invalidation:** `invalidate_reference(frame_id)` has the encoder predict past a
         frame a client lost, so recovery costs no keyframe.
+*   **Self-description:** `stream_info()` reports the capture path, the encoder, the GPU and why a
+    faster path was declined, and `stream_stats()` the encode's counters, so a caller shows its
+    user what a session runs on instead of pointing them at a log.
 *   **Input Handling:** Built-in input injection for mouse and keyboard (Wayland; XTEST on X11 via Computer Use).
 *   **Cursor Compositing:** Hardware cursor planes or software rendering options.
 *   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.

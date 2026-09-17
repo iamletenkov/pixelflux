@@ -670,6 +670,7 @@ fn nvidia_driven_x_server() -> Result<bool, String> {
 /// Why the NvFBC path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
     println!("[X11] Zero-copy capture (NvFBC) unavailable: {reason}.");
+    crate::report::capture_declined("NvFBC", reason);
     None
 }
 
@@ -759,6 +760,8 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         "[X11] Zero-copy capture (NvFBC): {}x{} composited into video memory, encoded in place on NVENC.",
         settings.width, settings.height
     );
+    crate::report::capture("NvFBC", true);
+    crate::report::hardware_encoder(encoder.device_name(), crate::encoders::driver_name(&driver), node);
     crate::log_stream_settings_of("X11", &settings, 1, Some(("NVENC", true)), encoder.is_fullcolor(), false);
     Some(GpuCapture { nvfbc, encoder, settings, request, screen })
 }

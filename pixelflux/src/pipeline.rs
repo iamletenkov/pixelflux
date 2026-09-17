@@ -178,7 +178,7 @@ impl X11Pipeline {
     /// H.264. A codec no backend serves demotes the pipeline to H.264.
     pub fn new(mut settings: RustCaptureSettings) -> Self {
         let hw = encoders::select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "X11");
-        Self {
+        let pipeline = Self {
             settings,
             stripes: Vec::new(),
             stripes_carrying: 1.0,
@@ -188,7 +188,20 @@ impl X11Pipeline {
             pending_force_idr: false,
             hw_error_streak: 0,
             hw_rebuilt: false,
-        }
+        };
+        pipeline.record_stream();
+        pipeline
+    }
+
+    /// Put the session this pipeline settled on into the capture's report.
+    fn record_stream(&self) {
+        let fullframe = self.hw.is_some() || self.settings.video_fullframe;
+        crate::report::stream(
+            &self.settings,
+            encoders::software::stripe_count(self.settings.height, self.settings.codec, fullframe),
+            self.hw.as_ref().map(|enc| (enc.backend_name(), enc.is_hardware())),
+            encoders::session_fullcolor(self.hw.as_ref(), &self.settings),
+        );
     }
 
     /// React to a streak of hardware encode failures: rebuild the session once with the startup
@@ -212,12 +225,14 @@ impl X11Pipeline {
             self.hw = None;
             self.settings.use_cpu = true;
             self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "X11");
+            crate::report::encoder_reason("the hardware encoder failed repeatedly and was given up");
         } else {
             eprintln!("[X11] rebuilding HW encoder after repeated encode errors.");
             self.hw = None;
             self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "X11");
             self.hw_rebuilt = true;
         }
+        self.record_stream();
         self.hw_state = StripeState::default();
         self.stripes.clear();
         self.pending_force_idr = true;
@@ -645,6 +660,64 @@ mod tests {
                 "X11 and Wayland must describe the same session identically"
             );
         }
+    }
+
+    /// A pipeline built with a report bound describes itself in it, and a frame it encodes is
+    /// tallied with its bytes and its encode time.
+    #[test]
+    fn x11_pipeline_reports_the_session_it_settled_on() {
+        let report = crate::report::StreamReport::new("x11");
+        let _scope = crate::report::enter(&report);
+        let mut p = X11Pipeline::new(RustCaptureSettings {
+            width: 64,
+            height: 64,
+            codec: Codec::H264,
+            use_cpu: true,
+            video_fullframe: true,
+            ..Default::default()
+        });
+        let info = report.info();
+        assert_eq!(info.encoder, crate::encoders::software_library(Codec::H264));
+        assert!(!info.hardware);
+        assert_eq!(info.encoder_reason, "software encoding selected");
+        assert_eq!(info.codec, "h264");
+        assert_eq!(info.stripes, 1);
+        assert!(info.gpu.is_empty());
+
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+        let mut stripes = p.process(&pixels, 64 * 4);
+        assert!(!stripes.is_empty(), "the first frame of a pipeline is sent");
+        let start = crate::wayland::host::now_ns();
+        crate::encoders::software::FrameTiming::stamp(&mut stripes, start - 2_000_000, start - 1_000_000);
+        report.tally(&stripes);
+        let totals = report.totals();
+        assert_eq!(totals.frames, 1);
+        assert_eq!(totals.bytes, stripes.iter().map(|s| s.data.len() as u64).sum::<u64>());
+        assert!(totals.encode_ns >= 1_000_000 && totals.pipeline_ns >= 2_000_000);
+    }
+
+    /// On a host with a hardware encoder the report names it, the GPU it runs on and the node.
+    #[test]
+    #[ignore]
+    fn gpu_x11_pipeline_reports_the_hardware_session() {
+        let report = crate::report::StreamReport::new("x11");
+        let _scope = crate::report::enter(&report);
+        let p = X11Pipeline::new(RustCaptureSettings {
+            width: 1280,
+            height: 720,
+            codec: Codec::H264,
+            target_fps: 60.0,
+            video_crf: 25,
+            ..Default::default()
+        });
+        assert!(p.is_hardware(), "needs a hardware encoder on render node 0");
+        let info = report.info();
+        println!("{info:?}");
+        assert!(info.hardware);
+        assert_eq!(info.encoder, p.encoder_name());
+        assert!(info.encoder_reason.is_empty());
+        assert_eq!(info.encode_node, 0);
+        assert!(!info.driver.is_empty());
     }
 
     fn settings() -> RustCaptureSettings {

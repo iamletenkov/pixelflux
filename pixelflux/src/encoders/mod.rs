@@ -511,6 +511,7 @@ pub fn select_frame_encoder(
                         if resized {
                             crate::log::debug!("[{tag}] NVENC session reconfigured in place.");
                         }
+                        crate::report::hardware_encoder(enc.device_name(), driver_name(&driver), node);
                         return Some(FrameEncoder::Nvenc(enc));
                     }
                     Err(e) => eprintln!("[{tag}] NVENC in-place reconfigure unavailable ({e}); rebuilding."),
@@ -529,9 +530,13 @@ pub fn select_frame_encoder(
                         enc.device_name(),
                         driver_name(&driver)
                     );
+                    crate::report::hardware_encoder(enc.device_name(), driver_name(&driver), node);
                     return Some(FrameEncoder::Nvenc(enc));
                 }
-                Err(e) => eprintln!("[{tag}] Failed to init NVENC {}: {e}", codec.display()),
+                Err(e) => {
+                    eprintln!("[{tag}] Failed to init NVENC {}: {e}", codec.display());
+                    crate::report::encoder_reason(&format!("NVENC {} did not open: {e}", codec.display()));
+                }
             }
         } else {
             // Nothing below reconfigures a session in place, so the previous one is released
@@ -551,9 +556,13 @@ pub fn select_frame_encoder(
                         enc.sw_format_name(),
                         driver_name(&driver)
                     );
+                    crate::report::hardware_encoder("", driver_name(&driver), node);
                     return Some(FrameEncoder::Avcodec(enc));
                 }
-                Err(e) => eprintln!("[{tag}] Failed to init VAAPI {}: {e}", codec.display()),
+                Err(e) => {
+                    eprintln!("[{tag}] Failed to init VAAPI {}: {e}", codec.display());
+                    crate::report::encoder_reason(&format!("VAAPI {} did not open: {e}", codec.display()));
+                }
             }
         }
         // A stateful M2M encoder publishes no render node driver to select on, so it is
@@ -577,6 +586,7 @@ pub fn select_frame_encoder(
         }
     } else {
         crate::log::debug!("[{tag}] Software encoding selected (use_cpu or encode_node_index -1).");
+        crate::report::encoder_reason("software encoding selected");
     }
     let FrameSource::Host { rgba } = source else {
         return None;

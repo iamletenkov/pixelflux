@@ -212,4 +212,10 @@ one `Stream settings active` builder (`log_stream_settings`) serves every path. 
 wait on (`Stream settings active`, `Socket listening on:`, `Configuring Output`, `[Wayland] Output`) are
 contracts; a change to one changes the test with it.
 
+What those lines tell an operator, a caller reads as values (`src/report.rs`, `ScreenCapture.stream_info` and
+`stream_stats`), which is what selkies shows a user who will never see the log. Each decision is recorded where
+it is made and logged, into the report bound to the deciding thread (`report::enter`), so a new capture path, a
+new fallback or a new reason a path is declined records itself beside its log line, and the counters stay one
+tally per delivered frame, never a callback into Python.
+
 Update this file when certain details change.
