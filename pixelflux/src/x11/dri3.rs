@@ -453,6 +453,9 @@ impl GpuCapture {
             // variant does, and it says what would happen rather than panicking if it ever did.
             #[cfg(target_arch = "aarch64")]
             Some(FrameEncoder::Tegra(_)) => Err("a Tegra session takes host frames".to_string()),
+            Some(FrameEncoder::V4l2m2m(_)) => {
+                Err("a V4L2 M2M session takes host frames".to_string())
+            }
             None => Err("no session to reconfigure".to_string()),
         };
         if let Err(e) = in_place {
