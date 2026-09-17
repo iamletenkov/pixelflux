@@ -759,7 +759,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         "[X11] Zero-copy capture (NvFBC): {}x{} composited into video memory, encoded in place on NVENC.",
         settings.width, settings.height
     );
-    crate::log_stream_settings_of("X11", &settings, 1, Some(("NVENC", true)), encoder.is_fullcolor());
+    crate::log_stream_settings_of("X11", &settings, 1, Some(("NVENC", true)), encoder.is_fullcolor(), false);
     Some(GpuCapture { nvfbc, encoder, settings, request, screen })
 }
 
