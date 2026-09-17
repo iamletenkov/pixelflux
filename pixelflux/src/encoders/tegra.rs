@@ -406,108 +406,140 @@ pub struct Vendor {
     open: V4l2Open,
     ioctl: V4l2Ioctl,
     close: V4l2Close,
-    surfaces: Surfaces,
+}
+
+/// `dlopen` by plain name first, so the loader's own search applies, then the L4T directory for
+/// images that do not put it on the default path.
+fn open_lib(name: &str) -> Result<Library, String> {
+    unsafe {
+        Library::new(name)
+            .or_else(|_| Library::new(format!("/usr/lib/aarch64-linux-gnu/tegra/{name}")))
+    }
+    .map_err(|e| format!("{name} is not loadable: {e}"))
+}
+
+/// One symbol as a bare pointer, for the caller to transmute to the signature the vendor
+/// documents for it. Every call here is unsafe on its own terms, which is what the 2024 edition
+/// asks for and what marks the lines that trust the vendor's ABI.
+fn sym(lib: &Library, name: &[u8]) -> Result<*const c_void, String> {
+    let s: Symbol<*const c_void> = unsafe { lib.get(name) }
+        .map_err(|e| format!("{} is missing: {e}", String::from_utf8_lossy(name)))?;
+    Ok(*s)
 }
 
 impl Vendor {
-    /// Load the vendor libraries, plain name first so the loader's own search applies, then the
-    /// L4T directory for images that do not put it on the default path. The encoder library is
-    /// required; of the two surface libraries, whichever this JetPack carries is taken.
+    /// Load the encoder library alone.
     unsafe fn load() -> Result<Self, String> {
-        // Every call below is unsafe on its own terms (a `dlopen`, a symbol read, a transmute to
-        // a function pointer), so they are written as unsafe operations rather than inherited
-        // from the signature: that is what the 2024 edition asks for, and it marks which lines
-        // are trusting the vendor's ABI.
-        let open_lib = |name: &str| -> Result<Library, String> {
-            unsafe {
-                Library::new(name)
-                    .or_else(|_| Library::new(format!("/usr/lib/aarch64-linux-gnu/tegra/{name}")))
-            }
-            .map_err(|e| format!("{name} is not loadable: {e}"))
-        };
         let v4l2 = open_lib("libnvv4l2.so")?;
-        let sym = |lib: &Library, name: &[u8]| -> Result<*const c_void, String> {
-            let s: Symbol<*const c_void> = unsafe { lib.get(name) }
-                .map_err(|e| format!("{} is missing: {e}", String::from_utf8_lossy(name)))?;
-            Ok(*s)
-        };
         let (open, ioctl, close) = (
             sym(&v4l2, b"v4l2_open\0")?,
             sym(&v4l2, b"v4l2_ioctl\0")?,
             sym(&v4l2, b"v4l2_close\0")?,
         );
-        // The older library is tried first, because a JetPack 5 image can carry both and its
-        // `nvbuf_utils` is the one this backend has the most hours on.
-        let surfaces = match open_lib("libnvbuf_utils.so") {
-            Ok(nvbuf) => {
-                let (create, raw2buf, transform, destroy) = (
-                    sym(&nvbuf, b"NvBufferCreateEx\0")?,
-                    sym(&nvbuf, b"Raw2NvBuffer\0")?,
-                    sym(&nvbuf, b"NvBufferTransform\0")?,
-                    sym(&nvbuf, b"NvBufferDestroy\0")?,
-                );
-                Surfaces::Utils(UtilsApi {
-                    create: unsafe { std::mem::transmute::<*const c_void, NvCreate>(create) },
-                    raw2buf: unsafe { std::mem::transmute::<*const c_void, NvRaw2Buf>(raw2buf) },
-                    transform: unsafe { std::mem::transmute::<*const c_void, NvTransform>(transform) },
-                    destroy: unsafe { std::mem::transmute::<*const c_void, NvDestroy>(destroy) },
-                    _lib: nvbuf,
-                })
-            }
-            Err(utils_error) => {
-                let surface = open_lib("libnvbufsurface.so").map_err(|e| {
-                    format!("neither surface API is loadable: {utils_error}; {e}")
-                })?;
-                let xform = open_lib("libnvbufsurftransform.so")?;
-                let (alloc, destroy, map, unmap, sync) = (
-                    sym(&surface, b"NvBufSurfaceAllocate\0")?,
-                    sym(&surface, b"NvBufSurfaceDestroy\0")?,
-                    sym(&surface, b"NvBufSurfaceMap\0")?,
-                    sym(&surface, b"NvBufSurfaceUnMap\0")?,
-                    sym(&surface, b"NvBufSurfaceSyncForDevice\0")?,
-                );
-                let (transform, set_session) = (
-                    sym(&xform, b"NvBufSurfTransform\0")?,
-                    sym(&xform, b"NvBufSurfTransformSetSessionParams\0")?,
-                );
-                Surfaces::Surface(SurfaceApi {
-                    alloc: unsafe { std::mem::transmute::<*const c_void, NvSurfAlloc>(alloc) },
-                    destroy: unsafe { std::mem::transmute::<*const c_void, NvSurfDestroy>(destroy) },
-                    map: unsafe { std::mem::transmute::<*const c_void, NvSurfMap>(map) },
-                    unmap: unsafe { std::mem::transmute::<*const c_void, NvSurfUnMap>(unmap) },
-                    sync: unsafe { std::mem::transmute::<*const c_void, NvSurfSync>(sync) },
-                    transform: unsafe { std::mem::transmute::<*const c_void, NvSurfTransform>(transform) },
-                    set_session: unsafe { std::mem::transmute::<*const c_void, NvSurfSetSession>(set_session) },
-                    _surface: surface,
-                    _transform: xform,
-                })
-            }
-        };
         Ok(Self {
             open: unsafe { std::mem::transmute::<*const c_void, V4l2Open>(open) },
             ioctl: unsafe { std::mem::transmute::<*const c_void, V4l2Ioctl>(ioctl) },
             close: unsafe { std::mem::transmute::<*const c_void, V4l2Close>(close) },
-            surfaces,
             _v4l2: v4l2,
         })
     }
 }
 
-/// Whether this host has the Tegra encoder: both vendor libraries load and a node opens. Probed
-/// once, because a failure here is a property of the machine and not of the session.
+/// The surface library this JetPack carries, loaded when a session is built rather than when the
+/// backend is probed.
+///
+/// **Not loaded by `available()`, on purpose.** `libnvbufsurftransform.so` brings EGL up in its
+/// ELF constructor, EGL talks to the X server through libxcb, and in a process whose libxcb came
+/// from somewhere other than the system — an AppImage bundling its own — that took the process
+/// down with SIGSEGV inside `dlopen`, on the worker thread that had merely asked whether this
+/// host has an encoder.
+fn surfaces() -> Option<&'static Surfaces> {
+    static SURFACES: OnceLock<Option<Surfaces>> = OnceLock::new();
+    SURFACES
+        .get_or_init(|| match load_surfaces() {
+            Ok(surfaces) => Some(surfaces),
+            Err(e) => {
+                crate::log::debug!("[pixelflux] Tegra surface API unavailable: {e}");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// The older library is tried first, because a JetPack 5 image can carry both and its
+/// `nvbuf_utils` is the one this backend has the most hours on.
+fn load_surfaces() -> Result<Surfaces, String> {
+    match open_lib("libnvbuf_utils.so") {
+        Ok(nvbuf) => {
+            let (create, raw2buf, transform, destroy) = (
+                sym(&nvbuf, b"NvBufferCreateEx\0")?,
+                sym(&nvbuf, b"Raw2NvBuffer\0")?,
+                sym(&nvbuf, b"NvBufferTransform\0")?,
+                sym(&nvbuf, b"NvBufferDestroy\0")?,
+            );
+        Ok(Surfaces::Utils(UtilsApi {
+                create: unsafe { std::mem::transmute::<*const c_void, NvCreate>(create) },
+                raw2buf: unsafe { std::mem::transmute::<*const c_void, NvRaw2Buf>(raw2buf) },
+                transform: unsafe { std::mem::transmute::<*const c_void, NvTransform>(transform) },
+                destroy: unsafe { std::mem::transmute::<*const c_void, NvDestroy>(destroy) },
+                _lib: nvbuf,
+        }))
+        }
+        Err(utils_error) => {
+            let surface = open_lib("libnvbufsurface.so").map_err(|e| {
+                format!("neither surface API is loadable: {utils_error}; {e}")
+            })?;
+            let xform = open_lib("libnvbufsurftransform.so")?;
+            let (alloc, destroy, map, unmap, sync) = (
+                sym(&surface, b"NvBufSurfaceAllocate\0")?,
+                sym(&surface, b"NvBufSurfaceDestroy\0")?,
+                sym(&surface, b"NvBufSurfaceMap\0")?,
+                sym(&surface, b"NvBufSurfaceUnMap\0")?,
+                sym(&surface, b"NvBufSurfaceSyncForDevice\0")?,
+            );
+            let (transform, set_session) = (
+                sym(&xform, b"NvBufSurfTransform\0")?,
+                sym(&xform, b"NvBufSurfTransformSetSessionParams\0")?,
+            );
+        Ok(Surfaces::Surface(SurfaceApi {
+                alloc: unsafe { std::mem::transmute::<*const c_void, NvSurfAlloc>(alloc) },
+                destroy: unsafe { std::mem::transmute::<*const c_void, NvSurfDestroy>(destroy) },
+                map: unsafe { std::mem::transmute::<*const c_void, NvSurfMap>(map) },
+                unmap: unsafe { std::mem::transmute::<*const c_void, NvSurfUnMap>(unmap) },
+                sync: unsafe { std::mem::transmute::<*const c_void, NvSurfSync>(sync) },
+                transform: unsafe { std::mem::transmute::<*const c_void, NvSurfTransform>(transform) },
+                set_session: unsafe { std::mem::transmute::<*const c_void, NvSurfSetSession>(set_session) },
+                _surface: surface,
+                _transform: xform,
+        }))
+        }
+    }
+}
+
+/// Whether this host has the Tegra encoder: the encoder library loads and an encoder node is
+/// there. Probed once, because a failure here is a property of the machine and not of the
+/// session.
+///
+/// **Nothing vendor-side is brought up here**, and each half of that cost a crash to learn. The
+/// surface library initializes EGL in its ELF constructor, which reaches the X server through
+/// libxcb and takes down a process whose libxcb came from elsewhere. Opening the node hands the
+/// shim the encoder block, which it will not give up while the surface library is absent: a probe
+/// that opened it reported no encoder at all on JetPack 4, and on JetPack 6 the process aborted
+/// in `Py_Finalize` afterwards. A `stat` answers what the callers ask — and they ask early, from
+/// whatever thread they like. A node that exists but will not open is then an init failure like
+/// any other, and the ladder's own line says what took over.
 pub fn available() -> bool {
     static PROBED: OnceLock<bool> = OnceLock::new();
     *PROBED.get_or_init(|| {
-        let Some(vendor) = vendor() else { return false };
-        for node in ENCODER_NODES {
-            let Ok(path) = CString::new(node) else { continue };
-            let fd = unsafe { (vendor.open)(path.as_ptr(), libc::O_RDWR) };
-            if fd >= 0 {
-                unsafe { (vendor.close)(fd) };
-                return true;
-            }
+        if vendor().is_none() {
+            return false;
         }
-        false
+        ENCODER_NODES.iter().any(|node| {
+            let Ok(path) = CString::new(*node) else { return false };
+            let mut info: libc::stat = unsafe { std::mem::zeroed() };
+            let found = unsafe { libc::stat(path.as_ptr(), &mut info) } == 0;
+            found && (info.st_mode & libc::S_IFMT) == libc::S_IFCHR
+        })
     })
 }
 
@@ -529,6 +561,7 @@ fn vendor() -> Option<&'static Vendor> {
 
 pub struct TegraEncoder {
     vendor: &'static Vendor,
+    surfaces: &'static Surfaces,
     fd: c_int,
     width: i32,
     height: i32,
@@ -560,6 +593,10 @@ impl TegraEncoder {
             return Err(format!("the encoder needs even dimensions, got {width}x{height}"));
         }
         let vendor = vendor().ok_or("the Tegra vendor libraries are unavailable")?;
+        // The surface library loads before the node is opened, and that order is the shim's, not
+        // a preference: opened first, the node does not open at all on JetPack 4, and on
+        // JetPack 6 the process aborted in `Py_Finalize` afterwards.
+        let surfaces = surfaces().ok_or("the Tegra surface libraries are unavailable")?;
 
         let mut fd = -1;
         let mut opened = "";
@@ -578,6 +615,7 @@ impl TegraEncoder {
 
         let mut me = Self {
             vendor,
+            surfaces,
             fd,
             width,
             height,
@@ -643,7 +681,7 @@ impl TegraEncoder {
     /// is also mapped here and kept mapped: it has no `Raw2NvBuffer`, so the rows are written by
     /// this session.
     fn allocate_surfaces(&mut self, rgba: bool) -> Result<(), String> {
-        match &self.vendor.surfaces {
+        match self.surfaces {
             Surfaces::Utils(api) => {
                 let mut staging = NvBufferCreateParams {
                     width: self.width,
@@ -721,7 +759,7 @@ impl TegraEncoder {
     /// Put one host frame into the staging surface.
     fn fill_staging(&mut self, pixels: &[u8], stride: usize) -> Result<(), String> {
         let height = self.height as usize;
-        match &self.vendor.surfaces {
+        match self.surfaces {
             Surfaces::Utils(api) => {
                 // Raw2NvBuffer takes tight rows, so a padded frame is packed once into scratch.
                 let source = if stride == self.row_bytes {
@@ -765,7 +803,7 @@ impl TegraEncoder {
 
     /// Convert the staging surface into the NV12 surface of one output slot, on the VIC.
     fn convert_to_nv12(&mut self, slot: usize) -> Result<(), String> {
-        match &self.vendor.surfaces {
+        match self.surfaces {
             Surfaces::Utils(api) => {
                 let mut params = [0u8; 56];
                 params[0..4].copy_from_slice(&NVBUF_TRANSFORM_FILTER.to_ne_bytes());
@@ -1112,7 +1150,7 @@ impl Drop for TegraEncoder {
         }
         unsafe {
             (self.vendor.close)(self.fd);
-            match &self.vendor.surfaces {
+            match self.surfaces {
                 Surfaces::Utils(api) => {
                     for fd in self.nv12_fd {
                         if fd >= 0 {
