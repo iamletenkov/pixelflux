@@ -56,7 +56,7 @@ sudo apt-get install -y \
 ### 2. Hardware Acceleration (Optional but Recommended)
 *   **NVIDIA (NVENC):** The library detects the NVIDIA driver at runtime. No extra compile-time packages are needed.
 *   **Intel/AMD (VA-API):** Ensure `libva-dev` and `libdrm-dev` are installed. You must also have the correct drivers (e.g., `intel-media-va-driver-non-free` or `mesa-va-drivers`).
-*   **NVIDIA Jetson (Tegra):** Nothing to install or build against. The L4T libraries the backend needs (`libnvv4l2.so`, `libnvbuf_utils.so`) ship with JetPack and are loaded at runtime.
+*   **NVIDIA Jetson (Tegra):** Nothing to install or build against. The L4T libraries the backend needs ship with JetPack and are loaded at runtime.
 
 ### 3. Install the Package
 
@@ -592,23 +592,23 @@ so no frame is converted on a CPU core.
 *   **Selection:** the ladder consults this backend before it probes render nodes, because a
     Jetson has no render node to probe. `hardware_encoders()` reports `[("h264", "tegra")]`
     there, and a session logs its backend as `TEGRA`.
-*   **Codecs:** H.264 only, 4:2:0, Main profile. The VIC does the colour conversion, so
+*   **Codecs:** H.264 only, 4:2:0, Main profile. The VIC does the color conversion, so
     `video_fullcolor` has no effect on this path.
 *   **Live changes:** the CBR target bitrate can be changed on a running session; the frame
     rate and the resolution rebuild it, as elsewhere.
 *   **Measured on a Jetson Nano** (L4T R32.6.1, four Cortex-A57 cores) in a live Selkies
     session, against the striped software encoder on the same board: 0.17 cores at 1080p30 and
     0.30 at 1080p60, against 2.26 cores for x264 at 1080p30. At 4K30 it holds 29 fps on
-    0.44 cores.
+    0.44 cores. The encode itself is 0.10 ms a frame at 1080p and 0.21 ms at 4K; what the path
+    actually spends is the copy of the captured frame into the staging surface (2.8 ms at
+    1080p, 9.6 ms at 4K) and the VIC conversion (1.7 ms and 5.9 ms).
 *   **Measured on an AGX Orin** (L4T R36.4.3, twelve Cortex-A78AE cores), isolated encode path
     over 200 frames: 0.05 cores at 1080p30, 0.10 at 1080p60, 0.20 at 1080p120 and 0.15 at 4K30,
     against 0.49 cores for the striped software encoder in a live session at 1080p30. 4K60 is
-    not reachable on that board either: the VIC conversion is 12 ms a frame there, which caps
-    the path at 46 fps. The conversion is pinned to the VIC rather than left at the API's
-    default, which cost 4.9 ms a frame at 1080p; the GPU does the same work in 0.9 ms, and that
-    GPU is what a robot runs its perception on. The encode itself is 0.10 ms a frame at 1080p and 0.21 ms at 4K; what the path
-    actually spends is the copy of the captured frame into the staging surface (2.8 ms at
-    1080p, 9.6 ms at 4K) and the VIC conversion (1.7 ms and 5.9 ms).
+    not reachable on that board either: the VIC conversion alone is 12 ms a frame there and the
+    path holds 46 fps. The conversion is pinned to the VIC rather than left at the API's
+    default; both cost 4.9 ms a frame at 1080p there and the GPU 0.9 ms, and that GPU is what a
+    robot runs its perception on.
 
 ## NVIDIA NVENC (X11)
 

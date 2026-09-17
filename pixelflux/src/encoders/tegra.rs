@@ -292,10 +292,7 @@ struct NvSurfTransformParams {
     dst_rect: *mut c_void,
 }
 
-/// `NvBufSurfTransformConfigParams` (16 bytes): which engine converts. Left at the default the
-/// conversion ran somewhere that cost 4.9 ms a frame at 1080p on an Orin; pinned to the VIC it is
-/// the same 4.9 ms, and on the GPU 0.9 ms — but the GPU on a robot is busy with the work the
-/// robot exists for, so the VIC is what this asks for.
+/// `NvBufSurfTransformConfigParams` (16 bytes): which engine converts.
 #[repr(C)]
 struct NvSurfConfigParams {
     compute_mode: i32,
@@ -328,7 +325,8 @@ fn staging_format(rgba: bool) -> i32 {
     if rgba { NVBUF_COLOR_ABGR32 } else { NVBUF_COLOR_XRGB32 }
 }
 
-/// The sizes the ioctl numbers above encode, checked against what this build lays out.
+/// The sizes this interface is laid out for — the V4L2 half as the ioctl numbers above encode
+/// them, the vendor half as its headers declare — against what this build lays out.
 fn abi_matches() -> Result<(), String> {
     let expected = [
         ("v4l2_format", size_of::<Format>(), 208),
@@ -360,7 +358,6 @@ type V4l2Close = unsafe extern "C" fn(c_int) -> c_int;
 type NvCreate = unsafe extern "C" fn(*mut c_int, *const NvBufferCreateParams) -> c_int;
 type NvRaw2Buf = unsafe extern "C" fn(*const u8, c_uint, c_int, c_int, c_int) -> c_int;
 type NvTransform = unsafe extern "C" fn(c_int, c_int, *mut c_void) -> c_int;
-type NvSync = unsafe extern "C" fn(c_int, c_uint, *mut *mut c_void) -> c_int;
 type NvDestroy = unsafe extern "C" fn(c_int) -> c_int;
 type NvSurfAlloc = unsafe extern "C" fn(*mut *mut NvSurf, u32, *mut NvSurfAllocateParams) -> c_int;
 type NvSurfDestroy = unsafe extern "C" fn(*mut NvSurf) -> c_int;
@@ -373,7 +370,7 @@ type NvSurfSetSession = unsafe extern "C" fn(*mut NvSurfConfigParams) -> c_int;
 
 /// The surface half of the vendor stack, which is where the two JetPack generations differ.
 ///
-/// JetPack 4 ships `libnvbuf_utils.so`. JetPack 5 deprecated it in favour of `NvBufSurface`, and
+/// JetPack 4 ships `libnvbuf_utils.so`. JetPack 5 deprecated it in favor of `NvBufSurface`, and
 /// JetPack 6 removed it: on an AGX Orin at L4T R36.4.3 there is no `libnvbuf_utils.so` at all,
 /// only `libnvbufsurface.so` and `libnvbufsurftransform.so`. The encoder half is identical on
 /// both — the same `libnvv4l2.so` and the same ioctls — so only this part is chosen at load time.
@@ -389,8 +386,6 @@ pub struct UtilsApi {
     create: NvCreate,
     raw2buf: NvRaw2Buf,
     transform: NvTransform,
-    #[allow(dead_code)]
-    sync: NvSync,
     destroy: NvDestroy,
 }
 
@@ -445,19 +440,17 @@ impl Vendor {
         // `nvbuf_utils` is the one this backend has the most hours on.
         let surfaces = match open_lib("libnvbuf_utils.so") {
             Ok(nvbuf) => {
-                let (create, raw2buf, transform, sync, destroy) = (
+                let (create, raw2buf, transform, destroy) = (
                     sym(&nvbuf, b"NvBufferCreateEx\0")?,
                     sym(&nvbuf, b"Raw2NvBuffer\0")?,
                     sym(&nvbuf, b"NvBufferTransform\0")?,
-                    sym(&nvbuf, b"NvBufferMemSyncForDevice\0")?,
                     sym(&nvbuf, b"NvBufferDestroy\0")?,
                 );
                 Surfaces::Utils(UtilsApi {
-                    create: unsafe { std::mem::transmute(create) },
-                    raw2buf: unsafe { std::mem::transmute(raw2buf) },
-                    transform: unsafe { std::mem::transmute(transform) },
-                    sync: unsafe { std::mem::transmute(sync) },
-                    destroy: unsafe { std::mem::transmute(destroy) },
+                    create: unsafe { std::mem::transmute::<*const c_void, NvCreate>(create) },
+                    raw2buf: unsafe { std::mem::transmute::<*const c_void, NvRaw2Buf>(raw2buf) },
+                    transform: unsafe { std::mem::transmute::<*const c_void, NvTransform>(transform) },
+                    destroy: unsafe { std::mem::transmute::<*const c_void, NvDestroy>(destroy) },
                     _lib: nvbuf,
                 })
             }
@@ -478,22 +471,22 @@ impl Vendor {
                     sym(&xform, b"NvBufSurfTransformSetSessionParams\0")?,
                 );
                 Surfaces::Surface(SurfaceApi {
-                    alloc: unsafe { std::mem::transmute(alloc) },
-                    destroy: unsafe { std::mem::transmute(destroy) },
-                    map: unsafe { std::mem::transmute(map) },
-                    unmap: unsafe { std::mem::transmute(unmap) },
-                    sync: unsafe { std::mem::transmute(sync) },
-                    transform: unsafe { std::mem::transmute(transform) },
-                    set_session: unsafe { std::mem::transmute(set_session) },
+                    alloc: unsafe { std::mem::transmute::<*const c_void, NvSurfAlloc>(alloc) },
+                    destroy: unsafe { std::mem::transmute::<*const c_void, NvSurfDestroy>(destroy) },
+                    map: unsafe { std::mem::transmute::<*const c_void, NvSurfMap>(map) },
+                    unmap: unsafe { std::mem::transmute::<*const c_void, NvSurfUnMap>(unmap) },
+                    sync: unsafe { std::mem::transmute::<*const c_void, NvSurfSync>(sync) },
+                    transform: unsafe { std::mem::transmute::<*const c_void, NvSurfTransform>(transform) },
+                    set_session: unsafe { std::mem::transmute::<*const c_void, NvSurfSetSession>(set_session) },
                     _surface: surface,
                     _transform: xform,
                 })
             }
         };
         Ok(Self {
-            open: unsafe { std::mem::transmute(open) },
-            ioctl: unsafe { std::mem::transmute(ioctl) },
-            close: unsafe { std::mem::transmute(close) },
+            open: unsafe { std::mem::transmute::<*const c_void, V4l2Open>(open) },
+            ioctl: unsafe { std::mem::transmute::<*const c_void, V4l2Ioctl>(ioctl) },
+            close: unsafe { std::mem::transmute::<*const c_void, V4l2Close>(close) },
             surfaces,
             _v4l2: v4l2,
         })
@@ -520,14 +513,14 @@ pub fn available() -> bool {
 
 /// The vendor libraries, loaded once for the process. They do not survive being unloaded and
 /// loaded again: a second `dlopen` after the first handle is dropped fails, and a session then
-/// falls back to software with nothing but a line in the log to say why.
+/// falls back to software, which the ladder's own refusal line reports.
 fn vendor() -> Option<&'static Vendor> {
     static VENDOR: OnceLock<Option<Vendor>> = OnceLock::new();
     VENDOR
         .get_or_init(|| match unsafe { Vendor::load() } {
             Ok(vendor) => Some(vendor),
             Err(e) => {
-                eprintln!("[pixelflux] Tegra vendor libraries unavailable: {e}");
+                crate::log::debug!("[pixelflux] Tegra vendor libraries unavailable: {e}");
                 None
             }
         })
@@ -649,9 +642,9 @@ impl TegraEncoder {
                 Ok(())
             }
             Surfaces::Surface(api) => {
-                // The conversion is pinned to the VIC block. Left at the default it cost 4.9 ms a
-                // frame at 1080p on an AGX Orin; the same conversion on the GPU takes 0.9 ms, and
-                // that is not this session's GPU to spend.
+                // Pinned to the VIC block. The default engine and the VIC both cost 4.9 ms a
+                // frame at 1080p on an AGX Orin and the GPU 0.9 ms, but that GPU is busy with
+                // the work the board exists for.
                 let mut cfg = NvSurfConfigParams { compute_mode: NVBUF_SURF_COMPUTE_VIC, ..Default::default() };
                 if unsafe { (api.set_session)(&mut cfg) } != NVBUF_SURF_TRANSFORM_SUCCESS {
                     eprintln!("[pixelflux] Tegra: the transform session would not take the VIC; using its default engine.");

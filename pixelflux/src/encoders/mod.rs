@@ -81,7 +81,7 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     #[cfg(target_arch = "aarch64")]
     if tegra::available() {
         let served: HardwareEncoders = vec![(Codec::H264, "tegra")];
-        println!("[pixelflux] Render node {node} encodes H.264 on tegra (vendor V4L2).");
+        println!("[pixelflux] Render node {node} encodes {} on tegra.", Codec::H264.display());
         probed.insert(node, served.clone());
         return served;
     }
@@ -421,9 +421,10 @@ pub enum FrameSource {
 /// cannot pick differently for the same settings:
 ///
 /// 1. Unless software encoding is forced (`use_cpu`, or encode node `-1`), the hardware
-///    backend the encode node's driver selects — NVENC on the NVIDIA driver, VA-API otherwise.
-///    A compatible NVENC session handed over in `prior` is reconfigured in place instead of
-///    rebuilt. A hardware refusal is logged and falls through.
+///    backend the encode node's driver selects — NVENC on the NVIDIA driver, VA-API otherwise,
+///    and on a Jetson the vendor V4L2 encoder before either, since that board publishes no
+///    render node driver to select on. A compatible NVENC session handed over in `prior` is
+///    reconfigured in place instead of rebuilt. A hardware refusal is logged and falls through.
 /// 2. A dmabuf source stops here: software cannot read dmabufs, and the caller's readback path
 ///    then runs this ladder again with host frames.
 /// 3. The software encoder of the codec, except JPEG and H.264, whose software path is the
@@ -448,10 +449,17 @@ pub fn select_frame_encoder(
             drop(prior);
             match tegra::TegraEncoder::new(settings, rgba) {
                 Ok(enc) => {
-                    println!("[{tag}] Tegra H.264 encoder initialized (vendor V4L2).");
+                    println!(
+                        "[{tag}] Encoder: TEGRA {} {} on the vendor V4L2 encoder.",
+                        codec.display(),
+                        chroma_name(enc.is_fullcolor())
+                    );
                     return Some(FrameEncoder::Tegra(enc));
                 }
-                Err(e) => eprintln!("[{tag}] Failed to init the Tegra encoder: {e}"),
+                Err(e) => {
+                    eprintln!("[{tag}] Failed to init the Tegra encoder: {e}");
+                    println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(Codec::H264));
+                }
             }
             return None;
         }
