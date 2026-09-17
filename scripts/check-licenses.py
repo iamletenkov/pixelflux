@@ -245,7 +245,9 @@ NATIVE: Dict[str, Dict[str, object]] = {
         library="libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), "
                 "libwayland-server.so.0 (MIT), libva.so.2 (MIT), "
                 "libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 "
-                "(proprietary)",
+                "(proprietary), and on aarch64 the Jetson Linux "
+                "libnvv4l2.so/libnvbuf_utils.so/libnvbufsurface.so/"
+                "libnvbufsurftransform.so (proprietary)",
         license="MIT and proprietary driver libraries", rank=PERMISSIVE,
         how="dlopen at run time, never linked", note="see nvcodec-sys"),
 }

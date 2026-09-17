@@ -8,7 +8,7 @@
 
 This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
 
-It encodes JPEG, H.264, H.265, VP8, VP9 and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so is the X11 path on an NVIDIA GPU whose session encodes on NVENC: NvFBC has the driver composite the X screen straight into video memory and that buffer is registered with the encoder in place, so a frame is never read, written or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
+It encodes JPEG, H.264, H.265, VP8, VP9 and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so is the X11 path on an NVIDIA GPU whose session encodes on NVENC: NvFBC has the driver composite the X screen straight into video memory and that buffer is registered with the encoder in place, so a frame is never read, written or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
 
 ## Installation
 
@@ -56,6 +56,7 @@ sudo apt-get install -y \
 ### 2. Hardware Acceleration (Optional but Recommended)
 *   **NVIDIA (NVENC):** The library detects the NVIDIA driver at runtime. No extra compile-time packages are needed.
 *   **Intel/AMD (VA-API):** Ensure `libva-dev` and `libdrm-dev` are installed. You must also have the correct drivers (e.g., `intel-media-va-driver-non-free` or `mesa-va-drivers`).
+*   **NVIDIA Jetson (Tegra):** Nothing to install or build against. The L4T libraries the backend needs ship with JetPack and are loaded at runtime.
 
 ### 3. Install the Package
 
@@ -576,6 +577,38 @@ curl -s -X POST http://localhost:5000/computer-use \
   -H 'Content-Type: application/json' \
   -d '{"action":"zoom","region":[100,200,400,350]}' | jq -r '.data' | base64 -d > zoomed.png
 ```
+
+## NVIDIA Jetson (Tegra)
+
+A Jetson has hardware H.264, and none of the usual ways to reach it: L4T carries no
+`libnvidia-encode`, has no VA-API driver, and its `/dev/v4l2-nvenc` node is a placeholder that
+`h264_v4l2m2m` cannot drive. The encoder is only reachable through the vendor's own libraries,
+so the Tegra session loads `libnvv4l2.so` for the encoder node and, for the surfaces, whichever
+library the board carries: `libnvbuf_utils.so` on JetPack 4, or `libnvbufsurface.so` with
+`libnvbufsurftransform.so` on JetPack 5 and 6, where the older one is gone. Either way the
+captured BGRA is converted to NV12 on the VIC block and the encoder is handed DMABUF surfaces,
+so no frame is converted on a CPU core.
+
+*   **Selection:** the ladder consults this backend before it probes render nodes, because a
+    Jetson has no render node to probe. `hardware_encoders()` reports `[("h264", "tegra")]`
+    there, and a session logs its backend as `TEGRA`.
+*   **Codecs:** H.264 only, 4:2:0, Main profile. The VIC does the color conversion, so
+    `video_fullcolor` has no effect on this path.
+*   **Live changes:** the CBR target bitrate can be changed on a running session; the frame
+    rate and the resolution rebuild it, as elsewhere.
+*   **Measured on a Jetson Nano** (L4T R32.6.1, four Cortex-A57 cores) in a live Selkies
+    session, against the striped software encoder on the same board: 0.17 cores at 1080p30 and
+    0.30 at 1080p60, against 2.26 cores for x264 at 1080p30. At 4K30 it holds 29 fps on
+    0.44 cores. The encode itself is 0.10 ms a frame at 1080p and 0.21 ms at 4K; what the path
+    actually spends is the copy of the captured frame into the staging surface (2.8 ms at
+    1080p, 9.6 ms at 4K) and the VIC conversion (1.7 ms and 5.9 ms).
+*   **Measured on an AGX Orin** (L4T R36.4.3, twelve Cortex-A78AE cores), isolated encode path
+    over 200 frames: 0.05 cores at 1080p30, 0.10 at 1080p60, 0.20 at 1080p120 and 0.15 at 4K30,
+    against 0.49 cores for the striped software encoder in a live session at 1080p30. 4K60 is
+    not reachable on that board either: the VIC conversion alone is 12 ms a frame there and the
+    path holds 46 fps. The conversion is pinned to the VIC rather than left at the API's
+    default; both cost 4.9 ms a frame at 1080p there and the GPU 0.9 ms, and that GPU is what a
+    robot runs its perception on.
 
 ## NVIDIA NVENC (X11)
 
