@@ -608,6 +608,32 @@ impl TegraEncoder {
         Ok(())
     }
 
+    /// One surface out of `NvBufSurfaceAllocate`, its batch marked as carrying a frame and its
+    /// first plane taken. The caller's field is written only once the surface is one `Drop` can
+    /// destroy, so an allocation the library refused leaves nothing behind to free.
+    fn allocate_surface(
+        api: &SurfaceApi,
+        params: &mut NvSurfAllocateParams,
+        what: &str,
+    ) -> Result<(*mut NvSurf, *mut NvSurfParams), String> {
+        let mut surf: *mut NvSurf = ptr::null_mut();
+        if unsafe { (api.alloc)(&mut surf, 1, params) } < 0 {
+            return Err(format!("NvBufSurfaceAllocate for {what} failed"));
+        }
+        if surf.is_null() {
+            return Err(format!("NvBufSurfaceAllocate for {what} returned no surface"));
+        }
+        // `numFilled` is what the transform reads to know the batch carries a frame.
+        let batch = unsafe { &mut *surf };
+        batch.num_filled = 1;
+        let plane = batch.surface_list;
+        if plane.is_null() {
+            unsafe { (api.destroy)(surf) };
+            return Err(format!("{what} came back carrying no plane"));
+        }
+        Ok((surf, plane))
+    }
+
     /// Allocate the two kinds of surface this path needs: one pitch-linear surface in the host
     /// frame's byte order, and one block-linear NV12 surface per queued encoder buffer.
     ///
@@ -658,27 +684,22 @@ impl TegraEncoder {
                     if rgba { NVBUF_SURF_COLOR_RGBA } else { NVBUF_SURF_COLOR_BGRX };
                 params.params.mem_type = NVBUF_MEM_SURFACE_ARRAY;
                 params.memtag = NVBUF_SURF_TAG_NONE;
-                if unsafe { (api.alloc)(&mut self.staging_surf, 1, &mut params) } < 0
-                    || self.staging_surf.is_null()
-                {
-                    return Err("NvBufSurfaceAllocate for the staging surface failed".into());
-                }
-                // `numFilled` is what the transform reads to know the batch carries a frame.
-                let staging = unsafe { &mut *self.staging_surf };
-                staging.num_filled = 1;
-                let plane = unsafe { &*staging.surface_list };
-                self.staging_fd = plane.buffer_desc as c_int;
-                self.staging_pitch = plane.pitch as usize;
-                if self.staging_pitch < self.row_bytes || plane.height != self.height as u32 {
+                let (surf, plane) = Self::allocate_surface(api, &mut params, "the staging surface")?;
+                self.staging_surf = surf;
+                let (desc, pitch, height) =
+                    unsafe { ((*plane).buffer_desc, (*plane).pitch as usize, (*plane).height) };
+                self.staging_fd = desc as c_int;
+                self.staging_pitch = pitch;
+                if pitch < self.row_bytes || height != self.height as u32 {
                     return Err(format!(
-                        "staging surface reports pitch {} height {} for {}x{}",
-                        self.staging_pitch, plane.height, self.width, self.height
+                        "staging surface reports pitch {pitch} height {height} for {}x{}",
+                        self.width, self.height
                     ));
                 }
-                if unsafe { (api.map)(self.staging_surf, 0, 0, NVBUF_SURF_MAP_READ_WRITE) } < 0 {
+                if unsafe { (api.map)(surf, 0, 0, NVBUF_SURF_MAP_READ_WRITE) } < 0 {
                     return Err("NvBufSurfaceMap of the staging surface failed".into());
                 }
-                let mapped = unsafe { (*staging.surface_list).mapped_addr[0] };
+                let mapped = unsafe { (*plane).mapped_addr[0] };
                 if mapped.is_null() {
                     return Err("the staging surface mapped to a null address".into());
                 }
@@ -688,14 +709,9 @@ impl TegraEncoder {
                 params.params.color_format = NVBUF_SURF_COLOR_NV12;
                 params.memtag = NVBUF_SURF_TAG_VIDEO_ENC;
                 for slot in 0..OUTPUT_BUFFERS {
-                    if unsafe { (api.alloc)(&mut self.nv12_surf[slot], 1, &mut params) } < 0
-                        || self.nv12_surf[slot].is_null()
-                    {
-                        return Err("NvBufSurfaceAllocate for an NV12 surface failed".into());
-                    }
-                    let surf = unsafe { &mut *self.nv12_surf[slot] };
-                    surf.num_filled = 1;
-                    self.nv12_fd[slot] = unsafe { (*surf.surface_list).buffer_desc } as c_int;
+                    let (surf, plane) = Self::allocate_surface(api, &mut params, "an NV12 surface")?;
+                    self.nv12_surf[slot] = surf;
+                    self.nv12_fd[slot] = unsafe { (*plane).buffer_desc } as c_int;
                 }
                 Ok(())
             }
