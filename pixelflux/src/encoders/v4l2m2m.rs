@@ -271,6 +271,17 @@ fn empty_format(type_: u32) -> Format {
     }
 }
 
+/// The fourcc for the bytes a caller holds. The kernel spells these by channel order in a
+/// word, so the name of each is the reverse of the memory it takes, and a session that picks
+/// by name rather than by byte order swaps red and blue without failing.
+fn input_format(rgba: bool) -> u32 {
+    if rgba {
+        V4L2_PIX_FMT_RGBA
+    } else {
+        V4L2_PIX_FMT_BGRA
+    }
+}
+
 /// What an encode node offers, read once for the process.
 struct NodeInfo {
     path: String,
@@ -461,7 +472,7 @@ impl V4l2M2mEncoder {
     }
 
     fn setup(&mut self, settings: &RustCaptureSettings, rgba: bool) -> Result<(), String> {
-        let input = if rgba { V4L2_PIX_FMT_RGBA } else { V4L2_PIX_FMT_BGRA };
+        let input = input_format(rgba);
         let mut output_format = empty_format(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
         output_format.pix_mp.width = self.width as u32;
         output_format.pix_mp.height = self.height as u32;
@@ -724,6 +735,55 @@ impl Drop for V4l2M2mEncoder {
         if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The structures are laid out for the sizes the ioctl numbers encode, so a layout that
+    /// drifted is caught here rather than by a device scribbling through a field.
+    #[test]
+    fn layouts_match_the_ioctl_numbers() {
+        abi_matches().expect("the V4L2 structures are laid out as their ioctl numbers say");
+    }
+
+    fn node(min: u32, max: u32, step: u32) -> NodeInfo {
+        NodeInfo {
+            path: "/dev/videoX".to_string(),
+            min_width: min,
+            max_width: max,
+            step_width: step,
+            min_height: min,
+            max_height: max,
+            step_height: step,
+        }
+    }
+
+    #[test]
+    fn a_node_takes_the_sizes_inside_its_range_and_on_its_step() {
+        let stepwise = node(32, 1920, 2);
+        assert!(stepwise.fits(1920, 1080), "1080p is inside 32..1920 by 2");
+        assert!(stepwise.fits(1920, 1200), "the ceiling is square, so 1920x1200 fits");
+        assert!(!stepwise.fits(2560, 1440), "a size past the ceiling does not fit");
+        assert!(!stepwise.fits(30, 30), "a size below the floor does not fit");
+        assert!(!stepwise.fits(1921, 1080), "an odd width is off a step of two");
+    }
+
+    /// A device that publishes one size answers for that size alone, which a step of zero says.
+    #[test]
+    fn a_discrete_node_takes_only_the_size_it_publishes() {
+        let discrete = node(1280, 1280, 0);
+        assert!(discrete.fits(1280, 1280));
+        assert!(!discrete.fits(1281, 1280));
+    }
+
+    #[test]
+    fn the_input_format_follows_the_bytes_the_caller_holds() {
+        assert_eq!(input_format(false), V4L2_PIX_FMT_BGRA, "an X11 capture hands over B,G,R,A");
+        assert_eq!(input_format(true), V4L2_PIX_FMT_RGBA, "an rgba caller hands over R,G,B,A");
+        assert_ne!(V4L2_PIX_FMT_BGRA, V4L2_PIX_FMT_RGBA);
     }
 }
 
