@@ -32,6 +32,9 @@ pub mod reference;
 /// CPU-based striped H.264 (libx264 or OpenH264, by build) / JPEG encoder with per-stripe
 /// change detection.
 pub mod software;
+/// The colour an H.264 stream declares: read from a sequence parameter set, and written into
+/// one for a device that converts without saying what it converted with.
+pub mod sps;
 /// Hardware H.264 through a generic stateful V4L2 M2M encoder: boards whose encoder sits
 /// behind the kernel's own interface rather than a vendor library or a render node, such as
 /// a Raspberry Pi 4, RK356x or i.MX8M. Built everywhere, since the interface is the kernel's.
@@ -341,7 +344,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.is_full_range(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => false,
-            FrameEncoder::V4l2m2m(_) => true,
+            FrameEncoder::V4l2m2m(enc) => enc.is_full_range(),
         }
     }
 
@@ -593,96 +596,6 @@ pub fn select_frame_encoder(
     }
 }
 
-/// The H.264 sequence parameter set read the reference checks of every backend share.
-#[cfg(test)]
-pub(crate) mod sps {
-    struct Bits<'a> {
-        rbsp: &'a [u8],
-        pos: usize,
-    }
-
-    impl Bits<'_> {
-        fn bits(&mut self, n: u32) -> u32 {
-            (0..n).fold(0, |acc, _| {
-                let bit = self.rbsp.get(self.pos / 8).map_or(0, |b| (b >> (7 - self.pos % 8)) & 1);
-                self.pos += 1;
-                (acc << 1) | bit as u32
-            })
-        }
-
-        fn ue(&mut self) -> u32 {
-            let mut zeros = 0;
-            while self.bits(1) == 0 && zeros < 32 {
-                zeros += 1;
-            }
-            (1 << zeros) - 1 + self.bits(zeros)
-        }
-
-        fn se(&mut self) -> i32 {
-            let k = self.ue() as i32;
-            if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) }
-        }
-    }
-
-    /// `max_num_ref_frames` of the first SPS in an Annex-B H.264 stream.
-    pub fn h264_max_num_ref_frames(stream: &[u8]) -> Option<u32> {
-        let nal = super::codec::annexb_nals(stream).find(|n| n[0] & 0x1f == 7)?;
-        let mut rbsp = Vec::with_capacity(nal.len());
-        let mut zeros = 0;
-        for &b in &nal[1..] {
-            if zeros >= 2 && b == 3 {
-                zeros = 0;
-                continue;
-            }
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-            rbsp.push(b);
-        }
-        let mut r = Bits { rbsp: &rbsp, pos: 0 };
-        let profile = r.bits(8);
-        r.bits(16);
-        r.ue();
-        if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
-            let chroma = r.ue();
-            if chroma == 3 {
-                r.bits(1);
-            }
-            r.ue();
-            r.ue();
-            r.bits(1);
-            if r.bits(1) == 1 {
-                for list in 0..(if chroma == 3 { 12 } else { 8 }) {
-                    if r.bits(1) == 1 {
-                        let (mut last, mut next) = (8i32, 8i32);
-                        for _ in 0..(if list < 6 { 16 } else { 64 }) {
-                            if next != 0 {
-                                next = (last + r.se()).rem_euclid(256);
-                            }
-                            if next != 0 {
-                                last = next;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        r.ue();
-        match r.ue() {
-            0 => {
-                r.ue();
-            }
-            1 => {
-                r.bits(1);
-                r.se();
-                r.se();
-                for _ in 0..r.ue() {
-                    r.se();
-                }
-            }
-            _ => {}
-        }
-        Some(r.ue())
-    }
-}
 
 /// The fixture the chroma-siting checks of every backend share.
 #[cfg(test)]

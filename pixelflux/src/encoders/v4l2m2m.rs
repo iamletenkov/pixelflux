@@ -32,6 +32,7 @@ use std::os::fd::RawFd;
 use std::sync::OnceLock;
 
 use super::codec::{h264_frame_type, push_video_header, Codec, VIDEO_HEADER_LEN};
+use super::sps::{self, ColorSignal};
 use super::reference::Reference;
 use crate::RustCaptureSettings;
 
@@ -285,6 +286,7 @@ fn input_format(rgba: bool) -> u32 {
 /// What an encode node offers, read once for the process.
 struct NodeInfo {
     path: String,
+    driver: String,
     min_width: u32,
     max_width: u32,
     step_width: u32,
@@ -350,6 +352,7 @@ fn frame_sizes(fd: RawFd, path: &str) -> Option<NodeInfo> {
     };
     Some(NodeInfo {
         path: path.to_string(),
+        driver: String::new(),
         min_width: min_w,
         max_width: max_w,
         step_width: step_w,
@@ -388,7 +391,10 @@ fn node() -> Option<&'static NodeInfo> {
                 if !enumerates(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_PIX_FMT_BGRA) {
                     return None;
                 }
-                frame_sizes(fd, &path)
+                let driver = String::from_utf8_lossy(&caps.driver)
+                    .trim_end_matches('\0')
+                    .to_string();
+                frame_sizes(fd, &path).map(|info| NodeInfo { driver, ..info })
             })();
             unsafe { libc::close(fd) };
             if let Some(info) = found {
@@ -402,6 +408,61 @@ fn node() -> Option<&'static NodeInfo> {
         None
     })
     .as_ref()
+}
+
+/// Where each sequence parameter set sits in an access unit, as `(start, end)` of the NAL unit
+/// itself, the start code excluded. A set repeats with every key frame when the encoder is asked
+/// for headers on each one, and a stream whose first set alone is written shows one color to the
+/// client that connected first and another to the one that joined later.
+fn sequence_parameter_sets(unit: &[u8]) -> Vec<(usize, usize)> {
+    let mut starts = Vec::new();
+    let mut index = 0;
+    while index + 3 < unit.len() {
+        if unit[index] == 0 && unit[index + 1] == 0 && unit[index + 2] == 1 {
+            starts.push(index + 3);
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let mut sets = Vec::new();
+    for (position, &start) in starts.iter().enumerate() {
+        if unit[start] & 0x1f != 7 {
+            continue;
+        }
+        let mut end = starts.get(position + 1).map_or(unit.len(), |next| next - 3);
+        if end > start && unit[end - 1] == 0 {
+            end -= 1;
+        }
+        sets.push((start, end));
+    }
+    sets
+}
+
+/// What a device is known to convert RGB with when it declares nothing itself. Only a device
+/// whose behavior is on record earns an entry: a Raspberry Pi with firmware older than August
+/// 2024 converts to full range BT.601 and writes no `video_signal_type`, which the driver's
+/// author states in the firmware tracker and a decoded chart confirms. Guessing for a device not
+/// on this list would put a claim in the stream that nobody has checked, and a wrong declaration
+/// colours a picture worse than an absent one.
+fn known_conversion(driver: &str) -> Option<ColorSignal> {
+    match driver {
+        "bcm2835-codec" => Some(ColorSignal::BT601_FULL),
+        _ => None,
+    }
+}
+
+/// What the session has learned about the colour its device produces.
+enum Color {
+    /// No access unit has come back yet.
+    Unknown,
+    /// The device declares its own colour, whatever it is, and the stream is left alone.
+    Declared(ColorSignal),
+    /// The device declares nothing and its conversion is on record, so every sequence parameter
+    /// set is written with it on the way out.
+    Writing(ColorSignal),
+    /// The device declares nothing and nothing is known about it, so nothing is claimed.
+    Untagged,
 }
 
 /// Whether this machine carries an M2M encode node at all.
@@ -430,6 +491,12 @@ pub struct V4l2M2mEncoder {
     bitrate_bps: u32,
     fps: f64,
     omit_headers: bool,
+    color: Color,
+    /// What to declare when the device declares nothing, or `None` for a device off the record.
+    fallback: Option<ColorSignal>,
+    /// A sequence parameter set arrives with every key frame and is identical each time, so it is
+    /// written once and matched by bytes after that.
+    written_sps: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 unsafe impl Send for V4l2M2mEncoder {}
@@ -464,6 +531,9 @@ impl V4l2M2mEncoder {
             bitrate_bps: (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000),
             fps: settings.target_fps.max(1.0),
             omit_headers: settings.omit_stripe_headers,
+            color: Color::Unknown,
+            fallback: known_conversion(&info.driver),
+            written_sps: None,
         };
         match encoder.setup(settings, rgba) {
             Ok(()) => Ok(encoder),
@@ -660,6 +730,88 @@ impl V4l2M2mEncoder {
         false
     }
 
+    /// What the stream says about its colour, once an access unit has settled it.
+    fn signal(&self) -> Option<ColorSignal> {
+        match self.color {
+            Color::Declared(signal) | Color::Writing(signal) => Some(signal),
+            Color::Unknown | Color::Untagged => None,
+        }
+    }
+
+    /// The range the stream declares, which is the device's to decide: a session that says
+    /// nothing is described as limited, since that is what a decoder given nothing assumes.
+    pub fn is_full_range(&self) -> bool {
+        self.signal().is_some_and(|signal| signal.full_range)
+    }
+
+    /// Learn what the first sequence parameter set says, and write one into every later set when
+    /// the device said nothing and its conversion is on record.
+    fn tag_color(&mut self, unit: &[u8]) -> Option<Vec<u8>> {
+        let sets = sequence_parameter_sets(unit);
+        if sets.is_empty() {
+            return None;
+        }
+        if matches!(self.color, Color::Unknown) {
+            let (start, end) = sets[0];
+            self.color = match sps::read_color(&unit[start..end]) {
+                Some(signal) => {
+                    println!(
+                        "[pixelflux] The M2M encoder declares its own color: matrix {}, {} range.",
+                        signal.matrix,
+                        if signal.full_range { "full" } else { "limited" }
+                    );
+                    Color::Declared(signal)
+                }
+                None => match self.fallback {
+                    Some(signal) => {
+                        println!(
+                            "[pixelflux] The M2M encoder declares no color; writing matrix {}, {} range into its headers.",
+                            signal.matrix,
+                            if signal.full_range { "full" } else { "limited" }
+                        );
+                        Color::Writing(signal)
+                    }
+                    None => {
+                        eprintln!(
+                            "[pixelflux] The M2M encoder declares no color and none is on record for it; the stream carries none, and a decoder will guess from the frame size."
+                        );
+                        Color::Untagged
+                    }
+                },
+            };
+        }
+        let Color::Writing(signal) = self.color else { return None };
+
+        let mut out = Vec::with_capacity(unit.len() + 8 * sets.len());
+        let mut copied = 0;
+        for (start, end) in sets {
+            let original = &unit[start..end];
+            let written = match &self.written_sps {
+                Some((was, now)) if was == original => now.clone(),
+                _ => match sps::write_color(original, signal) {
+                    Ok(written) => {
+                        self.written_sps = Some((original.to_vec(), written.clone()));
+                        written
+                    }
+                    Err(e) => {
+                        // A set this code cannot write is left as it came: a stream that carries
+                        // no color is watchable, and one carrying a set built wrong is not.
+                        if self.written_sps.is_none() {
+                            eprintln!("[pixelflux] The sequence parameter set was left as it came: {e}");
+                            self.color = Color::Untagged;
+                        }
+                        return None;
+                    }
+                },
+            };
+            out.extend_from_slice(&unit[copied..start]);
+            out.extend_from_slice(&written);
+            copied = end;
+        }
+        out.extend_from_slice(&unit[copied..]);
+        Some(out)
+    }
+
     /// Apply a live bitrate or frame rate change. Both are writable while streaming on this path,
     /// and the frame rate goes down with the bitrate: left behind, it would budget a new bitrate
     /// against an old rate.
@@ -697,8 +849,10 @@ impl V4l2M2mEncoder {
             return Err(format!("the node returned capture buffer {slot}"));
         }
         let (data, _) = self.capture[slot];
-        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
-        let mut out = Vec::with_capacity(VIDEO_HEADER_LEN + length);
+        let unit = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+        let tagged = self.tag_color(unit);
+        let bytes = tagged.as_deref().unwrap_or(unit);
+        let mut out = Vec::with_capacity(VIDEO_HEADER_LEN + bytes.len());
         if self.omit_headers {
             out.extend_from_slice(bytes);
         } else {
@@ -752,6 +906,7 @@ mod tests {
     fn node(min: u32, max: u32, step: u32) -> NodeInfo {
         NodeInfo {
             path: "/dev/videoX".to_string(),
+            driver: "test".to_string(),
             min_width: min,
             max_width: max,
             step_width: step,
@@ -959,6 +1114,44 @@ mod hardware_tests {
             }
         }
         frame
+    }
+
+    /// What the stream declares, read back by a decoder that is not ours: FFmpeg parses the
+    /// sequence parameter set the session carries and reports the signal in it. This is the check
+    /// that a written set is a set a decoder accepts, rather than one our own reader agrees with.
+    #[test]
+    #[ignore]
+    fn v4l2_the_color_reads_back_through_a_decoder() {
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use ffmpeg_sys_next::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
+        use ffmpeg_sys_next::AVColorSpace::{AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
+
+        let mut encoder =
+            V4l2M2mEncoder::new(&settings(1280, 720), false).expect("the session comes up");
+        let frame = chart(1280, 720);
+        let unit = encoder.encode_host(&frame, 1280 * 4, false, 0, 26, true).expect("a frame");
+        let mut decoder = AvDecoder::new(Codec::H264).expect("a decoder");
+        assert!(decoder.decode(&unit).expect("the stream decodes"), "no frame came back");
+
+        let Some(signal) = encoder.signal() else {
+            assert_eq!(
+                decoder.color_tags().map(|(space, _)| space),
+                Some(ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_UNSPECIFIED),
+                "the session claims nothing, so the stream must claim nothing either"
+            );
+            return;
+        };
+        let space = match signal.matrix {
+            1 => AVCOL_SPC_BT709,
+            6 => AVCOL_SPC_SMPTE170M,
+            other => panic!("the session declares matrix {other}, which this check does not map"),
+        };
+        let range = if signal.full_range { AVCOL_RANGE_JPEG } else { AVCOL_RANGE_MPEG };
+        assert_eq!(
+            decoder.color_tags(),
+            Some((space, range)),
+            "the decoder read something other than what the session declares"
+        );
     }
 
     /// A size past the device's range is refused before a session exists, so the ladder falls
