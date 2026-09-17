@@ -16,6 +16,9 @@ cuda = []
 regen = ["bindgen", "regex"]
 
 [build-dependencies]
-# Pinned to the version that produced the committed bindings so a regen reproduces them.
+# Pinned to the version that produced the committed bindings so a regen reproduces them. The
+# regen builds from this directory against the lock beside it, because cargo refuses
+# `--features` for a package outside the workspace; pixelflux's own lock therefore carries
+# whichever bindgen its other -sys crates resolve, not this pin.
 bindgen = { version = "=0.73.2", default-features = false, features = ["runtime"], optional = true }
 regex = { version = "1", optional = true }
