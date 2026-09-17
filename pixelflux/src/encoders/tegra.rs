@@ -1150,7 +1150,15 @@ impl TegraEncoder {
                 (self.vendor.ioctl)(self.fd, VIDIOC_DQBUF, &mut buffer as *mut Buffer as *mut c_void)
             };
             if rc < 0 {
-                break;
+                // EAGAIN is the only answer that means "nothing ready yet" on a non-blocking
+                // node. Anything else is a session that has stopped working, and reporting it as
+                // an empty frame would leave the caller waiting on a stream that never returns
+                // instead of rebuilding the encoder.
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EAGAIN) {
+                    break;
+                }
+                return Err(format!("DQBUF capture failed: {err}"));
             }
             let index = buffer.index as usize;
             let length = planes[0].bytesused as usize;
