@@ -1081,9 +1081,10 @@ mod rebuild_cost {
         let first_ms = t.elapsed().as_secs_f64() * 1000.0;
         assert!(!out.is_empty());
         println!("openh264 1080p init={init_ms:.1}ms first_frame={first_ms:.1}ms");
-        // Headroom for heavily-loaded runners: the assertion exists to catch
-        // pathological rebuilds (seconds), not a few ms of host contention.
-        assert!(init_ms < 250.0, "OpenH264 init unexpectedly slow: {init_ms}ms");
+        // The bound is the one the check is for: a rebuild gone pathological takes seconds,
+        // so a second is the line. A tighter one fails on host contention alone -- 260ms on a
+        // loaded builder -- which reports nothing about the encoder and costs a red suite.
+        assert!(init_ms < 1000.0, "OpenH264 init unexpectedly slow: {init_ms}ms");
     }
 }
 
