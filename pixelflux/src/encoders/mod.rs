@@ -110,8 +110,10 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
         // The node index names nothing here: an M2M encoder is not a render node, and the
         // answer is the same whichever index was asked about. It is cached under the key all
         // the same, so a caller asking twice is answered from the same probe.
-        let served: HardwareEncoders = vec![(Codec::H264, "v4l2m2m")];
-        println!("[pixelflux] A stateful V4L2 M2M encoder serves {}.", Codec::H264.display());
+        let codecs = v4l2m2m::served();
+        let served: HardwareEncoders = codecs.iter().map(|&c| (c, "v4l2m2m")).collect();
+        let names: Vec<&str> = codecs.iter().map(|c| c.display()).collect();
+        println!("[pixelflux] A stateful V4L2 M2M encoder serves {}.", names.join(", "));
         probed.insert(node, served.clone());
         return served;
     }
@@ -558,9 +560,9 @@ pub fn select_frame_encoder(
         // reached only once the two backends that do have refused. The size is checked before
         // the node is opened: a refusal here falls through to software, a refusal later would
         // leave a session that came up and produces nothing.
-        if let (Codec::H264, FrameSource::Host { rgba }) = (codec, source) {
-            if v4l2m2m::encodes(settings.width, settings.height) {
-                match v4l2m2m::V4l2M2mEncoder::new(settings, rgba) {
+        if let (Some(_), FrameSource::Host { rgba }) = (v4l2m2m::coded_fourcc(codec), source) {
+            if v4l2m2m::encodes(codec, settings.width, settings.height) {
+                match v4l2m2m::V4l2M2mEncoder::new(codec, settings, rgba) {
                     Ok(enc) => {
                         println!(
                             "[{tag}] Encoder: V4L2M2M {} {} on a stateful M2M node.",

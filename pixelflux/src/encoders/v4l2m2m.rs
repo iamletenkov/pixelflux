@@ -31,7 +31,10 @@ use std::mem::size_of;
 use std::os::fd::RawFd;
 use std::sync::OnceLock;
 
-use super::codec::{h264_frame_type, push_video_header, Codec, VIDEO_HEADER_LEN};
+use super::codec::{
+    frame_type_from_key, h264_frame_type, h265_frame_type, push_video_header, vp8_is_key,
+    vp9_is_key, Codec, VIDEO_HEADER_LEN,
+};
 use super::sps::{self, ColorSignal};
 use super::reference::Reference;
 use crate::RustCaptureSettings;
@@ -48,6 +51,22 @@ const V4L2_CAP_VIDEO_M2M: u32 = 0x0000_4000;
 const V4L2_PIX_FMT_BGRA: u32 = 0x3432_4241;
 const V4L2_PIX_FMT_RGBA: u32 = 0x3452_4742;
 const V4L2_PIX_FMT_H264: u32 = 0x3436_3248;
+const V4L2_PIX_FMT_HEVC: u32 = 0x4356_4548;
+const V4L2_PIX_FMT_VP8: u32 = 0x3038_5056;
+const V4L2_PIX_FMT_VP9: u32 = 0x3039_5056;
+
+/// The capture-queue format for a codec the kernel's interface names, or `None` for one it does
+/// not. The queues, the controls and the input format are the same whichever of these a node
+/// carries, so the codec is a parameter rather than a second backend.
+pub fn coded_fourcc(codec: Codec) -> Option<u32> {
+    match codec {
+        Codec::H264 => Some(V4L2_PIX_FMT_H264),
+        Codec::H265 => Some(V4L2_PIX_FMT_HEVC),
+        Codec::Vp8 => Some(V4L2_PIX_FMT_VP8),
+        Codec::Vp9 => Some(V4L2_PIX_FMT_VP9),
+        Codec::Av1 | Codec::Jpeg => None,
+    }
+}
 
 const VIDIOC_QUERYCAP: u64 = 0x8068_5600;
 const VIDIOC_ENUM_FMT: u64 = 0xc040_5602;
@@ -287,6 +306,8 @@ fn input_format(rgba: bool) -> u32 {
 struct NodeInfo {
     path: String,
     driver: String,
+    /// The coded formats its capture queue enumerates, which is what it encodes.
+    coded: Vec<u32>,
     min_width: u32,
     max_width: u32,
     step_width: u32,
@@ -296,6 +317,11 @@ struct NodeInfo {
 }
 
 impl NodeInfo {
+    /// Whether this node encodes `codec`.
+    fn serves(&self, codec: Codec) -> bool {
+        coded_fourcc(codec).is_some_and(|f| self.coded.contains(&f))
+    }
+
     /// Whether a session of this size can come up, answered before anything is built: a refusal
     /// here falls through to software, a refusal later leaves a black stream.
     fn fits(&self, width: u32, height: u32) -> bool {
@@ -328,10 +354,10 @@ fn enumerates(fd: RawFd, type_: u32, wanted: u32) -> bool {
     false
 }
 
-fn frame_sizes(fd: RawFd, path: &str) -> Option<NodeInfo> {
+fn frame_sizes(fd: RawFd, path: &str, coded: u32) -> Option<NodeInfo> {
     let mut sizes = FrameSizeEnum {
         index: 0,
-        pixel_format: V4L2_PIX_FMT_H264,
+        pixel_format: coded,
         type_: 0,
         bounds: [0; 6],
         reserved: [0; 2],
@@ -353,6 +379,7 @@ fn frame_sizes(fd: RawFd, path: &str) -> Option<NodeInfo> {
     Some(NodeInfo {
         path: path.to_string(),
         driver: String::new(),
+        coded: Vec::new(),
         min_width: min_w,
         max_width: max_w,
         step_width: step_w,
@@ -385,7 +412,12 @@ fn node() -> Option<&'static NodeInfo> {
                 if caps.device_caps & (V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M) == 0 {
                     return None;
                 }
-                if !enumerates(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_PIX_FMT_H264) {
+                let coded: Vec<u32> = [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9]
+                    .into_iter()
+                    .filter_map(coded_fourcc)
+                    .filter(|&f| enumerates(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, f))
+                    .collect();
+                if coded.is_empty() {
                     return None;
                 }
                 if !enumerates(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_PIX_FMT_BGRA) {
@@ -394,7 +426,7 @@ fn node() -> Option<&'static NodeInfo> {
                 let driver = String::from_utf8_lossy(&caps.driver)
                     .trim_end_matches('\0')
                     .to_string();
-                frame_sizes(fd, &path).map(|info| NodeInfo { driver, ..info })
+                frame_sizes(fd, &path, coded[0]).map(|info| NodeInfo { driver, coded, ..info })
             })();
             unsafe { libc::close(fd) };
             if let Some(info) = found {
@@ -457,7 +489,7 @@ fn fallback_rates(wanted: f64) -> Vec<f64> {
 /// 2024 converts to full range BT.601 and writes no `video_signal_type`, which the driver's
 /// author states in the firmware tracker and a decoded chart confirms. Guessing for a device not
 /// on this list would put a claim in the stream that nobody has checked, and a wrong declaration
-/// colours a picture worse than an absent one.
+/// colors a picture worse than an absent one.
 fn known_conversion(driver: &str) -> Option<ColorSignal> {
     match driver {
         "bcm2835-codec" => Some(ColorSignal::BT601_FULL),
@@ -465,12 +497,12 @@ fn known_conversion(driver: &str) -> Option<ColorSignal> {
     }
 }
 
-/// What the session has learned about the colour its device produces.
+/// What the session has learned about the color its device produces.
 enum Color {
     /// No access unit has come back yet, and nothing is on record for this device either, so
     /// what the stream will say is not known until one arrives.
     Unknown,
-    /// The device declares its own colour, whatever it is, and the stream is left alone.
+    /// The device declares its own color, whatever it is, and the stream is left alone.
     Declared(ColorSignal),
     /// The device declares nothing and its conversion is on record, so every sequence parameter
     /// set is written with it on the way out.
@@ -484,17 +516,32 @@ pub fn available() -> bool {
     node().is_some()
 }
 
-/// Whether a session of this size would come up on it, so the ladder can fall through to software
-/// before a session exists rather than after one has failed.
-pub fn encodes(width: i32, height: i32) -> bool {
+/// Whether a session of this codec and size would come up on it, so the ladder can fall through
+/// to software before a session exists rather than after one has failed.
+pub fn encodes(codec: Codec, width: i32, height: i32) -> bool {
     match node() {
-        Some(info) if width > 0 && height > 0 => info.fits(width as u32, height as u32),
+        Some(info) if width > 0 && height > 0 => {
+            info.serves(codec) && info.fits(width as u32, height as u32)
+        }
         _ => false,
+    }
+}
+
+/// The codecs the node encodes, for the report a caller reads before any session exists.
+pub fn served() -> Vec<Codec> {
+    match node() {
+        Some(info) => [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9]
+            .into_iter()
+            .filter(|&c| info.serves(c))
+            .collect(),
+        None => Vec::new(),
     }
 }
 
 pub struct V4l2M2mEncoder {
     fd: RawFd,
+    codec: Codec,
+    coded: u32,
     width: i32,
     height: i32,
     row_bytes: usize,
@@ -518,8 +565,11 @@ pub struct V4l2M2mEncoder {
 unsafe impl Send for V4l2M2mEncoder {}
 
 impl V4l2M2mEncoder {
-    pub fn new(settings: &RustCaptureSettings, rgba: bool) -> Result<Self, String> {
+    pub fn new(codec: Codec, settings: &RustCaptureSettings, rgba: bool) -> Result<Self, String> {
         let info = node().ok_or("no V4L2 M2M encode node")?;
+        let coded = coded_fourcc(codec).filter(|f| info.coded.contains(f)).ok_or_else(|| {
+            format!("{} encodes no {}", info.path, codec.display())
+        })?;
         let (width, height) = (settings.width, settings.height);
         if width <= 0 || height <= 0 {
             return Err(format!("the encoder needs positive dimensions, got {width}x{height}"));
@@ -537,6 +587,8 @@ impl V4l2M2mEncoder {
         }
         let mut encoder = Self {
             fd,
+            codec,
+            coded,
             width,
             height,
             row_bytes: width as usize * 4,
@@ -635,7 +687,7 @@ impl V4l2M2mEncoder {
         let mut capture_format = empty_format(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
         capture_format.pix_mp.width = self.width as u32;
         capture_format.pix_mp.height = self.height as u32;
-        capture_format.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
+        capture_format.pix_mp.pixelformat = self.coded;
         capture_format.pix_mp.plane_fmt[0].sizeimage =
             ((self.width * self.height) as u32).max(2 << 20);
         self.call(VIDIOC_S_FMT, &mut capture_format, "S_FMT capture")?;
@@ -795,7 +847,18 @@ impl V4l2M2mEncoder {
     }
 
     pub fn codec(&self) -> Codec {
-        Codec::H264
+        self.codec
+    }
+
+    /// The wire picture type of one access unit, read with the codec's own syntax: an H.265 NAL
+    /// header is two bytes where H.264's is one, and VP8 and VP9 carry no NAL units at all.
+    fn frame_type(&self, bytes: &[u8]) -> u8 {
+        match self.codec {
+            Codec::H265 => h265_frame_type(bytes),
+            Codec::Vp8 => frame_type_from_key(vp8_is_key(bytes)),
+            Codec::Vp9 => frame_type_from_key(vp9_is_key(bytes)),
+            _ => h264_frame_type(bytes),
+        }
     }
 
     /// The firmware converts to 4:2:0 and the encoder takes nothing else.
@@ -803,7 +866,7 @@ impl V4l2M2mEncoder {
         false
     }
 
-    /// What the stream says about its colour, once an access unit has settled it.
+    /// What the stream says about its color, once an access unit has settled it.
     fn signal(&self) -> Option<ColorSignal> {
         match self.color {
             Color::Declared(signal) | Color::Writing(signal) => Some(signal),
@@ -933,7 +996,7 @@ impl V4l2M2mEncoder {
             push_video_header(
                 &mut out,
                 Codec::H264,
-                h264_frame_type(bytes),
+                self.frame_type(bytes),
                 frame_number as u16,
                 0,
                 self.width as u16,
@@ -981,6 +1044,7 @@ mod tests {
         NodeInfo {
             path: "/dev/videoX".to_string(),
             driver: "test".to_string(),
+            coded: vec![V4L2_PIX_FMT_H264],
             min_width: min,
             max_width: max,
             step_width: step,
@@ -989,6 +1053,33 @@ mod tests {
             step_height: step,
         }
     }
+
+    /// A node is taken for what its capture queue enumerates, so one that encodes more than
+    /// H.264 serves more than H.264 and one that encodes less is not asked for it.
+    #[test]
+    fn a_node_serves_the_codecs_it_enumerates() {
+        let mut info = node(16, 1920, 2);
+        info.coded = vec![V4L2_PIX_FMT_H264, V4L2_PIX_FMT_HEVC];
+        assert!(info.serves(Codec::H264) && info.serves(Codec::H265));
+        assert!(!info.serves(Codec::Vp8), "a format it does not enumerate is not served");
+        assert!(!info.serves(Codec::Av1), "and one the interface cannot name is never served");
+        info.coded = vec![V4L2_PIX_FMT_VP9];
+        assert!(!info.serves(Codec::H264), "a node without H.264 is not asked for it");
+        assert!(info.serves(Codec::Vp9));
+    }
+
+    /// The fourccs are the kernel's own, and an interface that cannot name a codec says so
+    /// rather than guessing one.
+    #[test]
+    fn a_codec_maps_to_the_fourcc_the_kernel_names() {
+        assert_eq!(coded_fourcc(Codec::H264), Some(u32::from_le_bytes(*b"H264")));
+        assert_eq!(coded_fourcc(Codec::H265), Some(u32::from_le_bytes(*b"HEVC")));
+        assert_eq!(coded_fourcc(Codec::Vp8), Some(u32::from_le_bytes(*b"VP80")));
+        assert_eq!(coded_fourcc(Codec::Vp9), Some(u32::from_le_bytes(*b"VP90")));
+        assert_eq!(coded_fourcc(Codec::Av1), None);
+        assert_eq!(coded_fourcc(Codec::Jpeg), None);
+    }
+
 
     #[test]
     fn a_node_takes_the_sizes_inside_its_range_and_on_its_step() {
@@ -1068,15 +1159,15 @@ mod hardware_tests {
     #[ignore]
     fn v4l2_node_answers_for_the_sizes_it_encodes() {
         assert!(available(), "no M2M encode node on this machine");
-        assert!(encodes(1920, 1080), "1080p is inside every such device's range");
-        assert!(!encodes(0, 0), "a zero size is not encodable");
+        assert!(encodes(Codec::H264, 1920, 1080), "1080p is inside every such device's range");
+        assert!(!encodes(Codec::H264, 0, 0), "a zero size is not encodable");
     }
 
     #[test]
     #[ignore]
     fn v4l2_encodes_host_frames_to_h264() {
         let mut encoder =
-            V4l2M2mEncoder::new(&settings(1280, 720), false).expect("the session comes up");
+            V4l2M2mEncoder::new(Codec::H264, &settings(1280, 720), false).expect("the session comes up");
         let frame = chart(1280, 720);
         let first = encoder.encode_host(&frame, 1280 * 4, false, 0, 26, true).expect("first frame");
         let types = nal_types(&first);
@@ -1100,7 +1191,7 @@ mod hardware_tests {
     #[ignore]
     fn v4l2_takes_a_live_rate_change() {
         let mut encoder =
-            V4l2M2mEncoder::new(&settings(1280, 720), false).expect("the session comes up");
+            V4l2M2mEncoder::new(Codec::H264, &settings(1280, 720), false).expect("the session comes up");
         let frame = chart(1280, 720);
         encoder.encode_host(&frame, 1280 * 4, false, 0, 26, true).expect("first frame");
         let mut lowered = settings(1280, 720);
@@ -1131,7 +1222,7 @@ mod hardware_tests {
         ];
         for (name, frames) in contents {
             let mut encoder =
-                V4l2M2mEncoder::new(&settings(width, height), false).expect("the session comes up");
+                V4l2M2mEncoder::new(Codec::H264, &settings(width, height), false).expect("the session comes up");
             let cpu_before = process_cpu_seconds();
             let started = std::time::Instant::now();
             let mut bytes = 0usize;
@@ -1198,7 +1289,7 @@ mod hardware_tests {
     fn v4l2_steps_down_from_a_rate_the_device_refuses() {
         let mut asked = settings(1920, 1080);
         asked.target_fps = 60.0;
-        let encoder = V4l2M2mEncoder::new(&asked, false)
+        let encoder = V4l2M2mEncoder::new(Codec::H264, &asked, false)
             .expect("a session came up at some rate the device takes");
         assert!(encoder.fps <= 60.0, "the session reports a rate it never asked for");
         assert!(encoder.fps >= 15.0, "the session stepped below the floor");
@@ -1215,7 +1306,7 @@ mod hardware_tests {
         use ffmpeg_sys_next::AVColorSpace::{AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
 
         let mut encoder =
-            V4l2M2mEncoder::new(&settings(1280, 720), false).expect("the session comes up");
+            V4l2M2mEncoder::new(Codec::H264, &settings(1280, 720), false).expect("the session comes up");
         let frame = chart(1280, 720);
         let unit = encoder.encode_host(&frame, 1280 * 4, false, 0, 26, true).expect("a frame");
         let mut decoder = AvDecoder::new(Codec::H264).expect("a decoder");
@@ -1249,8 +1340,8 @@ mod hardware_tests {
     fn v4l2_refuses_a_size_past_the_ceiling() {
         let info = node().expect("a node");
         let too_wide = (info.max_width + info.step_width.max(2)) as i32;
-        assert!(!encodes(too_wide, 1080), "a size past the ceiling reported as encodable");
-        let error = match V4l2M2mEncoder::new(&settings(too_wide, 1080), false) {
+        assert!(!encodes(Codec::H264, too_wide, 1080), "a size past the ceiling reported as encodable");
+        let error = match V4l2M2mEncoder::new(Codec::H264, &settings(too_wide, 1080), false) {
             Ok(_) => panic!("a session past the ceiling came up"),
             Err(e) => e,
         };

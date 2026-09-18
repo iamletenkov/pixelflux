@@ -77,13 +77,15 @@ leaves a frame a consumer lost out of the predictions so recovery costs no keyfr
 the device reports reference-picture invalidation, libx264 always, and the stream declares the
 decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that cannot refuses, and the caller forces an
 IDR instead. Every full-frame session is chosen by one ladder,
-`encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then a stateful V4L2
-memory-to-memory device where one encodes the session's codec, then NVENC on the NVIDIA driver, VA-API otherwise, then the
-codec's software encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback.
-The V4L2 step comes before the render-node probes because the boards it serves -- the Raspberry Pi's
-`bcm2835-codec`, RK356x's hantro, i.MX8M's VPU -- publish no driver for those probes to select, and it is
-reached by asking for the interface (`V4L2_CAP_VIDEO_M2M` and the codec's fourcc on the capture queue) rather
-than by naming a board, so a device nobody here has is served on the same path. Both backends take the codec as
+`encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then NVENC on the NVIDIA
+driver, VA-API otherwise, then a stateful V4L2 memory-to-memory device, then the codec's software encoder, then
+a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback.
+The V4L2 step comes after the render-node probes, since a machine carrying either backend never reaches it, and
+the boards it serves -- the Raspberry Pi's `bcm2835-codec`, RK356x's hantro, i.MX8M's VPU -- publish no driver
+for those probes to select. It is reached by asking for the interface (`V4L2_CAP_VIDEO_M2M` and the codec's
+fourcc on the capture queue) rather than by naming a board, so a device nobody here has is served on the same
+path, and the size is checked before the node is opened because a refusal afterwards leaves a session that
+produces nothing. Both backends take the codec as
 a parameter rather than carrying a second copy of the interface: the queues, controls and surface formats are
 the same whichever coded format the capture queue is set to, so a device that advertises H.265 serves it there.
 Only the picture type is codec-specific, because an H.265 NAL header is two bytes where H.264's is one. `encoders/nvenc.rs`

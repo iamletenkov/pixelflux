@@ -1,13 +1,13 @@
-//! The colour a stream declares, read from an H.264 sequence parameter set and written into one.
+//! The color a stream declares, read from an H.264 sequence parameter set and written into one.
 //!
 //! An encoder that converts RGB itself decides the matrix and the range, and the stream is the
 //! only place a decoder learns which it was: with no `video_signal_type` in the VUI a browser
-//! guesses from the frame size, so one session is coloured one way at 1080p and another at
+//! guesses from the frame size, so one session is colored one way at 1080p and another at
 //! 800x600. Devices differ in whether they say: a Raspberry Pi with firmware from August 2024
 //! or later converts and declares it, and the same board on an older firmware converts to full
 //! range BT.601 and declares nothing at all.
 //!
-//! So this reads first. A stream that declares its colour is left alone, whatever it declares,
+//! So this reads first. A stream that declares its color is left alone, whatever it declares,
 //! because the device knows what it did and we do not. Only a stream that declares nothing is
 //! written into, and then only with a value the caller can justify.
 //!
@@ -16,7 +16,7 @@
 //! no business of ours, and a writer that re-emits what it does not understand is a writer that
 //! corrupts streams on devices it was never run against.
 
-/// What a stream says about the colour it carries.
+/// What a stream says about the color it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorSignal {
     pub full_range: bool,
@@ -253,7 +253,7 @@ fn locate(rbsp: &[u8]) -> Result<Located, String> {
             })
         } else {
             // A range without a matrix says half of what a decoder needs, and the half it leaves
-            // out is the one that colours the picture, so this counts as undeclared.
+            // out is the one that colors the picture, so this counts as undeclared.
             None
         }
     } else {
@@ -262,7 +262,7 @@ fn locate(rbsp: &[u8]) -> Result<Located, String> {
     Ok(Located { start, end: r.pos, vui_present: true, vui_flag, declared })
 }
 
-/// What the stream says about its colour, or `None` when it says nothing a decoder can use.
+/// What the stream says about its color, or `None` when it says nothing a decoder can use.
 pub fn read_color(nal: &[u8]) -> Option<ColorSignal> {
     let rbsp = unescape(nal.get(1..)?);
     locate(&rbsp).ok()?.declared
@@ -410,7 +410,7 @@ pub use dpb::h264_max_num_ref_frames;
 mod tests {
     use super::*;
 
-    /// An SPS a Raspberry Pi 4 produced at 1280x720: a VUI with timing and no colour at all.
+    /// An SPS a Raspberry Pi 4 produced at 1280x720: a VUI with timing and no color at all.
     const PI4_SPS: &[u8] = &[
         0x27, 0x64, 0x00, 0x28, 0xac, 0x2b, 0x40, 0x28, 0x02, 0xdd, 0x08, 0x00, 0x00, 0x03, 0x00,
         0x08, 0x00, 0x00, 0x03, 0x01, 0xe7, 0x15, 0x00, 0x01, 0xe8, 0x48, 0x00, 0x02, 0xfa, 0xf3,
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn what_is_written_reads_back() {
         for signal in [ColorSignal::BT601_FULL, ColorSignal::BT709_LIMITED] {
-            let patched = write_color(PI4_SPS, signal).expect("the SPS takes a colour");
+            let patched = write_color(PI4_SPS, signal).expect("the SPS takes a color");
             assert_eq!(read_color(&patched), Some(signal), "what was written did not read back");
         }
     }
@@ -452,12 +452,12 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_colour_reads_back_as_declared() {
+    fn a_declared_color_reads_back_as_declared() {
         let patched = write_color(PI4_SPS, ColorSignal::BT709_LIMITED).expect("patched");
         assert_eq!(read_color(&patched), Some(ColorSignal::BT709_LIMITED));
         let again = write_color(&patched, ColorSignal::BT601_FULL).expect("rewritten");
         assert_eq!(read_color(&again), Some(ColorSignal::BT601_FULL), "a rewrite did not replace");
-        assert_eq!(again.len(), patched.len(), "replacing a colour changed the length");
+        assert_eq!(again.len(), patched.len(), "replacing a color changed the length");
     }
 
     /// Emulation prevention is not decoration: a byte pair of zeros followed by a small byte is
