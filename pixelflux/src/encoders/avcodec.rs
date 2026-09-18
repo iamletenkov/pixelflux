@@ -1035,7 +1035,9 @@ impl AvcodecEncoder {
             let vbv = if self.library == "svt-av1" { vbv.max(bps / 50) } else { vbv };
             (*ctx).bit_rate = bps;
             if self.rate_ceiling {
-                (*ctx).rc_max_rate = bps;
+                // SVT-AV1 refuses a ceiling equal to the target and wants one strictly above it,
+                // where every other encoder here reads equal bounds as a constant rate.
+                (*ctx).rc_max_rate = if self.library == "svt-av1" { bps + 1 } else { bps };
                 (*ctx).rc_min_rate = bps;
             }
             (*ctx).rc_buffer_size = vbv.min(i32::MAX as i64) as i32;
