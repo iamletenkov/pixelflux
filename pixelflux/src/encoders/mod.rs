@@ -32,6 +32,13 @@ pub mod reference;
 /// CPU-based striped H.264 (libx264 or OpenH264, by build) / JPEG encoder with per-stripe
 /// change detection.
 pub mod software;
+/// The colour an H.264 stream declares: read from a sequence parameter set, and written into
+/// one for a device that converts without saying what it converted with.
+pub mod sps;
+/// Hardware H.264 through a generic stateful V4L2 M2M encoder: boards whose encoder sits
+/// behind the kernel's own interface rather than a vendor library or a render node, such as
+/// a Raspberry Pi 4, RK356x or i.MX8M. Built everywhere, since the interface is the kernel's.
+pub mod v4l2m2m;
 
 pub use codec::*;
 
@@ -98,6 +105,15 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
             Vec::new()
         }
     };
+    if served.is_empty() && v4l2m2m::available() {
+        // The node index names nothing here: an M2M encoder is not a render node, and the
+        // answer is the same whichever index was asked about. It is cached under the key all
+        // the same, so a caller asking twice is answered from the same probe.
+        let served: HardwareEncoders = vec![(Codec::H264, "v4l2m2m")];
+        println!("[pixelflux] A stateful V4L2 M2M encoder serves {}.", Codec::H264.display());
+        probed.insert(node, served.clone());
+        return served;
+    }
     if !served.is_empty() {
         let names: Vec<&str> = served.iter().map(|(codec, _)| codec.display()).collect();
         println!("[pixelflux] Render node {node} encodes {} on {backend}.", names.join(", "));
@@ -225,6 +241,7 @@ pub fn colorspace_desc(fullcolor: bool, full_range: bool) -> &'static str {
     match (fullcolor, full_range) {
         (true, true) => "I444 (Full Range)",
         (true, false) => "I444 (Limited Range)",
+        (false, true) => "I420 (Full Range)",
         _ => "I420 (Limited Range)",
     }
 }
@@ -269,6 +286,8 @@ pub enum FrameEncoder {
     /// Tegra's encoder, reached through the vendor V4L2 library.
     #[cfg(target_arch = "aarch64")]
     Tegra(tegra::TegraEncoder),
+    /// A stateful V4L2 M2M encoder, driven through the kernel interface directly.
+    V4l2m2m(v4l2m2m::V4l2M2mEncoder),
 }
 
 impl FrameEncoder {
@@ -279,6 +298,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.codec(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.codec(),
+            FrameEncoder::V4l2m2m(enc) => enc.codec(),
         }
     }
 
@@ -289,6 +309,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.backend() == Backend::Vaapi,
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => true,
+            FrameEncoder::V4l2m2m(_) => true,
         }
     }
 
@@ -300,6 +321,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.library(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => "TEGRA",
+            FrameEncoder::V4l2m2m(_) => "V4L2M2M",
         }
     }
 
@@ -310,16 +332,19 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.is_fullcolor(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.is_fullcolor(),
+            FrameEncoder::V4l2m2m(enc) => enc.is_fullcolor(),
         }
     }
 
-    /// Whether the session signals full range, which only a software 4:4:4 of x264's kind does.
+    /// Whether the session signals full range: a software 4:4:4 of x264's kind, and the V4L2
+    /// M2M sessions whose firmware converts at full range and offers no way to ask for another.
     pub fn is_full_range(&self) -> bool {
         match self {
             FrameEncoder::Nvenc(_) => false,
             FrameEncoder::Avcodec(enc) => enc.is_full_range(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => false,
+            FrameEncoder::V4l2m2m(enc) => enc.is_full_range(),
         }
     }
 
@@ -334,6 +359,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.reconfigure_rate(settings),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.reconfigure_rate(settings),
+            FrameEncoder::V4l2m2m(enc) => enc.reconfigure_rate(settings),
         }
     }
 
@@ -353,6 +379,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.encode_host(pixels, stride, frame_number, qp, force_idr),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
+            FrameEncoder::V4l2m2m(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
         }
     }
 
@@ -363,6 +390,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(_) => reference::Reference::Untracked,
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => reference::Reference::Untracked,
+            FrameEncoder::V4l2m2m(_) => reference::Reference::Untracked,
         }
     }
 
@@ -375,6 +403,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(_) => false,
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => false,
+            FrameEncoder::V4l2m2m(_) => false,
         }
     }
 
@@ -391,6 +420,7 @@ impl FrameEncoder {
             FrameEncoder::Avcodec(enc) => enc.encode_dmabuf(dmabuf, frame_number, qp, force_idr),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => Err("the Tegra session takes host frames".into()),
+            FrameEncoder::V4l2m2m(_) => Err("the V4L2 M2M session takes host frames".into()),
         }
     }
 }
@@ -498,6 +528,10 @@ pub fn select_frame_encoder(
                 Err(e) => eprintln!("[{tag}] Failed to init NVENC {}: {e}", codec.display()),
             }
         } else {
+            // Nothing below reconfigures a session in place, so the previous one is released
+            // here: a single-context M2M node refuses to open while its own last session is
+            // alive, and a window resize would then demote a working hardware path.
+            drop(prior);
             let input = match source {
                 FrameSource::Dmabuf { .. } => Input::Dmabuf,
                 FrameSource::Host { rgba } => Input::Host { rgba },
@@ -514,6 +548,25 @@ pub fn select_frame_encoder(
                     return Some(FrameEncoder::Avcodec(enc));
                 }
                 Err(e) => eprintln!("[{tag}] Failed to init VAAPI {}: {e}", codec.display()),
+            }
+        }
+        // A stateful M2M encoder publishes no render node driver to select on, so it is
+        // reached only once the two backends that do have refused. The size is checked before
+        // the node is opened: a refusal here falls through to software, a refusal later would
+        // leave a session that came up and produces nothing.
+        if let (Codec::H264, FrameSource::Host { rgba }) = (codec, source) {
+            if v4l2m2m::encodes(settings.width, settings.height) {
+                match v4l2m2m::V4l2M2mEncoder::new(settings, rgba) {
+                    Ok(enc) => {
+                        println!(
+                            "[{tag}] Encoder: V4L2M2M {} {} on a stateful M2M node.",
+                            codec.display(),
+                            chroma_name(enc.is_fullcolor())
+                        );
+                        return Some(FrameEncoder::V4l2m2m(enc));
+                    }
+                    Err(e) => eprintln!("[{tag}] Failed to init the V4L2 M2M encoder: {e}"),
+                }
             }
         }
     } else {
@@ -543,96 +596,6 @@ pub fn select_frame_encoder(
     }
 }
 
-/// The H.264 sequence parameter set read the reference checks of every backend share.
-#[cfg(test)]
-pub(crate) mod sps {
-    struct Bits<'a> {
-        rbsp: &'a [u8],
-        pos: usize,
-    }
-
-    impl Bits<'_> {
-        fn bits(&mut self, n: u32) -> u32 {
-            (0..n).fold(0, |acc, _| {
-                let bit = self.rbsp.get(self.pos / 8).map_or(0, |b| (b >> (7 - self.pos % 8)) & 1);
-                self.pos += 1;
-                (acc << 1) | bit as u32
-            })
-        }
-
-        fn ue(&mut self) -> u32 {
-            let mut zeros = 0;
-            while self.bits(1) == 0 && zeros < 32 {
-                zeros += 1;
-            }
-            (1 << zeros) - 1 + self.bits(zeros)
-        }
-
-        fn se(&mut self) -> i32 {
-            let k = self.ue() as i32;
-            if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) }
-        }
-    }
-
-    /// `max_num_ref_frames` of the first SPS in an Annex-B H.264 stream.
-    pub fn h264_max_num_ref_frames(stream: &[u8]) -> Option<u32> {
-        let nal = super::codec::annexb_nals(stream).find(|n| n[0] & 0x1f == 7)?;
-        let mut rbsp = Vec::with_capacity(nal.len());
-        let mut zeros = 0;
-        for &b in &nal[1..] {
-            if zeros >= 2 && b == 3 {
-                zeros = 0;
-                continue;
-            }
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-            rbsp.push(b);
-        }
-        let mut r = Bits { rbsp: &rbsp, pos: 0 };
-        let profile = r.bits(8);
-        r.bits(16);
-        r.ue();
-        if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
-            let chroma = r.ue();
-            if chroma == 3 {
-                r.bits(1);
-            }
-            r.ue();
-            r.ue();
-            r.bits(1);
-            if r.bits(1) == 1 {
-                for list in 0..(if chroma == 3 { 12 } else { 8 }) {
-                    if r.bits(1) == 1 {
-                        let (mut last, mut next) = (8i32, 8i32);
-                        for _ in 0..(if list < 6 { 16 } else { 64 }) {
-                            if next != 0 {
-                                next = (last + r.se()).rem_euclid(256);
-                            }
-                            if next != 0 {
-                                last = next;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        r.ue();
-        match r.ue() {
-            0 => {
-                r.ue();
-            }
-            1 => {
-                r.bits(1);
-                r.se();
-                r.se();
-                for _ in 0..r.ue() {
-                    r.se();
-                }
-            }
-            _ => {}
-        }
-        Some(r.ue())
-    }
-}
 
 /// The fixture the chroma-siting checks of every backend share.
 #[cfg(test)]

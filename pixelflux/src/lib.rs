@@ -1504,7 +1504,8 @@ pub(crate) fn log_stream_settings(
 ) {
     let backend = video_encoder.map(|enc| (enc.backend_name(), enc.is_hardware()));
     let fullcolor = encoders::session_fullcolor(video_encoder, settings);
-    log_stream_settings_of(tag, settings, n_stripes, backend, fullcolor);
+    let full_range = encoders::session_full_range(video_encoder, settings);
+    log_stream_settings_of(tag, settings, n_stripes, backend, fullcolor, full_range);
 }
 
 /// The "Stream settings active" line for a backend named outright, `(name, hardware)`, where
@@ -1516,6 +1517,7 @@ pub(crate) fn log_stream_settings_of(
     n_stripes: usize,
     backend: Option<(&str, bool)>,
     fullcolor: bool,
+    full_range: bool,
 ) {
     let mut log_msg = format!(
         "[{tag}] Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
@@ -1565,7 +1567,7 @@ pub(crate) fn log_stream_settings_of(
 
         log_msg.push_str(&format!(
             " | Colorspace: {}",
-            encoders::colorspace_desc(fullcolor, backend.is_none_or(|(_, hardware)| !hardware))
+            encoders::colorspace_desc(fullcolor, full_range)
         ));
     }
 

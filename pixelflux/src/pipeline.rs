@@ -635,9 +635,13 @@ mod tests {
             });
             assert_eq!(p.encoder_name(), format!("CPU ({})", crate::encoders::software_library(Codec::H264)));
             assert_eq!(p.colorspace_desc(), expected);
+            // A striped software session signals full range exactly when it carries 4:4:4, so
+            // the describing call takes that rather than a constant: a 4:2:0 session converted
+            // at full range exists now, and the two are no longer the same thing.
+            let session_444 = fullcolor && carries_444;
             assert_eq!(
                 p.colorspace_desc(),
-                crate::encoders::colorspace_desc(fullcolor && carries_444, true),
+                crate::encoders::colorspace_desc(session_444, session_444),
                 "X11 and Wayland must describe the same session identically"
             );
         }
