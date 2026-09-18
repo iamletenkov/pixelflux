@@ -492,6 +492,7 @@ pub fn select_frame_encoder(
                 Err(e) => {
                     eprintln!("[{tag}] Failed to init the Tegra encoder: {e}");
                     println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(codec));
+                    crate::report::encoder_reason(&format!("Tegra {} did not open: {e}", codec.display()));
                 }
             }
             return None;
