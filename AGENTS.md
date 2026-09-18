@@ -77,8 +77,13 @@ leaves a frame a consumer lost out of the predictions so recovery costs no keyfr
 the device reports reference-picture invalidation, libx264 always, and the stream declares the
 decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that cannot refuses, and the caller forces an
 IDR instead. Every full-frame session is chosen by one ladder,
-`encoders::select_frame_encoder` (NVENC on the NVIDIA driver, VA-API otherwise, then the codec's software
-encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback. `encoders/nvenc.rs`
+`encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then a stateful V4L2
+memory-to-memory device where one encodes H.264, then NVENC on the NVIDIA driver, VA-API otherwise, then the
+codec's software encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback.
+The V4L2 step comes before the render-node probes because the boards it serves -- the Raspberry Pi's
+`bcm2835-codec`, RK356x's hantro, i.MX8M's VPU -- publish no driver for those probes to select, and it is
+reached by asking for the interface (`V4L2_CAP_VIDEO_M2M` and H.264 on the capture queue) rather than by
+naming a board, so a device nobody here has is served on the same path. `encoders/nvenc.rs`
 is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
 the libavcodec session: VA-API for all five codecs (a 4:4:4 session tries the surface formats the
 driver allocates and its video processor renders, read through libva's `VAProfileNone`
@@ -104,7 +109,10 @@ the packed surface, a pitch-linear dmabuf import or a texture over an array-type
 the NV12 NVENC encodes; 4:4:4 subsamples nothing and keeps the hardware conversion, as does a
 driver that refuses the kernel.
 `AvDecoder::color_tags` reads what a stream declares, and the unit tests hold each
-encoder to it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
+encoder to it; the sequence headers travel with every IDR so a client joining or resynchronizing on any key
+frame can decode, which `encoders/v4l2m2m.rs` keeps true itself for the devices whose drivers will not
+(`REPEAT_SEQ_HEADER` is asked for and the parameter sets are put back where it is refused), since neither
+FFmpeg's nor GStreamer's M2M encoder guarantees it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
 ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265
 ultrafast with wavefront threads) and NVENC at preset P3 with two-pass quarter-resolution rate control
