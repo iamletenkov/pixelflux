@@ -1,4 +1,4 @@
-//! Tegra hardware H.264 and H.265 through the vendor V4L2 encoder.
+//! Tegra hardware video encoding through the vendor V4L2 encoder.
 //!
 //! Tegra ships no `libnvidia-encode`, so the NVENC backend cannot open it, it publishes no render
 //! node driver for the VA-API one to probe, and its encoder is not a plain V4L2 M2M node either:
@@ -25,13 +25,17 @@
 //! from memory, and `abi_matches` checks the sizes those numbers encode.
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
+use std::fs;
 use std::mem::size_of;
 use std::sync::OnceLock;
 use std::ptr;
 
 use libloading::{Library, Symbol};
 
-use super::codec::{h264_frame_type, h265_frame_type, push_video_header, Codec, VIDEO_HEADER_LEN};
+use super::codec::{
+    av1_is_key, frame_type_from_key, h264_frame_type, h265_frame_type, push_video_header, Codec,
+    VIDEO_HEADER_LEN,
+};
 use super::reference::Reference;
 use crate::RustCaptureSettings;
 
@@ -43,6 +47,7 @@ const V4L2_PIX_FMT_NV12M: u32 = 0x3231_4d4e;
 const V4L2_PIX_FMT_H264: u32 = 0x3436_3248;
 /// The vendor library spells HEVC `H265`, not the `HEVC` of a mainline V4L2 encoder.
 const V4L2_PIX_FMT_H265: u32 = 0x3536_3248;
+const V4L2_PIX_FMT_AV1: u32 = 0x3031_5641;
 /// The driver copies this buffer's timestamp to the access unit it produces.
 const V4L2_BUF_FLAG_TIMESTAMP_COPY: u32 = 0x4000;
 
@@ -64,6 +69,8 @@ const CID_H265_PROFILE: u32 = 0x0099_0b01;
 const CID_IDR_INTERVAL: u32 = 0x0099_0b02;
 const CID_VBV_SIZE: u32 = 0x0099_0b13;
 const CID_INSERT_SPS_PPS_AT_IDR: u32 = 0x0099_0b17;
+/// AV1 carries no parameter sets; its sequence header rides the frame under its own control.
+const CID_AV1_HEADERS_WITH_FRAME: u32 = 0x0099_0b39;
 const CID_HW_PRESET: u32 = 0x0099_0b1c;
 const CID_INSERT_VUI: u32 = 0x0099_0b22;
 const CID_MAX_PERFORMANCE: u32 = 0x0099_0b2a;
@@ -549,20 +556,47 @@ fn load_surfaces() -> Result<Surfaces, String> {
     }
 }
 
-/// The capture-queue format for a codec the vendor encoder serves, or `None` for one it does
-/// not. Every Jetson since T210 encodes both of these, and the queues, controls and surface
-/// formats are the same for either, so the codec is a parameter rather than a second backend.
+/// The capture-queue format for a codec the vendor encoder can be set to, or `None` for one it
+/// has no format for. The queues, controls and surface formats are the same whichever of these
+/// the capture queue carries, so the codec is a parameter rather than a second backend.
 pub fn coded_fourcc(codec: Codec) -> Option<u32> {
     match codec {
         Codec::H264 => Some(V4L2_PIX_FMT_H264),
         Codec::H265 => Some(V4L2_PIX_FMT_H265),
+        Codec::Av1 => Some(V4L2_PIX_FMT_AV1),
         _ => None,
     }
 }
 
-/// The codecs the vendor encoder serves, in the order the ladder prefers them.
+/// The SoC generation from the device tree's root `compatible`, which names it as `tegra234`
+/// among the board's own strings. Read rather than probed: the encoder publishes no format list
+/// without opening its node, which is not safe until the surface library has loaded.
+fn soc_generation() -> Option<u32> {
+    let compatible = fs::read("/proc/device-tree/compatible")
+        .or_else(|_| fs::read("/sys/firmware/devicetree/base/compatible"))
+        .ok()?;
+    soc_generation_of(&compatible)
+}
+
+/// The generation named in a device tree `compatible`, whose entries are NUL-separated and carry
+/// the board's own strings alongside `nvidia,tegra234` and the looser `nvidia,tegra23x`.
+fn soc_generation_of(compatible: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(compatible)
+        .split(|c: char| c.is_ascii_whitespace() || c == '\0' || c == ',')
+        .filter_map(|part| part.strip_prefix("tegra")?.parse::<u32>().ok())
+        .max()
+}
+
+/// The codecs the vendor encoder serves on this board. Every Jetson L4T supports encodes H.264
+/// and H.265; Orin adds AV1. A board whose SoC is not named here is taken to be newer than they
+/// are and offered the whole set, because a format it does not serve is refused at `S_FMT` and
+/// the ladder falls back, where one wrongly withheld has no route back to its hardware.
 pub fn served() -> Vec<Codec> {
-    vec![Codec::H264, Codec::H265]
+    let mut served = vec![Codec::H264, Codec::H265];
+    if soc_generation().is_none_or(|generation| generation >= 234) {
+        served.push(Codec::Av1);
+    }
+    served
 }
 
 /// Whether this host has the Tegra encoder: the encoder library loads and an encoder node is
@@ -979,15 +1013,28 @@ impl TegraEncoder {
         let vbv = (bitrate_bps as f64 / fps.max(1.0)) as i64;
         self.set_control(CID_BITRATE, bitrate_bps as i64, "bitrate")?;
         self.set_control(CID_BITRATE_MODE, BITRATE_MODE_CBR as i64, "rate control mode")?;
-        let (profile_cid, profile) = match self.codec {
-            Codec::H265 => (CID_H265_PROFILE, H265_PROFILE_MAIN),
-            _ => (CID_H264_PROFILE, H264_PROFILE_MAIN),
+        // AV1 has no profile control in the vendor header; the other two carry their own.
+        let profile = match self.codec {
+            Codec::H264 => Some((CID_H264_PROFILE, H264_PROFILE_MAIN)),
+            Codec::H265 => Some((CID_H265_PROFILE, H265_PROFILE_MAIN)),
+            _ => None,
         };
-        self.set_control(profile_cid, profile as i64, "profile")?;
+        if let Some((cid, value)) = profile {
+            self.set_control(cid, value as i64, "profile")?;
+        }
         self.set_control(CID_HW_PRESET, HW_PRESET_ULTRAFAST as i64, "preset")?;
         self.set_control(CID_MAX_PERFORMANCE, 1, "max performance")?;
-        self.set_control(CID_INSERT_SPS_PPS_AT_IDR, 1, "SPS/PPS at IDR")?;
-        self.set_control(CID_INSERT_VUI, 1, "VUI")?;
+        // Every IDR carries what a client needs to start on it: parameter sets for H.264 and
+        // H.265, the sequence header for AV1, which the vendor puts behind its own control. VUI
+        // is an H.264 and H.265 construct, and AV1 declares its color in that sequence header.
+        let headers = match self.codec {
+            Codec::Av1 => CID_AV1_HEADERS_WITH_FRAME,
+            _ => CID_INSERT_SPS_PPS_AT_IDR,
+        };
+        self.set_control(headers, 1, "sequence headers at IDR")?;
+        if self.codec != Codec::Av1 {
+            self.set_control(CID_INSERT_VUI, 1, "VUI")?;
+        }
         // Picture order count type is an H.264 field with no H.265 counterpart, and NVIDIA
         // documents even the H.264 control as Orin-only on current L4T though older drivers
         // take it. It saves a few bits per slice on a stream that never reorders and nothing
@@ -1091,6 +1138,7 @@ impl TegraEncoder {
     fn frame_type(&self, bytes: &[u8]) -> u8 {
         match self.codec {
             Codec::H265 => h265_frame_type(bytes),
+            Codec::Av1 => frame_type_from_key(av1_is_key(bytes)),
             _ => h264_frame_type(bytes),
         }
     }
@@ -1308,9 +1356,10 @@ mod tests {
     fn hevc_is_spelled_the_way_the_vendor_library_spells_it() {
         assert_eq!(coded_fourcc(Codec::H264), Some(u32::from_le_bytes(*b"H264")));
         assert_eq!(coded_fourcc(Codec::H265), Some(u32::from_le_bytes(*b"H265")));
+        assert_eq!(coded_fourcc(Codec::Av1), Some(u32::from_le_bytes(*b"AV10")));
         assert_ne!(coded_fourcc(Codec::H265), Some(u32::from_le_bytes(*b"HEVC")),
                    "the kernel's HEVC fourcc is not the vendor library's");
-        for codec in [Codec::Vp8, Codec::Vp9, Codec::Av1, Codec::Jpeg] {
+        for codec in [Codec::Vp8, Codec::Vp9, Codec::Jpeg] {
             assert_eq!(coded_fourcc(codec), None, "{} has no vendor encoder here", codec.display());
         }
     }
@@ -1325,6 +1374,33 @@ mod tests {
             assert!(coded_fourcc(*codec).is_some(), "{} is reported but has no format", codec.display());
         }
         assert!(served.contains(&Codec::H264) && served.contains(&Codec::H265));
+    }
+
+    /// The generation is read out of the board's own `compatible`, where it sits among strings
+    /// that are not it, and a board newer than any named here keeps every codec rather than
+    /// losing one to a name this does not recognize.
+    #[test]
+    fn the_soc_generation_is_read_from_the_boards_compatible() {
+        let orin = b"nvidia,p3737-0000+p3701-0000\0nvidia,tegra234\0nvidia,tegra23x\0";
+        assert_eq!(soc_generation_of(orin), Some(234));
+        assert_eq!(soc_generation_of(b"nvidia,p3448-0000\0nvidia,tegra210\0"), Some(210));
+        assert_eq!(soc_generation_of(b"nvidia,p2771-0000\0nvidia,tegra186\0"), Some(186));
+        assert_eq!(soc_generation_of(b"nvidia,tegra194\0"), Some(194));
+        assert_eq!(soc_generation_of(b"brcm,bcm2711\0"), None, "a board that is no Tegra names none");
+        assert_eq!(soc_generation_of(b""), None);
+    }
+
+    /// AV1 is Orin's and newer, and a board too old for it is not offered it; one whose SoC this
+    /// cannot name is, because the encoder refuses a format it does not serve and the ladder
+    /// falls back, where withholding one leaves hardware unreachable.
+    #[test]
+    fn av1_follows_the_generation_and_an_unknown_board_keeps_it() {
+        for old in [b"nvidia,tegra210\0".as_slice(), b"nvidia,tegra186\0", b"nvidia,tegra194\0"] {
+            assert!(soc_generation_of(old).unwrap() < 234);
+        }
+        assert!(soc_generation_of(b"nvidia,tegra234\0").unwrap() >= 234);
+        assert!(soc_generation_of(b"nvidia,tegra264\0").unwrap() >= 234, "a newer Tegra still clears it");
+        assert_eq!(soc_generation_of(b"unknown\0"), None, "and an unnamed board reads as unknown");
     }
 
     /// The profile control is the codec's own: H.264's is a standard kernel CID and H.265's a
