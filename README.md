@@ -8,7 +8,7 @@
 
 This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
 
-It encodes JPEG, H.264, H.265, VP8, VP9 and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so is the X11 path on an NVIDIA GPU whose session encodes on NVENC: NvFBC has the driver composite the X screen straight into video memory and that buffer is registered with the encoder in place, so a frame is never read, written or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
+It encodes JPEG, H.264, H.265, VP8, VP9 and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264 and H.265 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so is the X11 path on an NVIDIA GPU whose session encodes on NVENC: NvFBC has the driver composite the X screen straight into video memory and that buffer is registered with the encoder in place, so a frame is never read, written or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
 
 ## Installation
 
@@ -580,7 +580,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ## NVIDIA Jetson (Tegra)
 
-A Jetson has hardware H.264, and none of the usual ways to reach it: L4T carries no
+A Jetson has hardware H.264 and H.265, and none of the usual ways to reach them: L4T carries no
 `libnvidia-encode`, has no VA-API driver, and its `/dev/v4l2-nvenc` node is a placeholder that
 `h264_v4l2m2m` cannot drive. The encoder is only reachable through the vendor's own libraries,
 so the Tegra session loads `libnvv4l2.so` for the encoder node and, for the surfaces, whichever
@@ -590,10 +590,11 @@ captured BGRA is converted to NV12 on the VIC block and the encoder is handed DM
 so no frame is converted on a CPU core.
 
 *   **Selection:** the ladder consults this backend before it probes render nodes, because a
-    Jetson has no render node to probe. `hardware_encoders()` reports `[("h264", "tegra")]`
-    there, and a session logs its backend as `TEGRA`.
-*   **Codecs:** H.264 only, 4:2:0, Main profile. The VIC does the color conversion, so
-    `video_fullcolor` has no effect on this path.
+    Jetson has no render node to probe. `hardware_encoders()` reports
+    `[("h264", "tegra"), ("h265", "tegra")]` there, and a session logs its backend as `TEGRA`.
+*   **Codecs:** H.264 and H.265, 4:2:0, Main profile. The capture queue is set to the session's
+    codec and everything else about the path is the same for either. The VIC does the color
+    conversion, so `video_fullcolor` has no effect on this path.
 *   **Live changes:** the CBR target bitrate can be changed on a running session; the frame
     rate and the resolution rebuild it, as elsewhere.
 *   **Measured on a Jetson Nano** (L4T R32.6.1, four Cortex-A57 cores) in a live Selkies

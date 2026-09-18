@@ -78,12 +78,15 @@ the device reports reference-picture invalidation, libx264 always, and the strea
 decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that cannot refuses, and the caller forces an
 IDR instead. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then a stateful V4L2
-memory-to-memory device where one encodes H.264, then NVENC on the NVIDIA driver, VA-API otherwise, then the
+memory-to-memory device where one encodes the session's codec, then NVENC on the NVIDIA driver, VA-API otherwise, then the
 codec's software encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback.
 The V4L2 step comes before the render-node probes because the boards it serves -- the Raspberry Pi's
 `bcm2835-codec`, RK356x's hantro, i.MX8M's VPU -- publish no driver for those probes to select, and it is
-reached by asking for the interface (`V4L2_CAP_VIDEO_M2M` and H.264 on the capture queue) rather than by
-naming a board, so a device nobody here has is served on the same path. `encoders/nvenc.rs`
+reached by asking for the interface (`V4L2_CAP_VIDEO_M2M` and the codec's fourcc on the capture queue) rather
+than by naming a board, so a device nobody here has is served on the same path. Both backends take the codec as
+a parameter rather than carrying a second copy of the interface: the queues, controls and surface formats are
+the same whichever coded format the capture queue is set to, so a device that advertises H.265 serves it there.
+Only the picture type is codec-specific, because an H.265 NAL header is two bytes where H.264's is one. `encoders/nvenc.rs`
 is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
 the libavcodec session: VA-API for all five codecs (a 4:4:4 session tries the surface formats the
 driver allocates and its video processor renders, read through libva's `VAProfileNone`

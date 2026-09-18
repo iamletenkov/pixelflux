@@ -13,7 +13,7 @@
 pub mod avcodec;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
-/// Tegra hardware H.264 through the vendor V4L2 encoder, loaded at runtime: the only path to a
+/// Tegra hardware H.264 and H.265 through the vendor V4L2 encoder, loaded at runtime: the only path to a
 /// Jetson's encoder, which carries no `libnvidia-encode` and no render node driver. Built for
 /// `aarch64` alone — the vendor libraries and the encoder behind them exist on no other
 /// architecture, so an x86_64 build carries none of this.
@@ -87,8 +87,9 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     }
     #[cfg(target_arch = "aarch64")]
     if tegra::available() {
-        let served: HardwareEncoders = vec![(Codec::H264, "tegra")];
-        println!("[pixelflux] Render node {node} encodes {} on tegra.", Codec::H264.display());
+        let served: HardwareEncoders = tegra::served().into_iter().map(|c| (c, "tegra")).collect();
+        let names: Vec<&str> = served.iter().map(|(c, _)| c.display()).collect();
+        println!("[pixelflux] Render node {node} encodes {} on tegra.", names.join(", "));
         probed.insert(node, served.clone());
         return served;
     }
@@ -472,12 +473,14 @@ pub fn select_frame_encoder(
     }
     let software_forced = settings.use_cpu || settings.encode_node_index == -1;
     #[cfg(target_arch = "aarch64")]
-    if let (false, Codec::H264, FrameSource::Host { rgba }) = (software_forced, codec, source) {
+    if let (false, Some(_), FrameSource::Host { rgba }) =
+        (software_forced, tegra::coded_fourcc(codec), source)
+    {
         // Tegra publishes no render node driver to probe and carries no libnvidia-encode, so the
         // vendor library is the only way to its encoder and this step comes before both.
         if tegra::available() {
             drop(prior);
-            match tegra::TegraEncoder::new(settings, rgba) {
+            match tegra::TegraEncoder::new(codec, settings, rgba) {
                 Ok(enc) => {
                     println!(
                         "[{tag}] Encoder: TEGRA {} {} on the vendor V4L2 encoder.",
@@ -488,7 +491,7 @@ pub fn select_frame_encoder(
                 }
                 Err(e) => {
                     eprintln!("[{tag}] Failed to init the Tegra encoder: {e}");
-                    println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(Codec::H264));
+                    println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(codec));
                 }
             }
             return None;

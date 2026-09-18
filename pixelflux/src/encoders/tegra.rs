@@ -1,4 +1,4 @@
-//! Tegra hardware H.264 through the vendor V4L2 encoder.
+//! Tegra hardware H.264 and H.265 through the vendor V4L2 encoder.
 //!
 //! Tegra ships no `libnvidia-encode`, so the NVENC backend cannot open it, it publishes no render
 //! node driver for the VA-API one to probe, and its encoder is not a plain V4L2 M2M node either:
@@ -31,7 +31,7 @@ use std::ptr;
 
 use libloading::{Library, Symbol};
 
-use super::codec::{h264_frame_type, push_video_header, Codec, VIDEO_HEADER_LEN};
+use super::codec::{h264_frame_type, h265_frame_type, push_video_header, Codec, VIDEO_HEADER_LEN};
 use super::reference::Reference;
 use crate::RustCaptureSettings;
 
@@ -41,6 +41,8 @@ const V4L2_MEMORY_MMAP: u32 = 1;
 const V4L2_MEMORY_DMABUF: u32 = 4;
 const V4L2_PIX_FMT_NV12M: u32 = 0x3231_4d4e;
 const V4L2_PIX_FMT_H264: u32 = 0x3436_3248;
+/// The vendor library spells HEVC `H265`, not the `HEVC` of a mainline V4L2 encoder.
+const V4L2_PIX_FMT_H265: u32 = 0x3536_3248;
 /// The driver copies this buffer's timestamp to the access unit it produces.
 const V4L2_BUF_FLAG_TIMESTAMP_COPY: u32 = 0x4000;
 
@@ -58,6 +60,7 @@ const VIDIOC_S_EXT_CTRLS: u64 = 0xc020_5648;
 const CID_BITRATE: u32 = 0x0099_09cf;
 const CID_BITRATE_MODE: u32 = 0x0099_09ce;
 const CID_H264_PROFILE: u32 = 0x0099_0a6b;
+const CID_H265_PROFILE: u32 = 0x0099_0b01;
 const CID_IDR_INTERVAL: u32 = 0x0099_0b02;
 const CID_VBV_SIZE: u32 = 0x0099_0b13;
 const CID_INSERT_SPS_PPS_AT_IDR: u32 = 0x0099_0b17;
@@ -72,6 +75,7 @@ const CID_FORCE_IDR_FRAME: u32 = 0x0099_0b37;
 const V4L2_CTRL_CLASS_MPEG: u32 = 0x0099_0000;
 const BITRATE_MODE_CBR: i32 = 1;
 const H264_PROFILE_MAIN: i32 = 2;
+const H265_PROFILE_MAIN: i32 = 0;
 const HW_PRESET_ULTRAFAST: i32 = 1;
 
 const NVBUF_PAYLOAD_SURF_ARRAY: i32 = 0;
@@ -545,6 +549,22 @@ fn load_surfaces() -> Result<Surfaces, String> {
     }
 }
 
+/// The capture-queue format for a codec the vendor encoder serves, or `None` for one it does
+/// not. Every Jetson since T210 encodes both of these, and the queues, controls and surface
+/// formats are the same for either, so the codec is a parameter rather than a second backend.
+pub fn coded_fourcc(codec: Codec) -> Option<u32> {
+    match codec {
+        Codec::H264 => Some(V4L2_PIX_FMT_H264),
+        Codec::H265 => Some(V4L2_PIX_FMT_H265),
+        _ => None,
+    }
+}
+
+/// The codecs the vendor encoder serves, in the order the ladder prefers them.
+pub fn served() -> Vec<Codec> {
+    vec![Codec::H264, Codec::H265]
+}
+
 /// Whether this host has the Tegra encoder: the encoder library loads and an encoder node is
 /// there. Probed once, because a failure here is a property of the machine and not of the
 /// session.
@@ -608,14 +628,17 @@ pub struct TegraEncoder {
     capture: [(*mut c_void, usize); CAPTURE_BUFFERS],
     queued: usize,
     scratch: Vec<u8>,
+    codec: Codec,
     omit_headers: bool,
     bitrate_bps: u32,
     fps: f64,
 }
 
 impl TegraEncoder {
-    pub fn new(settings: &RustCaptureSettings, rgba: bool) -> Result<Self, String> {
+    pub fn new(codec: Codec, settings: &RustCaptureSettings, rgba: bool) -> Result<Self, String> {
         abi_matches()?;
+        let coded = coded_fourcc(codec)
+            .ok_or_else(|| format!("the encoder does not serve {}", codec.display()))?;
         let (width, height) = (settings.width, settings.height);
         let fps = settings.target_fps.max(1.0);
         let bitrate_bps = (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000);
@@ -659,11 +682,12 @@ impl TegraEncoder {
             capture: [(ptr::null_mut(), 0); CAPTURE_BUFFERS],
             queued: 0,
             scratch: Vec::new(),
+            codec,
             omit_headers: settings.omit_stripe_headers,
             bitrate_bps,
             fps,
         };
-        if let Err(e) = me.setup(settings, fps, bitrate_bps, rgba) {
+        if let Err(e) = me.setup(settings, fps, bitrate_bps, rgba, coded) {
             return Err(format!("{opened}: {e}"));
         }
         Ok(me)
@@ -931,10 +955,17 @@ impl TegraEncoder {
         }
     }
 
-    fn setup(&mut self, settings: &RustCaptureSettings, fps: f64, bitrate_bps: u32, rgba: bool) -> Result<(), String> {
+    fn setup(
+        &mut self,
+        settings: &RustCaptureSettings,
+        fps: f64,
+        bitrate_bps: u32,
+        rgba: bool,
+        coded: u32,
+    ) -> Result<(), String> {
         let pixels = self.width as u32 * self.height as u32;
         let mut capture_format =
-            self.format(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, V4L2_PIX_FMT_H264, 1, pixels.max(2 << 20));
+            self.format(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, coded, 1, pixels.max(2 << 20));
         self.ioctl(VIDIOC_S_FMT, &mut capture_format, "S_FMT capture")?;
         let mut output_format =
             self.format(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, V4L2_PIX_FMT_NV12M, 2, 0);
@@ -948,12 +979,22 @@ impl TegraEncoder {
         let vbv = (bitrate_bps as f64 / fps.max(1.0)) as i64;
         self.set_control(CID_BITRATE, bitrate_bps as i64, "bitrate")?;
         self.set_control(CID_BITRATE_MODE, BITRATE_MODE_CBR as i64, "rate control mode")?;
-        self.set_control(CID_H264_PROFILE, H264_PROFILE_MAIN as i64, "profile")?;
+        let (profile_cid, profile) = match self.codec {
+            Codec::H265 => (CID_H265_PROFILE, H265_PROFILE_MAIN),
+            _ => (CID_H264_PROFILE, H264_PROFILE_MAIN),
+        };
+        self.set_control(profile_cid, profile as i64, "profile")?;
         self.set_control(CID_HW_PRESET, HW_PRESET_ULTRAFAST as i64, "preset")?;
         self.set_control(CID_MAX_PERFORMANCE, 1, "max performance")?;
         self.set_control(CID_INSERT_SPS_PPS_AT_IDR, 1, "SPS/PPS at IDR")?;
         self.set_control(CID_INSERT_VUI, 1, "VUI")?;
-        self.set_control(CID_POC_TYPE, 2, "picture order count type")?;
+        // Picture order count type is an H.264 field with no H.265 counterpart, and NVIDIA
+        // documents even the H.264 control as Orin-only on current L4T though older drivers
+        // take it. It saves a few bits per slice on a stream that never reorders and nothing
+        // else, so a driver that refuses it is not worth the session's hardware encoder.
+        if self.codec == Codec::H264 {
+            let _ = self.set_control(CID_POC_TYPE, 2, "picture order count type");
+        }
         self.set_control(CID_IDR_INTERVAL, keyframe, "IDR interval")?;
         self.set_control(CID_VBV_SIZE, vbv, "VBV size")?;
 
@@ -1041,7 +1082,17 @@ impl TegraEncoder {
     }
 
     pub fn codec(&self) -> Codec {
-        Codec::H264
+        self.codec
+    }
+
+    /// The wire picture type of one access unit, read with the codec's own syntax: an H.265
+    /// NAL header is two bytes where H.264's is one, so the wrong reader labels every IDR a
+    /// delta and no client ever finds an entry point.
+    fn frame_type(&self, bytes: &[u8]) -> u8 {
+        match self.codec {
+            Codec::H265 => h265_frame_type(bytes),
+            _ => h264_frame_type(bytes),
+        }
     }
 
     /// The VIC converts into NV12 and the encoder takes nothing else.
@@ -1182,8 +1233,8 @@ impl TegraEncoder {
                     out.reserve(VIDEO_HEADER_LEN + length);
                     push_video_header(
                         &mut out,
-                        Codec::H264,
-                        h264_frame_type(bytes),
+                        self.codec,
+                        self.frame_type(bytes),
                         buffer.timestamp[0] as u16,
                         0,
                         self.width as u16,
@@ -1243,5 +1294,46 @@ impl Drop for TegraEncoder {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capture format is the vendor library's spelling, which is not the one a mainline V4L2
+    /// encoder uses: NVIDIA's header defines HEVC as `H265` where the kernel defines `HEVC`, and
+    /// a session that sent the kernel's fourcc would be refused a format the device does serve.
+    #[test]
+    fn hevc_is_spelled_the_way_the_vendor_library_spells_it() {
+        assert_eq!(coded_fourcc(Codec::H264), Some(u32::from_le_bytes(*b"H264")));
+        assert_eq!(coded_fourcc(Codec::H265), Some(u32::from_le_bytes(*b"H265")));
+        assert_ne!(coded_fourcc(Codec::H265), Some(u32::from_le_bytes(*b"HEVC")),
+                   "the kernel's HEVC fourcc is not the vendor library's");
+        for codec in [Codec::Vp8, Codec::Vp9, Codec::Av1, Codec::Jpeg] {
+            assert_eq!(coded_fourcc(codec), None, "{} has no vendor encoder here", codec.display());
+        }
+    }
+
+    /// Every codec the backend reports is one it can open, so the ladder never picks a hardware
+    /// path that the session then refuses and logs as a failure.
+    #[test]
+    fn every_codec_reported_is_one_a_session_can_be_opened_for() {
+        let served = served();
+        assert!(!served.is_empty());
+        for codec in &served {
+            assert!(coded_fourcc(*codec).is_some(), "{} is reported but has no format", codec.display());
+        }
+        assert!(served.contains(&Codec::H264) && served.contains(&Codec::H265));
+    }
+
+    /// The profile control is the codec's own: H.264's is a standard kernel CID and H.265's a
+    /// vendor extension, and setting one on the other codec is a refusal that costs the session
+    /// its hardware encoder.
+    #[test]
+    fn the_profile_control_is_the_codec_s_own() {
+        assert_ne!(CID_H264_PROFILE, CID_H265_PROFILE);
+        assert_eq!(CID_H265_PROFILE, 0x0099_0900 + 513, "V4L2_CID_MPEG_BASE + 513");
+        assert_eq!(CID_H264_PROFILE, 0x0099_0900 + 363, "V4L2_CID_MPEG_VIDEO_H264_PROFILE");
     }
 }
