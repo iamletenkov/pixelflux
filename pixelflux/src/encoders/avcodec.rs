@@ -29,6 +29,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+#[cfg(test)]
+use std::cell::Cell;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::ptr;
@@ -343,6 +348,29 @@ fn vaapi_profiles(codec: Codec) -> &'static [c_int] {
         Codec::Av1 => &[32],
         Codec::Jpeg => &[],
     }
+}
+
+/// The SVT-AV1 the linked FFmpeg carries, as `(major, minor)`, read from the library already in
+/// this process. `None` where nothing exports the symbol, which is every build without SVT-AV1.
+///
+/// The real-time mode arrived in 3.1, and a library older than that does not ignore the key it
+/// does not know: the parse fails and the heap is corrupted a moment later, so the mode is asked
+/// for only where it exists.
+fn svt_av1_version() -> Option<(u32, u32)> {
+    static VERSION: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let name = CString::new("svt_av1_get_version").ok()?;
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if symbol.is_null() {
+            return None;
+        }
+        let get: extern "C" fn() -> *const libc::c_char = unsafe { std::mem::transmute(symbol) };
+        let text = unsafe { CStr::from_ptr(get()) }.to_str().ok()?;
+        let mut parts = text.trim_start_matches('v').split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+        Some((major, minor))
+    })
 }
 
 /// The video codecs the VA-API driver of the render node behind `encode_node_index`
@@ -1222,10 +1250,14 @@ impl AvcodecEncoder {
                 // presets above it are no faster. `lp` is a level of parallelism, 0..=6, not a
                 // thread count.
                 dict_set(opts, "preset", "11");
-                let mut params = format!(
-                    "rtc=1:pred-struct=1:lookahead=0:keyint=-1:tile-columns=0:tile-rows=0:lp={}",
+                let mut params = String::new();
+                if svt_av1_version().is_some_and(|version| version >= (3, 1)) {
+                    params.push_str("rtc=1:");
+                }
+                params.push_str(&format!(
+                    "pred-struct=1:lookahead=0:keyint=-1:tile-columns=0:tile-rows=0:lp={}",
                     self.threads.min(6)
-                );
+                ));
                 if self.cbr_mode {
                     params.push_str(":rc=2");
                 } else {
@@ -1574,6 +1606,47 @@ fn drain_first(enc: &mut AvcodecEncoder, bgra: &[u8], stride: usize, qp: u32) ->
     Vec::new()
 }
 
+/// One AV1 session at a time across the suite. SVT-AV1 before 2.x faults while a second session
+/// is live -- the codec re-opens on a quantizer change, so the whole life of the session is the
+/// unsafe window, not just its build. Every other codec stays parallel, and a thread already
+/// holding the turn keeps it, since one check holds two sessions at once.
+#[cfg(test)]
+static ONE_AV1: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static AV1_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The AV1 turn, held for as long as the session it was taken for.
+#[cfg(test)]
+struct Turn {
+    _guard: Option<MutexGuard<'static, ()>>,
+    counted: bool,
+}
+
+#[cfg(test)]
+impl Drop for Turn {
+    fn drop(&mut self) {
+        if self.counted {
+            AV1_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// Take the turn for `codec`, which is a no-op for anything but AV1.
+#[cfg(test)]
+fn turn(codec: Codec) -> Turn {
+    let counted = codec == Codec::Av1;
+    let first = counted
+        && AV1_DEPTH.with(|depth| {
+            let held = depth.get();
+            depth.set(held + 1);
+            held == 0
+        });
+    Turn { _guard: first.then(|| ONE_AV1.lock().unwrap_or_else(|e| e.into_inner())), counted }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1715,6 +1788,7 @@ mod tests {
         let mut measured = 0;
         for backend in [Backend::Software, Backend::Vaapi] {
             for codec in Codec::VIDEO {
+                let _turn = turn(codec);
                 let mut enc = match AvcodecEncoder::new(&settings, codec, backend, Input::Host { rgba: false }) {
                     Ok(enc) => enc,
                     Err(_) => continue,
@@ -1757,6 +1831,7 @@ mod tests {
         for backend in [Backend::Software, Backend::Vaapi] {
             let mut on_this_backend = 0;
             for codec in Codec::VIDEO {
+                let _turn = turn(codec);
                 let mut enc = match AvcodecEncoder::new(&settings, codec, backend, Input::Host { rgba: false }) {
                     Ok(enc) => enc,
                     Err(_) => continue,
@@ -1893,9 +1968,33 @@ mod software_tests {
             .collect()
     }
 
-    fn session(codec: Codec, s: &RustCaptureSettings, rgba: bool) -> AvcodecEncoder {
+    /// A software session, holding the AV1 turn for as long as it lives.
+    struct Session {
+        encoder: AvcodecEncoder,
+        _turn: Turn,
+    }
+
+    impl std::ops::Deref for Session {
+        type Target = AvcodecEncoder;
+        fn deref(&self) -> &AvcodecEncoder {
+            &self.encoder
+        }
+    }
+
+    impl std::ops::DerefMut for Session {
+        fn deref_mut(&mut self) -> &mut AvcodecEncoder {
+            &mut self.encoder
+        }
+    }
+
+    fn encoder_of(codec: Codec, s: &RustCaptureSettings, rgba: bool) -> AvcodecEncoder {
         AvcodecEncoder::new(s, codec, Backend::Software, Input::Host { rgba })
             .unwrap_or_else(|e| panic!("{codec:?} software session: {e}"))
+    }
+
+    fn session(codec: Codec, s: &RustCaptureSettings, rgba: bool) -> Session {
+        let _turn = turn(codec);
+        Session { encoder: encoder_of(codec, s, rgba), _turn }
     }
 
     /// A desktop-like BGRA frame: a diagonal gradient with a grid of dark glyph cells and a
@@ -2007,7 +2106,8 @@ mod software_tests {
         use super::super::{reference::Reference, FrameEncoder};
         for codec in software_codecs() {
             let s = settings(codec);
-            let mut enc = FrameEncoder::Avcodec(session(codec, &s, false));
+            let _turn = turn(codec);
+            let mut enc = FrameEncoder::Avcodec(encoder_of(codec, &s, false));
             for t in 0..4usize {
                 enc.encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0)
                     .unwrap_or_else(|e| panic!("{codec:?} encode {t}: {e}"));
