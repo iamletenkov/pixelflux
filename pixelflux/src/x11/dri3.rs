@@ -452,9 +452,9 @@ impl GpuCapture {
         let in_place = match self.encoder.as_mut() {
             Some(FrameEncoder::Nvenc(enc)) => enc.reconfigure_resolution(&self.settings).map(|_| ()),
             Some(FrameEncoder::Avcodec(_)) => Err("a VA-API session is rebuilt at a new size".to_string()),
-            // A Tegra session never reaches this path: it takes host frames, so `open` below
-            // declines the zero-copy capture before one is built. The arm exists because the
-            // variant does, and it says what would happen rather than panicking if it ever did.
+            // Neither a Tegra nor a V4L2 M2M session reaches this path: both take host frames,
+            // so `open` below declines the zero-copy capture before one is built. The arms exist
+            // because the variants do, saying what would happen rather than panicking.
             #[cfg(target_arch = "aarch64")]
             Some(FrameEncoder::Tegra(_)) => Err("a Tegra session takes host frames".to_string()),
             Some(FrameEncoder::V4l2m2m(_)) => {
