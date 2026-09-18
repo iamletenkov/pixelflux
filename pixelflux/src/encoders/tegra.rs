@@ -25,7 +25,6 @@
 //! from memory, and `abi_matches` checks the sizes those numbers encode.
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
-use std::fs;
 use std::mem::size_of;
 use std::sync::OnceLock;
 use std::ptr;
@@ -568,35 +567,12 @@ pub fn coded_fourcc(codec: Codec) -> Option<u32> {
     }
 }
 
-/// The SoC generation from the device tree's root `compatible`, which names it as `tegra234`
-/// among the board's own strings. Read rather than probed: the encoder publishes no format list
-/// without opening its node, which is not safe until the surface library has loaded.
-fn soc_generation() -> Option<u32> {
-    let compatible = fs::read("/proc/device-tree/compatible")
-        .or_else(|_| fs::read("/sys/firmware/devicetree/base/compatible"))
-        .ok()?;
-    soc_generation_of(&compatible)
-}
-
-/// The generation named in a device tree `compatible`, whose entries are NUL-separated and carry
-/// the board's own strings alongside `nvidia,tegra234` and the looser `nvidia,tegra23x`.
-fn soc_generation_of(compatible: &[u8]) -> Option<u32> {
-    String::from_utf8_lossy(compatible)
-        .split(|c: char| c.is_ascii_whitespace() || c == '\0' || c == ',')
-        .filter_map(|part| part.strip_prefix("tegra")?.parse::<u32>().ok())
-        .max()
-}
-
-/// The codecs the vendor encoder serves on this board. Every Jetson L4T supports encodes H.264
-/// and H.265; Orin adds AV1. A board whose SoC is not named here is taken to be newer than they
-/// are and offered the whole set, because a format it does not serve is refused at `S_FMT` and
-/// the ladder falls back, where one wrongly withheld has no route back to its hardware.
+/// Every codec the vendor encoder can be set to. The board is its own authority on which of them
+/// it has an engine for and says so at `S_FMT`: a format it does not serve costs one refusal and
+/// a fall back to software that the session report names, where a codec withheld here would have
+/// no route back to hardware that does carry it.
 pub fn served() -> Vec<Codec> {
-    let mut served = vec![Codec::H264, Codec::H265];
-    if soc_generation().is_none_or(|generation| generation >= 234) {
-        served.push(Codec::Av1);
-    }
-    served
+    vec![Codec::H264, Codec::H265, Codec::Av1]
 }
 
 /// Whether this host has the Tegra encoder: the encoder library loads and an encoder node is
@@ -1374,33 +1350,6 @@ mod tests {
             assert!(coded_fourcc(*codec).is_some(), "{} is reported but has no format", codec.display());
         }
         assert!(served.contains(&Codec::H264) && served.contains(&Codec::H265));
-    }
-
-    /// The generation is read out of the board's own `compatible`, where it sits among strings
-    /// that are not it, and a board newer than any named here keeps every codec rather than
-    /// losing one to a name this does not recognize.
-    #[test]
-    fn the_soc_generation_is_read_from_the_boards_compatible() {
-        let orin = b"nvidia,p3737-0000+p3701-0000\0nvidia,tegra234\0nvidia,tegra23x\0";
-        assert_eq!(soc_generation_of(orin), Some(234));
-        assert_eq!(soc_generation_of(b"nvidia,p3448-0000\0nvidia,tegra210\0"), Some(210));
-        assert_eq!(soc_generation_of(b"nvidia,p2771-0000\0nvidia,tegra186\0"), Some(186));
-        assert_eq!(soc_generation_of(b"nvidia,tegra194\0"), Some(194));
-        assert_eq!(soc_generation_of(b"brcm,bcm2711\0"), None, "a board that is no Tegra names none");
-        assert_eq!(soc_generation_of(b""), None);
-    }
-
-    /// AV1 is Orin's and newer, and a board too old for it is not offered it; one whose SoC this
-    /// cannot name is, because the encoder refuses a format it does not serve and the ladder
-    /// falls back, where withholding one leaves hardware unreachable.
-    #[test]
-    fn av1_follows_the_generation_and_an_unknown_board_keeps_it() {
-        for old in [b"nvidia,tegra210\0".as_slice(), b"nvidia,tegra186\0", b"nvidia,tegra194\0"] {
-            assert!(soc_generation_of(old).unwrap() < 234);
-        }
-        assert!(soc_generation_of(b"nvidia,tegra234\0").unwrap() >= 234);
-        assert!(soc_generation_of(b"nvidia,tegra264\0").unwrap() >= 234, "a newer Tegra still clears it");
-        assert_eq!(soc_generation_of(b"unknown\0"), None, "and an unnamed board reads as unknown");
     }
 
     /// The profile control is the codec's own: H.264's is a standard kernel CID and H.265's a
