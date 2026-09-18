@@ -262,7 +262,9 @@ fn abi_matches() -> Result<(), String> {
 }
 
 unsafe fn ioctl<T>(fd: RawFd, request: u64, arg: *mut T) -> std::io::Result<()> {
-    let rc = unsafe { libc::ioctl(fd, request as libc::c_ulong, arg as *mut libc::c_void) };
+    // The request takes `as _` rather than a named type: `libc::Ioctl` is `c_ulong` on
+    // glibc and `c_int` on musl, so naming either one breaks the other's build.
+    let rc = unsafe { libc::ioctl(fd, request as _, arg as *mut libc::c_void) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
