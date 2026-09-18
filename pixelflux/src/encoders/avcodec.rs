@@ -1336,12 +1336,20 @@ impl AvcodecEncoder {
                     Codec::Vp9 => frame_type_from_key(vp9_is_key(bytes)),
                     _ => frame_type_from_key(av1_is_key(bytes)),
                 };
+                // The packet is the picture it encodes, not the frame just submitted: an
+                // encoder that pipelines hands back an earlier one, and an id taken from the
+                // submission names the wrong frame. Each frame carries its number in as a
+                // pts, which is what returns on its packet.
+                let id = match (*self.packet).pts {
+                    pts if pts >= 0 => pts as u64,
+                    _ => frame_number,
+                };
                 output.reserve(VIDEO_HEADER_LEN + size);
                 push_video_header(
                     &mut output,
                     self.codec,
                     frame_type,
-                    frame_number as u16,
+                    id as u16,
                     0,
                     self.width as u16,
                     self.height as u16,
