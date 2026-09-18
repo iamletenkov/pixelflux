@@ -237,15 +237,15 @@ pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier
 }
 
 /// The `Colorspace:` field of a stream log line, from what the session negotiated rather than
-/// what was asked for: a hardware encoder can refuse 4:4:4, and only some software encoders
-/// carry it at full range. Shared so the X11 and Wayland logs describe an identical session
-/// identically.
+/// what was asked for: a hardware encoder can refuse 4:4:4, software 4:4:4 of x264's kind
+/// carries full range, and a device converting in fixed function picks the range itself.
+/// Shared so the X11 and Wayland logs describe an identical session identically.
 pub fn colorspace_desc(fullcolor: bool, full_range: bool) -> &'static str {
     match (fullcolor, full_range) {
         (true, true) => "I444 (Full Range)",
         (true, false) => "I444 (Limited Range)",
         (false, true) => "I420 (Full Range)",
-        _ => "I420 (Limited Range)",
+        (false, false) => "I420 (Limited Range)",
     }
 }
 
@@ -276,6 +276,31 @@ mod tests {
         assert_eq!(software_fullcolor(Codec::H264), cfg!(feature = "gpl"));
         assert!(!software_fullcolor(Codec::Vp8));
         assert_eq!(software_fullcolor(Codec::Vp9), software_encoder(Codec::Vp9).is_some());
+    }
+
+    /// A session's range is the session's to report, not something read off whether its
+    /// encoder is hardware. The two part on a striped 4:2:0 software session, which is
+    /// limited range while the encoder is software, so a description taking the second for
+    /// the first names a range the bitstream does not carry. All four pairings have a name
+    /// of their own for that reason, rather than 4:2:0 falling through to one.
+    #[test]
+    fn a_session_reports_the_range_it_converted_at() {
+        assert_eq!(colorspace_desc(true, true), "I444 (Full Range)");
+        assert_eq!(colorspace_desc(true, false), "I444 (Limited Range)");
+        assert_eq!(colorspace_desc(false, true), "I420 (Full Range)");
+        assert_eq!(colorspace_desc(false, false), "I420 (Limited Range)");
+
+        let mut settings = RustCaptureSettings::default();
+        settings.codec = Codec::H264;
+        settings.video_fullcolor = false;
+        assert!(!session_full_range(None, &settings), "striped 4:2:0 converts at limited range");
+        assert_eq!(colorspace_desc(session_fullcolor(None, &settings),
+                                   session_full_range(None, &settings)),
+                   "I420 (Limited Range)");
+
+        settings.video_fullcolor = true;
+        assert_eq!(session_full_range(None, &settings), software_fullcolor(Codec::H264),
+                   "striped 4:4:4 converts at full range where the build carries it");
     }
 }
 
@@ -762,7 +787,9 @@ pub fn session_fullcolor(encoder: Option<&FrameEncoder>, settings: &RustCaptureS
 }
 
 /// Whether a session signals full range: a software 4:4:4 session of x264's kind, which the
-/// striped path (`None`) is whenever it carries 4:4:4.
+/// striped path (`None`) is whenever it carries 4:4:4, or a device that converted in fixed
+/// function at a range it chose. The one answer every description of a session reads, so no
+/// two of them can disagree.
 pub fn session_full_range(encoder: Option<&FrameEncoder>, settings: &RustCaptureSettings) -> bool {
     match encoder {
         Some(enc) => enc.is_full_range(),

@@ -1526,7 +1526,7 @@ pub(crate) fn log_stream_settings_of(
     fullcolor: bool,
     full_range: bool,
 ) {
-    report::stream(settings, n_stripes, backend, fullcolor);
+    report::stream(settings, n_stripes, backend, fullcolor, full_range);
     let mut log_msg = format!(
         "[{tag}] Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
         settings.width, settings.height, settings.target_fps, n_stripes
@@ -7082,6 +7082,7 @@ impl ScreenCapture {
         d.set_item("encoder_reason", &info.encoder_reason)?;
         d.set_item("codec", info.codec)?;
         d.set_item("fullcolor", info.fullcolor)?;
+        d.set_item("full_range", info.full_range)?;
         d.set_item("striped", info.stripes > 1)?;
         d.set_item("gpu", &info.gpu)?;
         d.set_item("driver", &info.driver)?;

@@ -105,7 +105,12 @@ default from the exported names. Every session, on every backend, converts with 
 desktop's own primaries and transfer — at limited range for 4:2:0 and full range for the software
 4:4:4 sessions, and declares it; VP8 is the exception its bitstream forces, one color-space bit
 whose only defined value is BT.601 — told BT.709 out of band, Firefox reads neither the decoder
-configuration nor the RTP color-space extension and inverts the other matrix. Chroma sits at
+configuration nor the RTP color-space extension and inverts the other matrix. A device that
+converts in fixed function is the other exception, and only where it is probed and found to
+discard the colorimetry it is handed: that session declares the matrix and range the firmware
+produced rather than the one asked for, and one that honors the fields converts BT.709 limited
+like every other. What a session says of itself therefore comes from `session_full_range`, never
+from whether its encoder is hardware, so no two descriptions of one session can disagree. Chroma sits at
 the center of each 2x2 block, which NVENC's own conversion does not: it weights the two columns
 of a block 3:1 (its matrix follows what the session declares, measured on Volta and Pascal, so
 only the siting is at stake). A 4:2:0 session therefore converts with `ChromaConvert`, a PTX

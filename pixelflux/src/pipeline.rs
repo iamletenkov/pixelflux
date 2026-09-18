@@ -201,6 +201,7 @@ impl X11Pipeline {
             encoders::software::stripe_count(self.settings.height, self.settings.codec, fullframe),
             self.hw.as_ref().map(|enc| (enc.backend_name(), enc.is_hardware())),
             encoders::session_fullcolor(self.hw.as_ref(), &self.settings),
+            encoders::session_full_range(self.hw.as_ref(), &self.settings),
         );
     }
 
@@ -640,14 +641,15 @@ mod tests {
         assert_eq!(carries_444, crate::encoders::software_library(Codec::H264) == "x264");
         let i444 = if carries_444 { "I444 (Full Range)" } else { "I420 (Limited Range)" };
         for (fullcolor, expected) in [(true, i444), (false, "I420 (Limited Range)")] {
-            let p = X11Pipeline::new(RustCaptureSettings {
+            let settings = RustCaptureSettings {
                 width: 64,
                 height: 64,
                 codec: Codec::H264,
                 use_cpu: true,
                 video_fullcolor: fullcolor,
                 ..Default::default()
-            });
+            };
+            let p = X11Pipeline::new(settings.clone());
             assert_eq!(p.encoder_name(), format!("CPU ({})", crate::encoders::software_library(Codec::H264)));
             assert_eq!(p.colorspace_desc(), expected);
             // A striped software session signals full range exactly when it carries 4:4:4, so
@@ -656,7 +658,10 @@ mod tests {
             let session_444 = fullcolor && carries_444;
             assert_eq!(
                 p.colorspace_desc(),
-                crate::encoders::colorspace_desc(session_444, session_444),
+                crate::encoders::colorspace_desc(
+                    crate::encoders::session_fullcolor(None, &settings),
+                    crate::encoders::session_full_range(None, &settings),
+                ),
                 "X11 and Wayland must describe the same session identically"
             );
         }

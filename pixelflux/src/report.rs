@@ -39,6 +39,7 @@ pub struct StreamInfo {
     pub encoder_reason: String,
     pub codec: &'static str,
     pub fullcolor: bool,
+    pub full_range: bool,
     pub stripes: usize,
     pub gpu: String,
     pub driver: String,
@@ -177,7 +178,13 @@ pub fn encoder_reason(reason: &str) {
 
 /// What the stream settled on, from the same inputs as the `Stream settings active` line.
 /// `backend` is the full-frame session as `(name, hardware)`, `None` the striped software path.
-pub fn stream(settings: &RustCaptureSettings, stripes: usize, backend: Option<(&str, bool)>, fullcolor: bool) {
+pub fn stream(
+    settings: &RustCaptureSettings,
+    stripes: usize,
+    backend: Option<(&str, bool)>,
+    fullcolor: bool,
+    full_range: bool,
+) {
     record(|info| {
         let (name, hardware) = match backend {
             Some((name, hardware)) => (name, hardware),
@@ -193,6 +200,7 @@ pub fn stream(settings: &RustCaptureSettings, stripes: usize, backend: Option<(&
         }
         info.codec = settings.codec.name();
         info.fullcolor = fullcolor;
+        info.full_range = full_range;
         info.stripes = stripes;
     });
 }
