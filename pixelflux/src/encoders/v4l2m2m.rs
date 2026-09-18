@@ -439,6 +439,19 @@ fn sequence_parameter_sets(unit: &[u8]) -> Vec<(usize, usize)> {
     sets
 }
 
+/// The rates to try, in order: what the session asked for, then the ones a device that refuses
+/// it is likely to take. A device is asked at its own rate first, so one that can do it is never
+/// slowed, and the steps below are the rates video hardware is built around rather than a search.
+fn fallback_rates(wanted: f64) -> Vec<f64> {
+    let mut rates = vec![wanted];
+    for step in [30.0, 15.0] {
+        if step < wanted - 0.01 {
+            rates.push(step);
+        }
+    }
+    rates
+}
+
 /// What a device is known to convert RGB with when it declares nothing itself. Only a device
 /// whose behavior is on record earns an entry: a Raspberry Pi with firmware older than August
 /// 2024 converts to full range BT.601 and writes no `video_signal_type`, which the driver's
@@ -545,9 +558,59 @@ impl V4l2M2mEncoder {
             written_sps: None,
             decided: false,
         };
-        match encoder.setup(settings, rgba) {
-            Ok(()) => Ok(encoder),
-            Err(e) => Err(e),
+        // A device answers "not at that rate" only by refusing, and only once the port is
+        // enabled: the frame rate reaches the firmware at `STREAMON`, not at the ioctl that
+        // carried it, and `VIDIOC_ENUM_FRAMEINTERVALS` is not implemented to ask beforehand. A
+        // Raspberry Pi 4 takes 1080p at 30 and refuses it at 60, which is the rate a session
+        // asks for by default, so a single attempt would leave a capable device unused.
+        let mut last = String::new();
+        for rate in fallback_rates(settings.target_fps.max(1.0)) {
+            encoder.fps = rate;
+            match encoder.setup(settings, rgba) {
+                Ok(()) => {
+                    if rate < settings.target_fps.max(1.0) {
+                        println!(
+                            "[pixelflux] The M2M encoder refused {:.0} frames a second and took {:.0}.",
+                            settings.target_fps.max(1.0),
+                            rate
+                        );
+                    }
+                    return Ok(encoder);
+                }
+                Err(e) => {
+                    last = e;
+                    encoder.release();
+                    let reopened = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+                    if reopened < 0 {
+                        return Err(last);
+                    }
+                    encoder.fd = reopened;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Everything about the session that a refused `STREAMON` leaves behind, so the next attempt
+    /// starts on a node that carries none of it. The descriptor itself is reopened by the caller:
+    /// a device that refused a parameter answers `ESRCH` to every later call on that descriptor.
+    fn release(&mut self) {
+        let _ = self.stream(VIDIOC_STREAMOFF, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, "STREAMOFF output");
+        let _ = self.stream(VIDIOC_STREAMOFF, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, "STREAMOFF capture");
+        if self.output_map != libc::MAP_FAILED {
+            unsafe { libc::munmap(self.output_map, self.output_size) };
+            self.output_map = libc::MAP_FAILED;
+        }
+        for slot in 0..CAPTURE_BUFFERS {
+            let (map, length) = self.capture[slot];
+            if map != libc::MAP_FAILED {
+                unsafe { libc::munmap(map, length) };
+                self.capture[slot] = (libc::MAP_FAILED, 0);
+            }
+        }
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+            self.fd = -1;
         }
     }
 
@@ -1125,6 +1188,20 @@ mod hardware_tests {
             }
         }
         frame
+    }
+
+    /// A rate the device will not take does not cost the session its hardware. A Raspberry Pi 4
+    /// refuses 1080p at 60 and takes it at 30, and it says so only by refusing `STREAMON` on a
+    /// descriptor that answers nothing afterwards, so the backend reopens and asks for less.
+    #[test]
+    #[ignore]
+    fn v4l2_steps_down_from_a_rate_the_device_refuses() {
+        let mut asked = settings(1920, 1080);
+        asked.target_fps = 60.0;
+        let encoder = V4l2M2mEncoder::new(&asked, false)
+            .expect("a session came up at some rate the device takes");
+        assert!(encoder.fps <= 60.0, "the session reports a rate it never asked for");
+        assert!(encoder.fps >= 15.0, "the session stepped below the floor");
     }
 
     /// What the stream declares, read back by a decoder that is not ours: FFmpeg parses the
