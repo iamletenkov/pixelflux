@@ -1558,8 +1558,9 @@ fn vaapi_codec_name(codec: Codec) -> &'static str {
 }
 
 /// The first packet of a fresh session, feeding `bgra` until one arrives. An encoder that
-/// pipelines answers the opening frames with nothing -- SVT-AV1 before its real-time mode fills
-/// two -- so a check that wants the picture back cannot take the first call's word for it.
+/// pipelines answers the opening frames with nothing -- SVT-AV1 fills two before 2.3.0, where
+/// its packet call became blocking -- so a check that wants the picture back cannot take the
+/// first call's word for it.
 #[cfg(test)]
 fn drain_first(enc: &mut AvcodecEncoder, bgra: &[u8], stride: usize, qp: u32) -> Vec<u8> {
     for t in 0..8u64 {
@@ -1854,8 +1855,9 @@ mod software_tests {
 
     /// The video codecs this build has a software encoder for, other than H.264.
     /// Frames a fresh session takes before its first packet, zero where one frame in is one
-    /// picture out. The wire ids and the latency budget both assume zero; SVT-AV1 before its
-    /// real-time mode fills two, which it neither reports nor lets a caller shorten.
+    /// picture out. The wire ids and the latency budget both assume zero; SVT-AV1 gives that
+    /// only from 2.3.0, where its packet call became blocking for low delay, and before it
+    /// fills two frames that it neither reports nor lets a caller shorten.
     fn pipeline_depth(codec: Codec) -> usize {
         let s = settings(codec);
         let mut enc = session(codec, &s, false);
