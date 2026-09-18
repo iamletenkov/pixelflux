@@ -2068,7 +2068,10 @@ mod software_tests {
             let mut bytes = 0usize;
             for t in 0..90usize {
                 let out = enc.encode_host(&noise(t), W * 4, t as u64, 25, t == 0).unwrap();
-                if t >= 30 {
+                // A constant-rate encoder is free to answer a frame with nothing -- SVT-AV1
+                // drops one rather than overshoot its buffer -- and that frame carries no
+                // payload to count rather than a negative one.
+                if t >= 30 && out.len() > VIDEO_HEADER_LEN {
                     bytes += out.len() - VIDEO_HEADER_LEN;
                 }
             }

@@ -3412,7 +3412,7 @@ mod gpu_tests {
                     .expect("encode"),
             );
         });
-        let sizes: Vec<usize> = pkts.iter().map(|p| p.len() - VIDEO_HEADER_LEN).collect();
+        let sizes: Vec<usize> = pkts.iter().map(|p| p.len().saturating_sub(VIDEO_HEADER_LEN)).collect();
         let bytes: usize = sizes.iter().sum();
         let mut dec = AvDecoder::new(codec).expect("decoder");
         luma_psnr(&mut dec, &first, seq[0], w, h);
@@ -3731,7 +3731,7 @@ mod gpu_tests {
             let pkt = enc
                 .encode_cpu_argb(&frames[i as usize % 16], w * 4, i, 25, false)
                 .expect("encode");
-            bytes += pkt.len() - VIDEO_HEADER_LEN;
+            bytes += pkt.len().saturating_sub(VIDEO_HEADER_LEN);
         }
         let kbps = bytes as f64 * 8.0 * 60.0 / n as f64 / 1000.0;
         println!("CBR 2000 kbps after the rate change: {kbps:.0} kbps over {n} steady frames");
