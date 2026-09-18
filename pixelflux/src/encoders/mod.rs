@@ -13,7 +13,7 @@
 pub mod avcodec;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
-/// Tegra hardware H.264 and H.265 through the vendor V4L2 encoder, loaded at runtime: the only path to a
+/// Tegra hardware video encoding through the vendor V4L2 encoder, loaded at runtime: the only path to a
 /// Jetson's encoder, which carries no `libnvidia-encode` and no render node driver. Built for
 /// `aarch64` alone — the vendor libraries and the encoder behind them exist on no other
 /// architecture, so an x86_64 build carries none of this.
