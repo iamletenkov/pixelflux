@@ -351,12 +351,15 @@ impl GpuCapture {
                 self.gbm
                     .create_buffer_object::<()>(w as u32, h as u32, GbmFormat::Argb8888, BufferObjectFlags::RENDERING)
             } else {
-                self.gbm.create_buffer_object_with_modifiers2::<()>(
+                // The entry point without the flags argument, which implies exactly the
+                // rendering use this asks for: the one that takes flags arrived in Mesa 21.1
+                // and a wheel referencing it does not load at all against an older libgbm,
+                // since Python resolves an extension's symbols eagerly.
+                self.gbm.create_buffer_object_with_modifiers::<()>(
                     w as u32,
                     h as u32,
                     GbmFormat::Argb8888,
                     self.x.modifiers.iter().map(|&m| gbm::Modifier::from(m)),
-                    BufferObjectFlags::RENDERING,
                 )
             };
             let bo = match bo {

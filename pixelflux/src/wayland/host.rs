@@ -2305,12 +2305,14 @@ fn alloc_gpu_slot(
     let bo = if modifiers.is_empty() {
         dev.create_buffer_object::<()>(w as u32, h as u32, format, BufferObjectFlags::RENDERING)
     } else {
-        dev.create_buffer_object_with_modifiers2::<()>(
+        // Without the flags argument, which implies the rendering use asked for either
+        // way: the entry point taking flags is Mesa 21.1 and later, and an extension
+        // referencing it does not load against an older libgbm at all.
+        dev.create_buffer_object_with_modifiers::<()>(
             w as u32,
             h as u32,
             format,
             modifiers.iter().map(|&m| gbm::Modifier::from(m)),
-            BufferObjectFlags::RENDERING,
         )
         .or_else(|_| {
             dev.create_buffer_object::<()>(w as u32, h as u32, format, BufferObjectFlags::RENDERING)
