@@ -322,10 +322,10 @@ impl X11Pipeline {
     }
 
     /// Apply a runtime rate-control / framerate change: the CBR target bitrate + VBV (kbps /
-    /// kb; ignored unless CBR is active) and the target fps. NVENC reconfigures its live session
-    /// immediately; a libavcodec session re-opens its codec context to apply the new rate; the
-    /// striped software path picks the new values up on the next `process()` (encode_cpu reads
-    /// the updated settings and reconfigures each stripe's encoder).
+    /// kb; ignored unless CBR is active) and the target fps. NVENC, libvpx and x265 reconfigure
+    /// their live session; a VA-API session starts a new sequence; kvazaar and SVT-AV1 re-open;
+    /// the striped software path picks the new values up on the next `process()` (encode_cpu
+    /// reads the updated settings and reconfigures each stripe's encoder).
     pub fn update_rate(&mut self, bitrate_kbps: i32, vbv_multiplier: f64, fps: f64) {
         self.settings.video_bitrate_kbps = bitrate_kbps;
         self.settings.video_vbv_multiplier = vbv_multiplier;

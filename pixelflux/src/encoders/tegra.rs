@@ -5,8 +5,8 @@
 //! the node is `/dev/nvhost-msenc` on JetPack 4 and `/dev/v4l2-nvenc` on JetPack 6, and that
 //! JetPack 6 node is a `/dev/null` placeholder whose `open` the vendor `libnvv4l2.so` intercepts.
 //! The library is therefore loaded at runtime, the way `nvenc.rs` loads `libcuda` and
-//! `avcodec.rs` loads `libva`, and the encoder is driven with ordinary V4L2 ioctls. Nothing is
-//! added to the build.
+//! `vaapi` loads `libva`, and the encoder is driven with ordinary V4L2 ioctls. Nothing is added
+//! to the build.
 //!
 //! One host frame becomes one access unit like this:
 //!
@@ -1121,6 +1121,20 @@ impl TegraEncoder {
 
     /// The VIC converts into NV12 and the encoder takes nothing else.
     pub fn is_fullcolor(&self) -> bool {
+        false
+    }
+
+    /// The NV12 the VIC converts into is limited range.
+    pub fn is_full_range(&self) -> bool {
+        false
+    }
+
+    /// The encoder keeps its own references, so a frame a client lost costs a key frame.
+    pub fn last_reference(&self) -> Reference {
+        Reference::Untracked
+    }
+
+    pub fn invalidate_reference(&mut self, _frame_id: u16) -> bool {
         false
     }
 

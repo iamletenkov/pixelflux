@@ -18,8 +18,8 @@
 //! (a headless [Smithay](https://github.com/Smithay/smithay) compositor) — and a shared
 //! encoding layer that dispatches to software (striped JPEG, H.264 through the build's
 //! software encoder — libx264 with the `gpl` feature, OpenH264 without — and the other
-//! codecs through the software encoders the linked FFmpeg carries) or hardware (NVENC,
-//! VA-API) encoders based on the available GPU and operator settings.
+//! codecs through the software encoders the build links: x265 or kvazaar, libvpx, SVT-AV1) or
+//! hardware (NVENC, VA-API) encoders based on the available GPU and operator settings.
 //!
 //! ## Crate structure
 //!
@@ -166,7 +166,6 @@ pub mod nvgpufilter;
 
 pub mod webcam;
 
-pub use encoders::avcodec;
 pub use encoders::nvenc;
 pub use encoders::software::StripeState;
 
