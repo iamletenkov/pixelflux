@@ -52,11 +52,19 @@ pub enum Invalidation {
 /// bitstream uses, and it asks for the key frame where the encoder would. Frames are addressed
 /// by the capture's frame id, which wraps; the timestamp the encoder is told to forget is the
 /// session's own count of encoded frames, which does not.
+///
+/// An H.264 session also names how many values its `frame_num` takes before wrapping
+/// (`set_frame_num_range`). A decoder that never receives the frame carrying `frame_num` 0 sees
+/// a gap across that wrap, and FFmpeg's H.264 decoder derives the picture order past such a gap
+/// wrongly and withholds every picture after it until a key frame, so a loss covering that frame
+/// is answered with a key frame rather than a prediction past it.
 pub struct ReferenceWindow {
     frames: VecDeque<(u16, u64, bool)>,
     capacity: usize,
     next_pts: u64,
     key: Option<u16>,
+    key_pts: u64,
+    frame_num_range: u64,
 }
 
 /// Whether frame id `a` came before `b`, across the wrap.
@@ -66,7 +74,20 @@ fn before(a: u16, b: u16) -> bool {
 
 impl ReferenceWindow {
     pub fn new(capacity: u32) -> Self {
-        Self { frames: VecDeque::new(), capacity: capacity.max(1) as usize, next_pts: 0, key: None }
+        Self {
+            frames: VecDeque::new(),
+            capacity: capacity.max(1) as usize,
+            next_pts: 0,
+            key: None,
+            key_pts: 0,
+            frame_num_range: 0,
+        }
+    }
+
+    /// How many values the stream's `frame_num` takes before it wraps; 0 for a codec without
+    /// that counter.
+    pub fn set_frame_num_range(&mut self, range: u32) {
+        self.frame_num_range = range as u64;
     }
 
     /// The decoded picture buffer the session has now; frames past it are let go.
@@ -94,6 +115,7 @@ impl ReferenceWindow {
         let reference = if key {
             self.frames.clear();
             self.key = Some(frame_id);
+            self.key_pts = pts;
             Reference::None
         } else {
             self.frames.iter().rev().find(|f| !f.2).map_or(Reference::None, |f| Reference::Frame(f.0))
@@ -116,10 +138,12 @@ impl ReferenceWindow {
         match self.frames.iter().position(|f| f.0 == frame_id) {
             Some(at) => {
                 let pts = self.frames[at].1;
-                for f in self.frames.iter_mut().skip(at) {
+                let wraps = self.frame_num_range > 0
+                    && self.frames.iter().skip(at).any(|f| (f.1 - self.key_pts).is_multiple_of(self.frame_num_range));
+                for f in self.frames.iter_mut().skip(if wraps { 0 } else { at }) {
                     f.2 = true;
                 }
-                Invalidation::Forget(pts)
+                if wraps { Invalidation::KeyFrame } else { Invalidation::Forget(pts) }
             }
             None if before(frame_id, oldest) => {
                 for f in self.frames.iter_mut() {
@@ -190,6 +214,30 @@ mod tests {
         assert_eq!(w.invalidate(65533), Invalidation::Ignored, "before the key frame");
         w.set_capacity(2);
         assert_eq!(w.invalidate(65534), Invalidation::KeyFrame, "left the window, and everything held predicts through it");
+    }
+
+    #[test]
+    fn a_loss_covering_the_frame_num_wrap_costs_a_key_frame() {
+        let mut w = ReferenceWindow::new(8);
+        w.set_frame_num_range(16);
+        w.record(0, true);
+        for id in 1..=17u16 {
+            w.record(id, false);
+        }
+        // Frame 16 carries frame_num 0 again; a loss that leaves it out cannot be predicted past.
+        assert_eq!(w.invalidate(17), Invalidation::Forget(17));
+        assert_eq!(w.record(18, false), Reference::Frame(16));
+        assert_eq!(w.invalidate(15), Invalidation::KeyFrame, "15, 16 and 18 go, and 16 is the wrap");
+        assert!(!w.has_reference());
+        assert_eq!(w.record(19, true), Reference::None);
+        assert_eq!(w.record(20, false), Reference::Frame(19));
+        assert_eq!(w.invalidate(20), Invalidation::Forget(20), "the count restarts at the key frame");
+        let mut w = ReferenceWindow::new(8);
+        w.record(0, true);
+        for id in 1..=17u16 {
+            w.record(id, false);
+        }
+        assert_eq!(w.invalidate(16), Invalidation::Forget(16), "a codec without the counter predicts past it");
     }
 
     #[test]

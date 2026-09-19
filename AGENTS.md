@@ -76,7 +76,8 @@ does (`encoders/reference.rs`, `StripeFrame.reference_frame_id`), and `invalidat
 leaves a frame a consumer lost out of the predictions so recovery costs no keyframe: NVENC where
 the device reports reference-picture invalidation, libx264 always, and the stream declares the
 decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that cannot refuses, and the caller forces an
-IDR instead. Every full-frame session is chosen by one ladder,
+IDR instead; an H.264 session answers a loss covering the frame at its `frame_num` wrap with a key frame itself,
+since FFmpeg's decoder derives the picture order past that gap wrongly and withholds every picture after it. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then NVENC on the NVIDIA
 driver, VA-API otherwise, then a stateful V4L2 memory-to-memory device, then the codec's software encoder, then
 a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback.

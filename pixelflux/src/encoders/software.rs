@@ -19,6 +19,8 @@ use super::codec::{push_jpeg_header, Codec};
 use super::reference::Reference;
 #[cfg(feature = "gpl")]
 use super::reference::{Invalidation, ReferenceWindow};
+#[cfg(feature = "gpl")]
+use super::sps::h264_frame_num_range;
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
@@ -524,6 +526,10 @@ impl H264EncoderWrapper {
                 for nal in nal_slice {
                     let payload = std::slice::from_raw_parts(nal.p_payload, nal.i_payload as usize);
                     output_buf.extend_from_slice(payload);
+                }
+                if frame_type == FRAME_KEY {
+                    let stream = &output_buf[if omit_headers { 0 } else { super::codec::VIDEO_HEADER_LEN }..];
+                    self.references.set_frame_num_range(h264_frame_num_range(stream).unwrap_or(0));
                 }
                 return true;
             }
@@ -1913,6 +1919,47 @@ mod qp_bound_sweep {
         let (out, reference) = encode(&mut enc, 20);
         assert_eq!(reference, Reference::None);
         assert_eq!(h264_frame_type(&out), FRAME_KEY);
+    }
+
+    /// A loss covering the frame carrying `frame_num` 0 is answered with a key frame: predicted
+    /// past, the frames after it reach FFmpeg's decoder as a gap across the counter's wrap, and
+    /// it withholds every picture from then on.
+    #[test]
+    #[cfg(feature = "gpl")]
+    fn x264_answers_a_loss_at_the_frame_num_wrap_with_a_key_frame() {
+        use crate::encoders::codec::{h264_frame_type, FRAME_KEY};
+        use crate::encoders::reference::Reference;
+        use crate::encoders::sps::h264_frame_num_range;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let mut enc = H264EncoderWrapper::new(W as i32, H as i32, 20, false, 60.0, 4, false, 0, 0, 0, 0)
+            .expect("x264 init");
+        let encode = |enc: &mut H264EncoderWrapper, i: usize| {
+            let y = text_luma(i);
+            let mut out = Vec::new();
+            assert!(enc.encode_with_headers(&y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32,
+                                            i as u16, 0, i == 0, true, &mut out));
+            (out, enc.last_reference())
+        };
+        let (first, _) = encode(&mut enc, 0);
+        let range = h264_frame_num_range(&first).expect("the key frame carries the SPS") as usize;
+        assert_eq!(range, 16, "x264 sizes frame_num for its decoded picture buffer");
+        let mut frames = vec![first];
+        for i in 1..=range {
+            frames.push(encode(&mut enc, i).0);
+        }
+        assert!(enc.invalidate_reference(range as u16), "the wrap frame is reported lost");
+        let (out, reference) = encode(&mut enc, range + 1);
+        assert_eq!(reference, Reference::None);
+        assert_eq!(h264_frame_type(&out), FRAME_KEY);
+        let mut lossy = AvDecoder::new(Codec::H264).unwrap();
+        for f in &frames[..range] {
+            assert!(lossy.decode(f).expect("decode"));
+        }
+        assert!(lossy.decode(&out).expect("decode past the wrap"), "the decoder that never saw the wrap frame shows the next one");
+        assert_eq!(encode(&mut enc, range + 2).1, Reference::Frame(range as u16 + 1));
+        assert!(enc.invalidate_reference(range as u16 + 2), "the count restarted at the key frame");
+        assert_eq!(encode(&mut enc, range + 3).1, Reference::Frame(range as u16 + 1));
     }
 
     /// Mean absolute luma difference between two decoded pictures.

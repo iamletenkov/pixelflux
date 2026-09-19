@@ -41,6 +41,7 @@ use super::codec::{
     Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN,
 };
 use super::reference::{Invalidation, Reference, ReferenceWindow, REFERENCE_FRAMES};
+use super::sps::h264_frame_num_range;
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
@@ -2641,6 +2642,11 @@ impl NvencEncoder {
             let slice = std::slice::from_raw_parts(data_ptr, data_size);
             output.extend_from_slice(slice);
         }
+        if frame_type == FRAME_KEY && self.codec == Codec::H264
+            && let Some(references) = &mut self.references
+        {
+            references.set_frame_num_range(h264_frame_num_range(&output[header_sz..]).unwrap_or(0));
+        }
 
         (self.nvenc_funcs.nvEncUnlockBitstream.unwrap())(self.encoder_session, output_bitstream);
         Ok(output)
@@ -3670,6 +3676,49 @@ mod gpu_tests {
             }
             assert_eq!(encode(&mut enc, 1, 1920, 1080).1, Reference::Frame(0), "{codec:?}");
         }
+    }
+
+    /// An H.264 loss covering the frame carrying `frame_num` 0 is answered with a key frame:
+    /// predicted past, the frames after it reach FFmpeg's decoder as a gap across the counter's
+    /// wrap, and it withholds every picture from then on. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_answers_a_loss_at_the_frame_num_wrap_with_a_key_frame() {
+        use crate::encoders::reference::Reference;
+        use crate::encoders::sps::h264_frame_num_range;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (w, h) = (1280usize, 720usize);
+        let mut s = settings(w as i32, h as i32, 60.0);
+        s.omit_stripe_headers = true;
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("H.264 session");
+        let encode = |enc: &mut NvencEncoder, i: usize| {
+            let out = enc.encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0).expect("encode");
+            (out, enc.last_reference())
+        };
+        let (first, reference) = encode(&mut enc, 0);
+        if reference == Reference::Untracked {
+            println!("this device cannot invalidate a reference, so nothing is tracked");
+            return;
+        }
+        let range = h264_frame_num_range(&first).expect("the key frame carries the SPS") as usize;
+        println!("frame_num wraps after {range} frames");
+        let mut frames = vec![first];
+        for i in 1..=range {
+            let (out, reference) = encode(&mut enc, i);
+            assert_ne!(reference, Reference::None, "frame {i} is no key frame");
+            frames.push(out);
+        }
+        assert!(enc.invalidate_reference(range as u16), "the wrap frame is reported lost");
+        let (out, reference) = encode(&mut enc, range + 1);
+        assert_eq!(reference, Reference::None, "the loss at the wrap costs the key frame");
+        let mut lossy = AvDecoder::new(Codec::H264).unwrap();
+        for f in &frames[..range] {
+            assert!(lossy.decode(f).expect("decode"));
+        }
+        assert!(lossy.decode(&out).expect("decode past the wrap"), "the decoder that never saw the wrap frame shows the next one");
+        assert_eq!(encode(&mut enc, range + 2).1, Reference::Frame(range as u16 + 1));
+        assert!(enc.invalidate_reference(range as u16 + 2), "the count restarted at the key frame");
+        assert_eq!(encode(&mut enc, range + 3).1, Reference::Frame(range as u16 + 1));
     }
 
     /// On a real GPU, a CBR session resized 720p→1080p folds the new bitrate into the resize

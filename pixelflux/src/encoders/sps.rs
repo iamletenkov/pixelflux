@@ -310,10 +310,8 @@ fn write_signal(w: &mut Writer, signal: ColorSignal) {
     w.bits(signal.matrix as u32, 8);
 }
 
-/// The sequence parameter set read the reference checks of every backend share, moved here from
-/// the encoder module so that one place reads an SPS. It stays behind `cfg(test)`: the checks are
-/// the only caller, and a reader nothing calls in a release build is dead weight in the wheel.
-#[cfg(test)]
+/// The sequence parameter set read an H.264 session makes of its own key frames, and the
+/// reference checks of every backend share.
 mod dpb {
     struct Bits<'a> {
         rbsp: &'a [u8],
@@ -343,8 +341,8 @@ mod dpb {
         }
     }
 
-    /// `max_num_ref_frames` of the first SPS in an Annex-B H.264 stream.
-    pub fn h264_max_num_ref_frames(stream: &[u8]) -> Option<u32> {
+    /// `(log2_max_frame_num, max_num_ref_frames)` of the first SPS in an Annex-B H.264 stream.
+    fn h264_sps(stream: &[u8]) -> Option<(u32, u32)> {
         let nal = crate::encoders::codec::annexb_nals(stream).find(|n| n[0] & 0x1f == 7)?;
         let mut rbsp = Vec::with_capacity(nal.len());
         let mut zeros = 0;
@@ -384,7 +382,7 @@ mod dpb {
                 }
             }
         }
-        r.ue();
+        let log2_max_frame_num = r.ue() + 4;
         match r.ue() {
             0 => {
                 r.ue();
@@ -399,10 +397,23 @@ mod dpb {
             }
             _ => {}
         }
-        Some(r.ue())
+        Some((log2_max_frame_num, r.ue()))
+    }
+
+    /// How many values `frame_num` takes before it wraps, from the first SPS of an Annex-B
+    /// H.264 stream.
+    pub fn h264_frame_num_range(stream: &[u8]) -> Option<u32> {
+        h264_sps(stream).map(|(log2, _)| 1 << log2)
+    }
+
+    /// `max_num_ref_frames` of the first SPS in an Annex-B H.264 stream.
+    #[cfg(test)]
+    pub fn h264_max_num_ref_frames(stream: &[u8]) -> Option<u32> {
+        h264_sps(stream).map(|(_, refs)| refs)
     }
 }
 
+pub use dpb::h264_frame_num_range;
 #[cfg(test)]
 pub use dpb::h264_max_num_ref_frames;
 

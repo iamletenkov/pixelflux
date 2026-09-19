@@ -656,7 +656,9 @@ so no frame is converted on a CPU core.
     client that never received it and the stream costs no keyframe. Each frame says what it
     predicts from (`StripeFrame.reference_frame_id`), which is what a consumer holds the frames
     behind a loss back by. NVENC and libx264 track their references, on the devices whose drivers
-    offer it; a session that does not reports `-2` and answers this with a keyframe instead.
+    offer it; a session that does not reports `-2` and answers this with a keyframe instead, as
+    does an H.264 session for a loss covering the frame at its `frame_num` wrap, which FFmpeg's
+    decoder cannot be predicted past.
 
 ### Color conversion
 
