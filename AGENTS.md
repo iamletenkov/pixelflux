@@ -138,6 +138,9 @@ budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test 
 `libkvazaar`); the OpenH264 crates are also dev-dependencies so its tests run under the default build. The
 wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
 from source ahead of FFmpeg.
+The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver pre-release
+the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the manifest
+and the lock, so a build ahead of a release carries the series version and a release the tag's.
 
 Host capture of an external Wayland compositor (`wayland/host.rs`, `wayland_host_display`) picks each
 rung per capability from the host's registry, never by a setting: frames through

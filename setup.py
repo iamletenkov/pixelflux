@@ -3,6 +3,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import os
+import re
 import sys
 
 from setuptools import setup
@@ -10,6 +11,15 @@ from setuptools_rust import Binding, RustExtension, Strip
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
+
+def crate_version() -> str:
+    """The crate's version as pip spells it: a `2.1.0-rc.1` in Cargo.toml is `2.1.0rc1` here."""
+    manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pixelflux", "Cargo.toml")
+    with open(manifest, encoding="utf-8") as fh:
+        semver = re.search(r'^version = "([^"]+)"', fh.read(), re.M).group(1)
+    spelled = {"alpha": "a", "beta": "b", "rc": "rc", "dev": ".dev", "post": ".post"}
+    return re.sub(r"-(alpha|beta|rc|dev|post)\.(\d+)$", lambda m: spelled[m.group(1)] + m.group(2), semver)
+
 
 # The software H.264 encoder is chosen at build time. The default build enables the GPL
 # components (GPL-2.0+ libx264 encodes every software H.264 session). Set
@@ -39,7 +49,7 @@ else:
 
 setup(
     name="pixelflux",
-    version="2.1.0",
+    version=crate_version(),
     author="Selkies Project",
     author_email="pypi@linuxserver.io",
     description="A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.",
