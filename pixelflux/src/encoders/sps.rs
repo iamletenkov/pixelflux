@@ -78,7 +78,7 @@ impl<'a> Reader<'a> {
 
     fn se(&mut self) -> Result<i32, String> {
         let value = self.ue()?;
-        Ok(if value % 2 == 0 { -((value / 2) as i32) } else { ((value + 1) / 2) as i32 })
+        Ok(if value.is_multiple_of(2) { -((value / 2) as i32) } else { value.div_ceil(2) as i32 })
     }
 }
 
@@ -93,7 +93,7 @@ impl Writer {
     }
 
     fn bit(&mut self, value: u32) {
-        if self.pos % 8 == 0 {
+        if self.pos.is_multiple_of(8) {
             self.bytes.push(0);
         }
         if value & 1 != 0 {
@@ -120,7 +120,7 @@ impl Writer {
 
     fn trailing_bits(&mut self) {
         self.bit(1);
-        while self.pos % 8 != 0 {
+        while !self.pos.is_multiple_of(8) {
             self.bit(0);
         }
     }
@@ -231,11 +231,9 @@ fn locate(rbsp: &[u8]) -> Result<Located, String> {
     if r.bit()? == 0 {
         return Ok(Located { start: vui_flag, end: vui_flag, vui_present: false, vui_flag, declared: None });
     }
-    if r.bit()? == 1 {
-        if r.bits(8)? == 255 {
-            r.bits(16)?;
-            r.bits(16)?;
-        }
+    if r.bit()? == 1 && r.bits(8)? == 255 {
+        r.bits(16)?;
+        r.bits(16)?;
     }
     if r.bit()? == 1 {
         r.bit()?;

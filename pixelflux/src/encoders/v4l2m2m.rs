@@ -328,7 +328,7 @@ impl NodeInfo {
     /// here falls through to software, a refusal later leaves a black stream.
     fn fits(&self, width: u32, height: u32) -> bool {
         let in_range = |value: u32, min: u32, max: u32, step: u32| {
-            value >= min && value <= max && (step == 0 || (value - min) % step == 0)
+            value >= min && value <= max && (step == 0 || (value - min).is_multiple_of(step))
         };
         in_range(width, self.min_width, self.max_width, self.step_width)
             && in_range(height, self.min_height, self.max_height, self.step_height)

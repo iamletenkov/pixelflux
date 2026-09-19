@@ -290,9 +290,7 @@ mod tests {
         assert_eq!(colorspace_desc(false, true), "I420 (Full Range)");
         assert_eq!(colorspace_desc(false, false), "I420 (Limited Range)");
 
-        let mut settings = RustCaptureSettings::default();
-        settings.codec = Codec::H264;
-        settings.video_fullcolor = false;
+        let mut settings = RustCaptureSettings { codec: Codec::H264, video_fullcolor: false, ..Default::default() };
         assert!(!session_full_range(None, &settings), "striped 4:2:0 converts at limited range");
         assert_eq!(colorspace_desc(session_fullcolor(None, &settings),
                                    session_full_range(None, &settings)),
@@ -594,19 +592,19 @@ pub fn select_frame_encoder(
         // reached only once the two backends that do have refused. The size is checked before
         // the node is opened: a refusal here falls through to software, a refusal later would
         // leave a session that came up and produces nothing.
-        if let (Some(_), FrameSource::Host { rgba }) = (v4l2m2m::coded_fourcc(codec), source) {
-            if v4l2m2m::encodes(codec, settings.width, settings.height) {
-                match v4l2m2m::V4l2M2mEncoder::new(codec, settings, rgba) {
-                    Ok(enc) => {
-                        println!(
-                            "[{tag}] Encoder: V4L2M2M {} {} on a stateful M2M node.",
-                            codec.display(),
-                            chroma_name(enc.is_fullcolor())
-                        );
-                        return Some(FrameEncoder::V4l2m2m(enc));
-                    }
-                    Err(e) => eprintln!("[{tag}] Failed to init the V4L2 M2M encoder: {e}"),
+        if let (Some(_), FrameSource::Host { rgba }) = (v4l2m2m::coded_fourcc(codec), source)
+            && v4l2m2m::encodes(codec, settings.width, settings.height)
+        {
+            match v4l2m2m::V4l2M2mEncoder::new(codec, settings, rgba) {
+                Ok(enc) => {
+                    println!(
+                        "[{tag}] Encoder: V4L2M2M {} {} on a stateful M2M node.",
+                        codec.display(),
+                        chroma_name(enc.is_fullcolor())
+                    );
+                    return Some(FrameEncoder::V4l2m2m(enc));
                 }
+                Err(e) => eprintln!("[{tag}] Failed to init the V4L2 M2M encoder: {e}"),
             }
         }
     } else {
