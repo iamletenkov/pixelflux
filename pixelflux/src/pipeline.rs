@@ -388,15 +388,19 @@ impl X11Pipeline {
                     Ok(data) if !data.is_empty() => {
                         self.hw_error_streak = 0;
                         self.hw_rebuilt = false;
-                        vec![EncodedStripe {
-                            data: Arc::new(data),
-                            codec: self.settings.codec,
-                            stripe_y_start: 0,
-                            stripe_height: height,
-                            frame_id: self.frame_counter as i32,
-                            timing: Default::default(),
-                            reference: enc.last_reference(),
-                        }]
+                        let codec = self.settings.codec;
+                        enc.delivered_units(data, self.frame_counter)
+                            .into_iter()
+                            .map(|(data, id, reference)| EncodedStripe {
+                                data: Arc::new(data),
+                                codec,
+                                stripe_y_start: 0,
+                                stripe_height: height,
+                                frame_id: id as i32,
+                                timing: Default::default(),
+                                reference,
+                            })
+                            .collect()
                     }
                     Ok(_) => {
                         self.hw_error_streak = 0;

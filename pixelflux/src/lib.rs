@@ -1342,19 +1342,22 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                         hw_error_streak = 0;
                         hw_rebuilt = false;
                         if !data.is_empty() {
-                            out.push(EncodedStripe {
-                                data: Arc::new(data),
-                                codec: settings.codec,
-                                stripe_y_start: 0,
-                                stripe_height: height,
-                                frame_id: f.frame_id as i32,
-                                timing: FrameTiming {
-                                    capture_ns: f.captured_ns,
-                                    encode_start_ns,
-                                    encode_end_ns: wayland::host::now_ns(),
-                                },
-                                reference: encoder.last_reference(),
-                            });
+                            let encode_end_ns = wayland::host::now_ns();
+                            for (data, id, reference) in encoder.delivered_units(data, f.frame_id) {
+                                out.push(EncodedStripe {
+                                    data: Arc::new(data),
+                                    codec: settings.codec,
+                                    stripe_y_start: 0,
+                                    stripe_height: height,
+                                    frame_id: id as i32,
+                                    timing: FrameTiming {
+                                        capture_ns: f.captured_ns,
+                                        encode_start_ns,
+                                        encode_end_ns,
+                                    },
+                                    reference,
+                                });
+                            }
                         }
                     }
                     Err(e) => {

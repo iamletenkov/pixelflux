@@ -460,6 +460,29 @@ mod tests {
     }
 
     #[test]
+    fn the_set_held_leaves_out_what_a_client_lost() {
+        let held = |w: &ReferenceWindow| w.held().filter(|f| !f.2).map(|f| f.1).collect::<Vec<_>>();
+        let mut w = ReferenceWindow::new(4);
+        assert!(held(&w).is_empty(), "nothing is held before the first frame");
+        w.record(10, true);
+        w.record(11, false);
+        w.record(12, false);
+        assert_eq!(held(&w), [0, 1, 2]);
+        assert_eq!(w.invalidate(11), Invalidation::Forget(1));
+        assert_eq!(held(&w), [0], "11 and every frame after it are out");
+        // The frame recorded next predicts from the newest one held, which is the set's last.
+        assert_eq!(w.record(13, false), Reference::Frame(10));
+        assert_eq!(held(&w), [0, 3]);
+        // A lost frame still takes its place in the window until it is let go.
+        w.record(14, false);
+        assert_eq!(held(&w), [3, 4], "10 left the window of four, behind the two lost ones");
+        assert_eq!(w.invalidate(10), Invalidation::KeyFrame);
+        assert!(held(&w).is_empty(), "the next frame has to be a key frame");
+        w.record(15, true);
+        assert_eq!(held(&w), [5]);
+    }
+
+    #[test]
     fn the_wire_form_names_the_frame() {
         assert_eq!(Reference::Untracked.frame_id(), -2);
         assert_eq!(Reference::None.frame_id(), -1);
