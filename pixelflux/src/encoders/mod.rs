@@ -387,11 +387,9 @@ impl FrameEncoder {
     }
 
     /// The data one call returned, cut at the units it carries, each with its own frame's id and
-    /// reference. A session that hands back the frame it encoded returns it whole, labelled
-    /// `encoded` and `last_reference`. A session that hands units back frames late (Tegra) can
-    /// return several, each an earlier frame than the call encoded, and each travels on its own:
-    /// a consumer that drops one reports it lost by its id, and one id on two units would leave
-    /// the second a reference the client never received.
+    /// reference: whole and labelled `encoded` from a session that hands back the frame it
+    /// encoded, one unit per earlier frame from one that hands them back late (Tegra), so what a
+    /// consumer reports lost is the unit it dropped and nothing else.
     pub fn delivered_units(&self, data: Vec<u8>, encoded: u16) -> Vec<(Vec<u8>, u16, reference::Reference)> {
         #[cfg(target_arch = "aarch64")]
         if let FrameEncoder::Tegra(enc) = self {

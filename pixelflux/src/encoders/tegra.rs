@@ -407,13 +407,10 @@ fn abi_matches() -> Result<(), String> {
     Ok(())
 }
 
-/// Where the external-RPS structures put their fields on one L4T release.
-///
-/// Unlike the rest of the interface these differ between releases: R36 grew reserved fields and
-/// per-codec parameters, so every size and the position of `config_store` moved while the fields
-/// this backend writes kept their offsets. Both layouts were read off the shipped
-/// `v4l2_nv_extensions.h` with `sizeof` and `offsetof`, on a Nano at R32.6.1 and an AGX Orin at
-/// R36.4.3. R35 was measured on no board, so a JetPack 5 session keeps the key frame per loss.
+/// Sizes and offsets of the external-RPS structures on one L4T release: R36 grew reserved and
+/// per-codec fields, moving every size and `config_store` while the fields written here kept
+/// their offsets. Read off `v4l2_nv_extensions.h` on a Nano at R32.6.1 and an AGX Orin at
+/// R36.4.3; R35 was measured on no board and keeps the key frame per loss.
 struct RpsLayout {
     /// `v4l2_enc_enable_ext_rps_ctr`.
     enable: usize,
@@ -432,9 +429,8 @@ struct RpsLayout {
 const RPS_R32: RpsLayout = RpsLayout { enable: 12, num_ref: 4, prop: 8, params: 84, metadata: 56, config_store: 48 };
 const RPS_R36: RpsLayout = RpsLayout { enable: 28, num_ref: 20, prop: 24, params: 232, metadata: 72, config_store: 56 };
 
-/// The layout for the release this host runs, from `/etc/nv_tegra_release`, which carries it
-/// whichever surface library the image ships: a JetPack 5 image can carry `nvbuf_utils` and still
-/// lay these out as R35 does.
+/// The layout for the release `/etc/nv_tegra_release` names; the surface library an image ships
+/// says nothing about it.
 fn rps_layout() -> Option<&'static RpsLayout> {
     static LAYOUT: OnceLock<Option<&'static RpsLayout>> = OnceLock::new();
     *LAYOUT.get_or_init(|| {
@@ -741,9 +737,7 @@ pub struct TegraEncoder {
     /// What each frame in flight predicted from, by frame number, in the order queued: the
     /// encoder hands a unit back one or two frames after the one that produced it.
     in_flight: VecDeque<(u64, Reference)>,
-    /// The units the last call handed back, in order: each one's frame number, what it
-    /// predicted from, and where it ends in the data returned. These are earlier frames than
-    /// the call queued, and a call can hand back more than one.
+    /// The units the last call handed back, in order, as `delivered_units` describes them.
     units: Vec<(u16, Reference, usize)>,
     last_reference: Reference,
     /// Frames between the key frames the session asks for itself, and how many since the last.
@@ -808,9 +802,8 @@ impl TegraEncoder {
             fps,
             references: None,
             rps: None,
-            // The level the encoder picks for itself admits no more than this: at 3840x2160 a
-            // set of eight fails the session (`BlockSide error 0x4`) where five at level 5.1 do
-            // not, and at 1920x1080 the level admits more than the window holds.
+            // The level the encoder picks admits no more than this: at 3840x2160 a set of eight
+            // fails the session (`BlockSide error 0x4`) where level 5.1's five do not.
             dpb: match codec {
                 Codec::H265 => h265_dpb_frames(153, width as u32, height as u32),
                 _ => h264_dpb_frames(51, width as u32, height as u32),
@@ -1081,22 +1074,16 @@ impl TegraEncoder {
         self.ioctl(VIDIOC_S_EXT_CTRLS, &mut controls, what)
     }
 
-    /// Take the reference set into the session's hands, so a frame a client lost can be left out
-    /// of it instead of answered with a key frame.
+    /// Take the reference set into the session's hands, so a frame a client lost is left out of
+    /// it instead of answered with a key frame. Before the buffers are requested, which is what
+    /// the vendor's `enableExternalRPS` checks; once on, a frame queued without its set fails the
+    /// session (`BlockSide error 0x4`, then `EINVAL` on the next `QBUF`), so `rps` is set only
+    /// here and every queued frame carries one.
     ///
-    /// Before the buffers are requested, which is what the vendor's own `enableExternalRPS`
-    /// checks, whatever its header says. Once on, the encoder takes nothing on its own: a frame
-    /// queued without its set fails the session (`BlockSide error 0x4`, then `EINVAL` on the
-    /// next `QBUF`), so `rps` is set only here and every queued frame carries one.
-    ///
-    /// **H.265 only.** Under external RPS the vendor's H.264 encoder codes pictures its own
-    /// decoder does not reconstruct: where content repeats a few frames apart, so motion search
-    /// reaches past the newest reference, the decode drifts from the source — a mean 19.9 luma
-    /// levels off it on an AGX Orin at R36.4.3, against 3.2 with the session's own references and
-    /// 1.0 for H.265 under the same set — at any list order, one reference or eight, either
-    /// picture-order-count type and either preset. NVIDIA's own `01_video_encode` shows the same,
-    /// reported on their forum for JetPack 5 and 6 and unanswered. An H.264 session keeps the key
-    /// frame per loss; AV1 carries different metadata altogether.
+    /// H.265 only: under an external set the vendor's H.264 encoder codes pictures its own
+    /// decoder does not reconstruct where content repeats within the search range, at any list
+    /// order, reference count, POC type or preset, as NVIDIA's own sample shows, so an H.264
+    /// session keeps the key frame per loss. AV1 carries different metadata altogether.
     fn enable_external_rps(&mut self) {
         let (at, bits) = match self.codec {
             Codec::H265 => (8, H265_POC_LSB_BITS),
@@ -1112,10 +1099,9 @@ impl TegraEncoder {
             crate::log::debug!("[pixelflux] Tegra: {e}; a lost frame costs a key frame");
             return;
         }
-        // The count follows the enable, as the vendor documents, and like it goes through a
-        // pointer: passed inline, the driver reads the number as an address and the process
-        // dies inside the vendor library. Refused, the encoder keeps its own default of one, and
-        // the window holds what the encoder does.
+        // The count follows the enable and is a compound control too: passed inline, the driver
+        // reads the number as an address and dies inside the vendor library. Refused, the
+        // encoder keeps its default of one, and the window holds what the encoder does.
         let mut count = Fields::new(layout.num_ref);
         count.u32(0, self.dpb);
         if let Err(e) = self.set_pointer_control(CID_NUM_REFERENCE_FRAMES, count.as_ptr(), "reference frames") {
@@ -1200,11 +1186,9 @@ impl TegraEncoder {
     }
 
     /// The units the last call handed back: each one's frame number, what it predicted from and
-    /// where it ends in the data. The encoder returns a unit a frame or two after the frame that
-    /// produced it, and after a stall several at once, so these are earlier frames than the call
-    /// queued. A consumer that drops a unit and reports it lost has to name that unit's frame:
-    /// named otherwise, the frame left out of the predictions is one the client holds, the one
-    /// it lost stays a reference, and every frame after it decodes wrong until a key frame.
+    /// where it ends in the data. A unit comes back a frame or two after the frame that produced
+    /// it, several at once after a stall, so a consumer that drops one reports it lost by that
+    /// unit's own frame number; named otherwise, the lost frame stays a reference.
     pub fn delivered_units(&self) -> &[(u16, Reference, usize)] {
         &self.units
     }
@@ -1300,13 +1284,10 @@ impl TegraEncoder {
         if self.codec == Codec::H264 {
             let _ = self.set_control(CID_POC_TYPE, 2, "picture order count type");
         }
-        // Where the session hands the encoder its references, it asks for every key frame too:
-        // left an interval, the encoder inserts a key frame itself, against the set it was
-        // handed, and the window learns of it only once the frame comes back, frames later.
-        // Both intervals: the GOP size inserts an IDR of its own at its default of thirty
-        // frames whatever the IDR interval says, and the frames after it, predicted from a
-        // set the encoder no longer holds, decode as noise (33 luma levels off the source on an
-        // AGX Orin, against 4 with the interval parked).
+        // With the reference set the session's, so is every key frame: one the encoder inserts
+        // on an interval of its own, IDR or GOP, is coded against the set it was handed, and the
+        // frames after it decode as noise until the window learns of it. Both intervals are
+        // parked and the session asks for each key frame with an empty set.
         self.keyframe_every = keyframe as u64;
         self.enable_external_rps();
         let idr_interval = if self.rps.is_some() { i32::MAX as i64 } else { keyframe };
